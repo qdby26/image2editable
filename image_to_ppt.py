@@ -4921,9 +4921,19 @@ def prepare_component_layers(
                 "objects": gate_outcome["objects"],
             }
 
+    confirmed_payload = text_analysis.get("confirmed_objects")
+
     initial_diagnostics = []
     # Recovered text needs a second visual pass unless verified assets are reused.
     for visual_pass in range(2):
+        if (
+            confirmed_payload is not None
+            and text_analysis.get("confirmed_objects") != confirmed_payload
+        ):
+            raise RuntimeError(
+                "Proposal review confirmed_objects were dropped "
+                "before visual pass"
+            )
         object_detector = None
         mask_generator = None
         visual_source_image = None
@@ -5118,6 +5128,8 @@ def prepare_component_layers(
             "mask_path": str(text_mask_path),
             "page_policy": asdict(page_policy),
         }
+        if confirmed_payload is not None:
+            text_analysis["confirmed_objects"] = confirmed_payload
         source_image = source_for_delta
         stored_mask = sweep["text_mask"]
         removal_mask = None

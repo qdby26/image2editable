@@ -1570,6 +1570,8 @@ def _prepare_rerun_fixture(
     include_text_clean: bool = False,
     direct: bool = False,
     resource_isolation: bool = True,
+    proposal_gate=None,
+    confirmed_payloads=None,
 ) -> tuple[dict, list[int]]:
     source = _label_fixture(tmp_path)
     work_dir = tmp_path / "prepared"
@@ -1760,6 +1762,10 @@ def _prepare_rerun_fixture(
             assert not stale_parent.exists()
             assert outside_component.exists()
         process_text_counts.append(len(text_analysis["items"]))
+        if confirmed_payloads is not None:
+            confirmed_payloads.append(
+                text_analysis.get("confirmed_objects")
+            )
         if second_pass_error and pass_index == 2:
             raise RuntimeError("full visual failed")
         components_dir = target / "components"
@@ -1869,6 +1875,8 @@ def _prepare_rerun_fixture(
         source, work_dir, lang="en", resource_isolation=resource_isolation,
         visual_worker_pool=visual_worker_pool,
         pipeline_mode="fast" if direct else "strict",
+        **({"proposal_gate": proposal_gate}
+           if proposal_gate is not None else {}),
     )
     return prepared, process_text_counts
 
@@ -2129,6 +2137,51 @@ def test_prepare_uses_full_second_visual_pass_when_reuse_is_not_provable(
     with Image.open(prepared["components"][0]["path"]) as component:
         assert component.convert("RGB").getpixel((0, 0)) == (0, 128, 0)
     assert (Path(prepared["_work_dir"]) / "first-visual-cache.json").is_file()
+
+
+@pytest.mark.parametrize("case", ["full_fallback", "incremental_reuse"])
+def test_second_visual_pass_keeps_confirmed_objects(
+    tmp_path: Path,
+    monkeypatch,
+    case: str,
+) -> None:
+    objects = [
+        {
+            "id": "p_0001",
+            "source_proposal_ids": ["p_0001"],
+            "box_xyxy": [4.0, 4.0, 20.0, 20.0],
+            "role": "icon",
+            "labels": ["icon"],
+            "scores": [0.9],
+        },
+        {
+            "id": "merge__p_0002__p_0003",
+            "source_proposal_ids": ["p_0002", "p_0003"],
+            "box_xyxy": [30.0, 30.0, 64.0, 60.0],
+            "role": "card",
+            "labels": ["card", "icon"],
+            "scores": [0.7, 0.85],
+        },
+    ]
+    gate_payload = {
+        "status": "proposals_confirmed",
+        "page_id": "page_001",
+        "request_sha256": "a" * 64,
+        "objects": objects,
+    }
+    confirmed_payloads = []
+    _, calls = _prepare_rerun_fixture(
+        tmp_path,
+        monkeypatch,
+        affected_text_delta=case == "full_fallback",
+        safe_text_delta=case == "incremental_reuse",
+        proposal_gate=lambda **kwargs: gate_payload,
+        confirmed_payloads=confirmed_payloads,
+    )
+
+    assert calls == ([0, 1] if case == "full_fallback" else [0])
+    expected = {"request_sha256": "a" * 64, "objects": objects}
+    assert confirmed_payloads == [expected] * len(calls)
 
 
 def test_disjoint_text_delta_matches_full_visual_recompute_evidence(
