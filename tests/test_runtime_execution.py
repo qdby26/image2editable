@@ -668,6 +668,66 @@ def test_presentation_assets_assign_text_hole_to_colored_shape(
     assert np.all(rgba[8:12, 16:24, :3] == (20, 160, 60))
 
 
+def test_presentation_assets_claim_parent_only_card_edge_without_text(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "source.png"
+    clean_path = tmp_path / "text-clean.png"
+    parent_path = tmp_path / "parent.png"
+    child_path = tmp_path / "child.png"
+    text_path = tmp_path / "text.png"
+    source = np.full((24, 32, 3), 255, dtype=np.uint8)
+    source[3:21, 4:28] = (20, 160, 60)
+    clean = source.copy()
+    clean[9:13, 14:22] = (20, 160, 60)
+    parent = np.zeros((24, 32), dtype=np.uint8)
+    parent[3:21, 4:28] = 255
+    child = np.zeros((24, 32), dtype=np.uint8)
+    child[5:19, 6:26] = 255
+    text = np.zeros((24, 32), dtype=np.uint8)
+    text[9:13, 14:22] = 255
+    Image.fromarray(source).save(source_path)
+    Image.fromarray(clean).save(clean_path)
+    Image.fromarray(parent).save(parent_path)
+    Image.fromarray(child).save(child_path)
+    Image.fromarray(text).save(text_path)
+    graph = {"nodes": [
+        {
+            "id": "parent", "kind": "parent", "parent_id": None,
+            "state": "inactive", "mask": parent_path.name,
+            "mask_sha256": hashlib.sha256(parent_path.read_bytes()).hexdigest(),
+            "bbox": [4, 3, 28, 21], "z_index": 0, "text_ids": [],
+        },
+        {
+            "id": "card", "kind": "child", "parent_id": "parent",
+            "state": "pending", "mask": child_path.name,
+            "mask_sha256": hashlib.sha256(child_path.read_bytes()).hexdigest(),
+            "bbox": [6, 5, 26, 19], "z_index": 0, "text_ids": [],
+        },
+        {
+            "id": "text", "kind": "text", "parent_id": None,
+            "state": "frozen", "mask": text_path.name,
+            "mask_sha256": hashlib.sha256(text_path.read_bytes()).hexdigest(),
+            "bbox": [14, 9, 22, 13], "z_index": 1, "text_ids": [],
+        },
+    ]}
+
+    manifest_path, _ = _build_test_presentation_manifest(
+        tmp_path, source_path=source_path, text_clean_path=clean_path,
+        graph=graph, graph_dir=tmp_path, output_dir=tmp_path,
+        text_mask_path=text_path,
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    with Image.open(_manifest_asset_path(tmp_path, manifest, 0, "ownership_mask")) as image:
+        ownership = np.asarray(image.convert("L")) > 0
+    with Image.open(_manifest_asset_path(tmp_path, manifest, 0, "rgba")) as image:
+        rgba = np.asarray(image.convert("RGBA"))
+
+    assert np.all(ownership[3:5, 4:28])
+    assert not np.any(ownership[9:13, 14:22])
+    assert np.all(rgba[3:5, 4:28, :3] == (20, 160, 60))
+
+
 def test_presentation_assets_publish_atomically_and_retry_after_save_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -994,7 +1054,7 @@ def test_presentation_higher_masks_use_one_reverse_z_accumulator(
     assert [item["component_id"] for item in manifest["components"]] == [
         item[0] for item in specs
     ]
-    assert len(zero_calls) == 3
+    assert len(zero_calls) == 6
     assert not np.any(captured[2])
     assert np.array_equal(captured[0], np.array([[False, False, True, False]]))
     assert np.array_equal(captured[3], np.array([[False, False, True, False]]))
@@ -1243,6 +1303,413 @@ def test_next_round_disk_reserve_fails_before_evidence_publication(
     reconstruction = run_dir / "pages/page_001/reconstruction"
     assert reserve_calls == 1
     assert not (reconstruction / "evidence-round-02").exists()
+
+
+def _reach_evidence_round_two_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Path:
+    source = tmp_path / "source.png"
+    _component_source(source)
+    _install_component_e2e_boundaries(
+        monkeypatch,
+        baked_background_pages={"page_001"},
+    )
+    run_dir = runtime.prepare_job(
+        source,
+        run_dir=tmp_path / "run",
+        slide_size="16:9",
+        agent_provider="host",
+    )
+    assert runtime.run_job(run_dir)["status"] == "awaiting_agent"
+    _record_current_component_plan(
+        run_dir,
+        tmp_path / "round-1-plan.json",
+        [_accept_action()],
+    )
+    return run_dir
+
+
+def test_evidence_round_recovers_interrupted_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = _reach_evidence_round_two_publication(tmp_path, monkeypatch)
+    store = RunStore.open(run_dir)
+    reconstruction = run_dir / "pages" / "page_001" / "reconstruction"
+    evidence_root = reconstruction / "evidence-round-02"
+    record_calls = 0
+    real_record = legacy.record_next_component_request
+
+    def interrupted_record(*args, **kwargs):
+        nonlocal record_calls
+        record_calls += 1
+        if record_calls == 1:
+            raise RuntimeError("simulated crash after evidence publication")
+        return real_record(*args, **kwargs)
+
+    monkeypatch.setattr(
+        legacy, "record_next_component_request", interrupted_record
+    )
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        runtime.run_job(run_dir)
+
+    assert record_calls == 1
+    assert evidence_root.is_dir()
+    sentinel = evidence_root / "interrupted-marker.txt"
+    sentinel.write_text("interrupted attempt", encoding="utf-8")
+    state = store.read_json(
+        "pages/page_001/reconstruction/component_state.json"
+    )
+    assert state["current_round"]["round"] == 1
+
+    runtime.retry_page(run_dir, "page_001")
+    waiting = runtime.run_job(run_dir)
+
+    assert waiting["status"] == "awaiting_agent"
+    assert waiting["repair_round"] == 2
+    quarantined = sorted(
+        reconstruction.glob(".evidence-round-02.interrupted-*")
+    )
+    assert len(quarantined) == 1
+    assert (
+        quarantined[0] / "interrupted-marker.txt"
+    ).read_text(encoding="utf-8") == "interrupted attempt"
+    assert (quarantined[0] / "source.png").is_file()
+    assert (evidence_root / "source.png").is_file()
+    assert not list(reconstruction.glob(".evidence-round-02.staging-*"))
+    state = store.read_json(
+        "pages/page_001/reconstruction/component_state.json"
+    )
+    assert state["current_round"]["round"] == 2
+    assert state["current_round"]["request_ref"] is not None
+
+
+def test_evidence_round_staging_removed_when_publication_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = _reach_evidence_round_two_publication(tmp_path, monkeypatch)
+    reconstruction = run_dir / "pages" / "page_001" / "reconstruction"
+
+    def fail_render(*args, **kwargs):
+        raise RuntimeError("simulated evidence render failure")
+
+    monkeypatch.setattr(
+        legacy, "_render_component_evidence", fail_render
+    )
+    with pytest.raises(RuntimeError, match="simulated evidence render"):
+        runtime.run_job(run_dir)
+
+    assert not (reconstruction / "evidence-round-02").exists()
+    assert not list(reconstruction.glob(".evidence-round-02.staging-*"))
+
+
+def test_evidence_round_quarantine_refuses_foreign_link(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "run")
+    reconstruction = store.root / "pages" / "page_001" / "reconstruction"
+    reconstruction.mkdir(parents=True)
+    external = tmp_path / "external-evidence"
+    external.mkdir()
+    (external / "keep.txt").write_text("keep", encoding="utf-8")
+    evidence_root = reconstruction / "evidence-round-02"
+    try:
+        evidence_root.symlink_to(external, target_is_directory=True)
+    except OSError as error:
+        if os.name != "nt":
+            pytest.skip(f"directory links are unavailable: {error}")
+        junction = subprocess.run(
+            [
+                "cmd", "/c", "mklink", "/J",
+                str(evidence_root), str(external),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if junction.returncode:
+            pytest.skip(f"directory links are unavailable: {error}")
+    state = {
+        "current_round": {"round": 1, "request_ref": {"path": "x"}}
+    }
+
+    with pytest.raises(RuntimeError, match="link or reparse"):
+        legacy._quarantine_interrupted_round_artifact(
+            store, reconstruction, evidence_root, 2, state
+        )
+
+    assert (external / "keep.txt").read_text(encoding="utf-8") == "keep"
+    assert evidence_root.exists() or evidence_root.is_symlink()
+
+
+def test_evidence_round_quarantine_rejects_recorded_round(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "run")
+    reconstruction = store.root / "pages" / "page_001" / "reconstruction"
+    reconstruction.mkdir(parents=True)
+    evidence_root = reconstruction / "evidence-round-02"
+    evidence_root.mkdir()
+    (evidence_root / "source.png").write_bytes(b"published")
+    state = {
+        "current_round": {
+            "round": 2,
+            "request_ref": {"path": "agent/round-02/request.json"},
+        }
+    }
+
+    with pytest.raises(RuntimeError, match="already recorded"):
+        legacy._quarantine_interrupted_round_artifact(
+            store, reconstruction, evidence_root, 2, state
+        )
+
+    assert (evidence_root / "source.png").read_bytes() == b"published"
+    assert not list(
+        reconstruction.glob(".evidence-round-02.interrupted-*")
+    )
+
+
+def test_evidence_round_quarantine_refuses_non_directory(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "run")
+    reconstruction = store.root / "pages" / "page_001" / "reconstruction"
+    reconstruction.mkdir(parents=True)
+    evidence_root = reconstruction / "evidence-round-02"
+    evidence_root.write_text("not a directory", encoding="utf-8")
+    state = {
+        "current_round": {"round": 1, "request_ref": {"path": "x"}}
+    }
+
+    with pytest.raises(RuntimeError, match="non-directory"):
+        legacy._quarantine_interrupted_round_artifact(
+            store, reconstruction, evidence_root, 2, state
+        )
+
+    assert evidence_root.read_text(encoding="utf-8") == "not a directory"
+
+
+def _bound_evidence_fixture(tmp_path: Path):
+    store = RunStore(tmp_path / "run")
+    reconstruction = store.root / "pages" / "page_001" / "reconstruction"
+    reconstruction.mkdir(parents=True)
+    trusted_source = reconstruction / "trusted-source.png"
+    trusted_graph = reconstruction / "trusted-graph.json"
+    trusted_source.write_bytes(b"trusted-source-bytes")
+    trusted_graph.write_bytes(b"trusted-graph-bytes")
+    state = {"current_round": {"round": 1, "request_ref": {"path": "x"}}}
+    return store, reconstruction, trusted_source, trusted_graph, state
+
+
+def test_evidence_round_quarantine_rejects_unverifiable_dir(
+    tmp_path: Path,
+) -> None:
+    store, reconstruction, source, graph, state = _bound_evidence_fixture(
+        tmp_path
+    )
+    evidence_root = reconstruction / "evidence-round-02"
+    evidence_root.mkdir()
+
+    with pytest.raises(RuntimeError, match="unverifiable"):
+        legacy._quarantine_interrupted_round_artifact(
+            store,
+            reconstruction,
+            evidence_root,
+            2,
+            state,
+            evidence_binding=(source, graph),
+        )
+
+    assert evidence_root.is_dir()
+    assert not list(reconstruction.glob(".evidence-round-02.interrupted-*"))
+
+
+def test_evidence_round_quarantine_rejects_hash_mismatch(
+    tmp_path: Path,
+) -> None:
+    store, reconstruction, source, graph, state = _bound_evidence_fixture(
+        tmp_path
+    )
+    evidence_root = reconstruction / "evidence-round-02"
+    evidence_root.mkdir()
+    (evidence_root / "source.png").write_bytes(b"foreign-source")
+    (evidence_root / "component-graph.json").write_bytes(b"trusted-graph-bytes")
+
+    with pytest.raises(RuntimeError, match="does not match"):
+        legacy._quarantine_interrupted_round_artifact(
+            store,
+            reconstruction,
+            evidence_root,
+            2,
+            state,
+            evidence_binding=(source, graph),
+        )
+
+    assert (evidence_root / "source.png").read_bytes() == b"foreign-source"
+
+
+def test_evidence_round_quarantine_moves_bound_interrupted_dir(
+    tmp_path: Path,
+) -> None:
+    store, reconstruction, source, graph, state = _bound_evidence_fixture(
+        tmp_path
+    )
+    evidence_root = reconstruction / "evidence-round-02"
+    evidence_root.mkdir()
+    (evidence_root / "source.png").write_bytes(b"trusted-source-bytes")
+    (evidence_root / "component-graph.json").write_bytes(b"trusted-graph-bytes")
+    (evidence_root / "extra.bin").write_bytes(b"leftover")
+
+    legacy._quarantine_interrupted_round_artifact(
+        store,
+        reconstruction,
+        evidence_root,
+        2,
+        state,
+        evidence_binding=(source, graph),
+    )
+
+    assert not evidence_root.exists()
+    quarantined = list(reconstruction.glob(".evidence-round-02.interrupted-*"))
+    assert len(quarantined) == 1
+    assert (quarantined[0] / "extra.bin").read_bytes() == b"leftover"
+
+
+def test_evidence_round_quarantine_refuses_linked_parent(
+    tmp_path: Path,
+) -> None:
+    store, reconstruction, source, graph, state = _bound_evidence_fixture(
+        tmp_path
+    )
+    external = tmp_path / "external-agent"
+    external.mkdir()
+    round_dir = external / "round-02"
+    round_dir.mkdir()
+    agent_link = reconstruction / "agent"
+    try:
+        agent_link.symlink_to(external, target_is_directory=True)
+    except OSError as error:
+        if os.name != "nt":
+            pytest.skip(f"directory links are unavailable: {error}")
+        junction = subprocess.run(
+            [
+                "cmd", "/c", "mklink", "/J",
+                str(agent_link), str(external),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if junction.returncode:
+            pytest.skip(f"directory links are unavailable: {error}")
+
+    with pytest.raises(RuntimeError, match="link or reparse"):
+        legacy._quarantine_interrupted_round_artifact(
+            store,
+            reconstruction,
+            reconstruction / "agent" / "round-02",
+            2,
+            state,
+            agent_binding=("0" * 64, "0" * 64),
+        )
+
+    assert round_dir.is_dir()
+
+
+def test_evidence_round_quarantine_never_overwrites_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, reconstruction, source, graph, state = _bound_evidence_fixture(
+        tmp_path
+    )
+    evidence_root = reconstruction / "evidence-round-02"
+    evidence_root.mkdir()
+    (evidence_root / "source.png").write_bytes(b"trusted-source-bytes")
+    (evidence_root / "component-graph.json").write_bytes(b"trusted-graph-bytes")
+    monkeypatch.setattr(
+        legacy.uuid, "uuid4", lambda: types.SimpleNamespace(hex="f" * 12)
+    )
+    destination = reconstruction / ".evidence-round-02.interrupted-ffffffffffff"
+    destination.mkdir()
+    (destination / "preserved.txt").write_text("preserved", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="already published"):
+        legacy._quarantine_interrupted_round_artifact(
+            store,
+            reconstruction,
+            evidence_root,
+            2,
+            state,
+            evidence_binding=(source, graph),
+        )
+
+    assert evidence_root.is_dir()
+    assert (destination / "preserved.txt").read_text(
+        encoding="utf-8"
+    ) == "preserved"
+
+
+def test_evidence_round_quarantine_rejects_identity_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, reconstruction, source, graph, state = _bound_evidence_fixture(
+        tmp_path
+    )
+    evidence_root = reconstruction / "evidence-round-02"
+    evidence_root.mkdir()
+    (evidence_root / "source.png").write_bytes(b"trusted-source-bytes")
+    (evidence_root / "component-graph.json").write_bytes(b"trusted-graph-bytes")
+    real_check = legacy._require_directory_chain_identity
+
+    def swap_target(chain):
+        shutil.rmtree(evidence_root)
+        evidence_root.mkdir()
+        (evidence_root / "foreign.bin").write_bytes(b"foreign")
+        real_check(chain)
+
+    monkeypatch.setattr(
+        legacy, "_require_directory_chain_identity", swap_target
+    )
+    with pytest.raises(RuntimeError, match="identity changed"):
+        legacy._quarantine_interrupted_round_artifact(
+            store,
+            reconstruction,
+            evidence_root,
+            2,
+            state,
+            evidence_binding=(source, graph),
+        )
+
+    assert (evidence_root / "foreign.bin").read_bytes() == b"foreign"
+    assert not list(reconstruction.glob(".evidence-round-02.interrupted-*"))
+
+
+def test_evidence_round_quarantine_rejects_foreign_parent(
+    tmp_path: Path,
+) -> None:
+    store, reconstruction, source, graph, state = _bound_evidence_fixture(
+        tmp_path
+    )
+    nested = reconstruction / "nested"
+    nested.mkdir()
+    evidence_root = nested / "evidence-round-02"
+    evidence_root.mkdir()
+
+    with pytest.raises(RuntimeError, match="parent is invalid"):
+        legacy._quarantine_interrupted_round_artifact(
+            store,
+            reconstruction,
+            evidence_root,
+            2,
+            state,
+            evidence_binding=(source, graph),
+        )
+
+    assert evidence_root.is_dir()
 
 
 def test_pdf_component_plan_e2e_is_serial_and_falls_back_before_one_assembly(
@@ -3367,6 +3834,73 @@ def test_background_rebuild_skips_page_surface_when_repairing_foreground(
     assert captured["repair"][9, 9]
     assert not captured["repair"][18, 18]
     assert Image.open(output).getpixel((18, 18)) == (128, 128, 128)
+
+
+def test_rebuild_canvas_background_clears_parent_only_card_edge(
+    tmp_path: Path,
+) -> None:
+    shape = (30, 40)
+    card_color = (20, 160, 60)
+    source_pixels = np.full((*shape, 3), 240, dtype=np.uint8)
+    source_pixels[4:26, 4:36] = card_color
+    source_pixels[10:14, 16:24] = 255
+    source_pixels[27:29, 4:20] = (200, 30, 30)
+    source = tmp_path / "source.png"
+    current = tmp_path / "current.png"
+    restored = tmp_path / "text-clean.png"
+    Image.fromarray(source_pixels).save(source)
+    Image.fromarray(source_pixels).save(current)
+    clean_pixels = source_pixels.copy()
+    clean_pixels[10:14, 16:24] = card_color
+    Image.fromarray(clean_pixels).save(restored)
+    graph_dir = tmp_path / "graph"
+    (graph_dir / "masks").mkdir(parents=True)
+    parent_card = _background_box_mask(shape, (4, 4, 36, 26))
+    child_card = _background_box_mask(shape, (8, 8, 32, 24))
+    text_inner = _background_box_mask(shape, (16, 10, 24, 14))
+    inactive_orphan = _background_box_mask(shape, (4, 27, 20, 29))
+    graph = _write_background_action_graph(
+        graph_dir,
+        {
+            "parent_card": parent_card,
+            "child_card": child_card,
+            "text_inner": text_inner,
+            "inactive_orphan": inactive_orphan,
+        },
+    )
+    graph["nodes"][0].update({"state": "inactive"})
+    graph["nodes"][1].update({
+        "kind": "child", "parent_id": "parent_card",
+    })
+    graph["nodes"][3].update({"state": "inactive"})
+    text_mask = tmp_path / "text-mask.png"
+    Image.fromarray(text_inner.astype(np.uint8) * 255, mode="L").save(text_mask)
+    output = tmp_path / "rebuilt.png"
+
+    legacy._rebuild_canvas_background(
+        source_path=source,
+        current_background_path=current,
+        restore_background_path=restored,
+        repair_requests=[({"child_card"}, 0.02)],
+        graph=graph,
+        graph_dir=graph_dir,
+        text_mask_path=text_mask,
+        output_path=output,
+        repair_all_active=False,
+    )
+
+    actual = np.asarray(Image.open(output).convert("RGB"))
+    assert not np.array_equal(
+        actual[4:8, 10:20], source_pixels[4:8, 10:20]
+    )
+    assert not np.array_equal(
+        actual[8:10, 10:20], source_pixels[8:10, 10:20]
+    )
+    assert not np.all(actual[10:14, 16:24] == 255)
+    assert np.array_equal(
+        actual[27:29, 4:20], source_pixels[27:29, 4:20]
+    )
+    assert np.array_equal(actual[0:3, 0:3], source_pixels[0:3, 0:3])
 
 
 def test_rebind_strict_pending_masks_preserves_component_ids(

@@ -168,3 +168,135 @@ def test_unchanged_context_reuses_readings_even_when_they_disagree(tmp_path, mon
     for _ in range(2):
         assert refine_overlapping_text(source, items, tmp_path, lang="en") == items
     assert len(calls) == 1
+
+
+def _numeric_edge_fixture(tmp_path, font_size=60, draw_left=True, name="numeric.png",
+                          background="white", ink=(0, 0, 0)):
+    from pathlib import Path
+    from PIL import ImageDraw, ImageFont
+    source = tmp_path / name
+    image = Image.new("RGB", (300, 140), background)
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.truetype(
+        str(Path(__file__).parent / "fixtures" / "fonts" / "PTSerif-BoldItalic.ttf"),
+        font_size,
+    )
+    if draw_left:
+        draw.text((30, 30), "4.", font=font, fill=ink)
+    draw.text((90, 30), "8", font=font, fill=ink)
+    image.save(source)
+    x0, y0, x1, y1 = draw.textbbox((90, 30), "8", font=font)
+    item = {"text": "8", "box": [int(x0), int(y0), int(x1 - x0), int(y1 - y0)],
+            "font_size": float(font_size), "confidence": .99}
+    return source, item
+
+
+def _numeric_reading(text, confidence):
+    return {"text": text, "confidence": confidence, "box": [0, 0, 10, 10],
+            "words": [{"text": text, "box": [0, 0, 1, 1]}]}
+
+
+def _numeric_views(*texts, confidence=.999):
+    def recognize(paths, work_dir, *, lang, **kwargs):
+        return [[_numeric_reading(texts[min(i, len(texts) - 1)], confidence)]
+                for i, _ in enumerate(paths)]
+    return recognize
+
+
+def test_numeric_edge_recovers_missing_integer_part(tmp_path, monkeypatch):
+    from scripts import text_context
+    source, item = _numeric_edge_fixture(tmp_path)
+    monkeypatch.setattr(text_context, "_recognize_context_views",
+                        _numeric_views("4.8", "4.8"))
+    result = text_context.refine_overlapping_text(source, [item], tmp_path, lang="ch")
+    assert [entry["text"] for entry in result] == ["4.8"]
+    nx, ny, nw, nh = result[0]["box"]
+    ox, oy, ow, oh = item["box"]
+    assert abs(nx - 31) <= 10 and nx + nw >= ox + ow
+    assert "words" not in result[0]
+
+
+def test_numeric_edge_rejected_when_views_disagree(tmp_path, monkeypatch):
+    from scripts import text_context
+    source, item = _numeric_edge_fixture(tmp_path)
+    monkeypatch.setattr(text_context, "_recognize_context_views",
+                        _numeric_views("4.8", "9.8"))
+    assert text_context.refine_overlapping_text(source, [item], tmp_path, lang="ch") == [item]
+
+
+def test_numeric_edge_rejected_below_confidence_floor(tmp_path, monkeypatch):
+    from scripts import text_context
+    source, item = _numeric_edge_fixture(tmp_path)
+    monkeypatch.setattr(text_context, "_recognize_context_views",
+                        _numeric_views("4.8", "4.8", confidence=.99))
+    assert text_context.refine_overlapping_text(source, [item], tmp_path, lang="ch") == [item]
+
+
+def test_numeric_edge_never_recognizes_small_or_inkless_candidate(tmp_path, monkeypatch):
+    from scripts import text_context
+    calls = []
+
+    def recognize(*a, **k):
+        calls.append(1)
+        return []
+
+    monkeypatch.setattr(text_context, "_recognize_context_views", recognize)
+    source, item = _numeric_edge_fixture(tmp_path)
+    small = {**item, "font_size": 18.0}
+    assert text_context.refine_overlapping_text(source, [small], tmp_path, lang="ch") == [small]
+    blank_source, blank_item = _numeric_edge_fixture(tmp_path, draw_left=False,
+                                                   name="numeric-blank.png")
+    assert text_context.refine_overlapping_text(blank_source, [blank_item], tmp_path,
+                                                lang="ch") == [blank_item]
+    assert not calls
+
+
+def test_numeric_edge_ignores_ink_owned_by_neighbor(tmp_path, monkeypatch):
+    from scripts import text_context
+    source, item = _numeric_edge_fixture(tmp_path)
+    neighbor = {"text": "4", "box": [25, 25, 45, 55], "font_size": 60.0,
+                "confidence": .99}
+    calls = []
+    monkeypatch.setattr(text_context, "_recognize_context_views",
+                        lambda *a, **k: calls.append(1) or [])
+    result = text_context.refine_overlapping_text(
+        source, [neighbor, item], tmp_path, lang="ch")
+    assert [entry["text"] for entry in result] == ["4", "8"]
+    assert not calls
+
+
+def test_numeric_edge_rejects_reading_not_ending_with_known_digits(tmp_path, monkeypatch):
+    from scripts import text_context
+    source, item = _numeric_edge_fixture(tmp_path)
+    monkeypatch.setattr(text_context, "_recognize_context_views",
+                        _numeric_views("4.9", "4.9"))
+    assert text_context.refine_overlapping_text(source, [item], tmp_path, lang="ch") == [item]
+
+
+def test_numeric_edge_recovers_dim_number_on_brighter_gray(tmp_path, monkeypatch):
+    from scripts import text_context
+    source, item = _numeric_edge_fixture(
+        tmp_path, background=(200, 200, 200), ink=(170, 170, 170),
+        name="numeric-dim.png")
+    monkeypatch.setattr(text_context, "_recognize_context_views",
+                        _numeric_views("4.8", "4.8"))
+    result = text_context.refine_overlapping_text(source, [item], tmp_path, lang="ch")
+    assert [entry["text"] for entry in result] == ["4.8"]
+    assert result[0]["box"][0] < item["box"][0]
+    assert "words" not in result[0]
+
+
+def test_numeric_edge_drops_shifted_ocr_word_geometry(tmp_path, monkeypatch):
+    from scripts import text_context
+    source, item = _numeric_edge_fixture(tmp_path)
+
+    def recognize(paths, work_dir, *, lang, **kwargs):
+        return [[{"text": "4.8", "confidence": .999, "box": [0, 0, 10, 10],
+                  "words": [{"text": "4.8", "box": [.375, 0, .45, 1]}]}]
+                for _ in paths]
+
+    monkeypatch.setattr(text_context, "_recognize_context_views", recognize)
+    result = text_context.refine_overlapping_text(source, [item], tmp_path, lang="ch")
+    assert [entry["text"] for entry in result] == ["4.8"]
+    assert abs(result[0]["box"][0] - 31) <= 10
+    assert "words" not in result[0]

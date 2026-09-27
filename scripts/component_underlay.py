@@ -603,14 +603,13 @@ def build_presentation_layer(
             ):
                 rgb[text_hole] = repaired[text_hole]
     if np.any(visual_hole):
-        visual_fill, metrics = _choose_visual_fill(
+        visual_fill, _ = _choose_visual_fill(
             rgb=rgb, source_rgb=source, semantic_mask=semantic,
             donor_mask=ownership, visual_hole=visual_hole,
             allow_smooth_surface=True,
         )
         rgb[visual_hole] = visual_fill[visual_hole]
-    else:
-        metrics = _visual_metrics(rgb, source, ownership, generated)
+    metrics = _visual_metrics(rgb, source, ownership, generated)
 
     return {
         "rgb": rgb,

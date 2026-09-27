@@ -197,3 +197,84 @@ def test_vertical_worker_word_positions_follow_rotated_crop():
     words = ocr_worker._recognition_item(result, [[10, 10], [50, 10], [50, 210], [10, 210]])["words"]
     assert words[0]["box"] == pytest.approx([0, .1, 1, .05])
     assert words[1]["box"] == pytest.approx([0, .75, 1, .05])
+
+
+def test_r3_heading_fragments_merge_preserving_comma_and_words(monkeypatch):
+    monkeypatch.setattr(
+        text_detect, "_estimate_style",
+        lambda *a, **k: {"font_size": 18, "color": "#000000", "bold": False},
+    )
+    image = np.full((1400, 2000, 3), 255, dtype=np.uint8)
+    raw = [
+        {"box": [381, 1173, 725, 192], "text": "Safety First,", "confidence": 0.9999933838844299,
+         "words": [{"text": "Safety", "box": [0.08367869410021551, 0.0, 0.4222183964170259, 0.9715919494628906]},
+                   {"text": " ", "box": [0.5439116379310345, 0.026063919067382812, 0.04566414668642238, 0.950341542561849]},
+                   {"text": "First", "box": [0.6275904162176724, 0.030878067016601562, 0.3385397023168104, 0.9671904246012369]},
+                   {"text": ",", "box": [0.9623053609913793, 0.05013402303059896, 0.03769463900862069, 0.949865976969401]}]},
+        {"box": [1104, 1165, 759, 204], "text": "Care Always", "confidence": 0.9999911785125732,
+         "words": [{"text": "Care", "box": [0.11185404057559288, 0.018773696001838234, 0.2704738772747859, 0.8772517185585171]},
+                   {"text": " ", "box": [0.4098016188549901, 0.06896075080422794, 0.047755707551054016, 0.8397360409007353]},
+                   {"text": "Always", "box": [0.4840411159832016, 0.0814657772288603, 0.4951718698534256, 0.91510009765625]}]},
+    ]
+    items, mask = text_detect._build_text_result(image, raw, 0.7, 6)
+    assert [item["text"] for item in items] == ["Safety First, Care Always"]
+    assert "," in [word["text"] for word in items[0].get("words", [])]
+    for x, y, w, h in ([381, 1173, 725, 192], [1104, 1165, 759, 204]):
+        assert (mask[y:y + h, x:x + w] == 255).all()
+
+
+def test_filter_noise_keeps_numeric_fragments_and_still_rejects_vertical():
+    boxes = [
+        {"text": "4.8", "box": (0, 0, 60, 20), "confidence": 0.99},
+        {"text": "4.", "box": (0, 0, 50, 20), "confidence": 0.99},
+        {"text": "86%", "box": (0, 0, 60, 20), "confidence": 0.99},
+        {"text": "−32%", "box": (0, 0, 80, 20), "confidence": 0.99},
+        {"text": "19111", "box": (1219, 445, 23, 115), "confidence": 0.95},
+    ]
+    filtered = text_detect._filter_noise(boxes)
+    assert [item["text"] for item in filtered] == ["4.8", "4.", "86%", "−32%"]
+
+
+def test_decimal_continuation_merges_without_separator_and_keeps_words():
+    left = {"box": [10, 10, 40, 40], "text": "4.", "confidence": 0.99,
+            "words": [{"text": "4.", "box": [0, 0, 1, 1]}]}
+    right = {"box": [52, 10, 30, 40], "text": "8", "confidence": 0.99,
+             "words": [{"text": "8", "box": [0, 0, 1, 1]}]}
+    merged = text_detect._merge_text_pair(left, right)
+    assert merged["text"] == "4.8"
+    assert [word["text"] for word in merged["words"]] == ["4.", "8"]
+
+
+def test_plain_digit_pairs_keep_space_separator():
+    left = {"box": [10, 10, 50, 20], "text": "2025", "confidence": 0.99}
+    right = {"box": [65, 10, 50, 20], "text": "2026", "confidence": 0.99}
+    merged = text_detect._merge_text_pair(left, right)
+    assert merged["text"] == "2025 2026"
+
+
+def test_distant_decimal_fragments_do_not_merge():
+    items = [
+        {"box": [10, 10, 40, 20], "text": "4.", "font_size": 20, "color": "#000000",
+         "bold": False, "font": "Arial", "confidence": 0.99},
+        {"box": [400, 10, 30, 20], "text": "8", "font_size": 20, "color": "#000000",
+         "bold": False, "font": "Arial", "confidence": 0.99},
+    ]
+    merged = text_detect._merge_adjacent_text_items(items)
+    assert [item["text"] for item in merged] == ["4.", "8"]
+
+
+def test_signed_decimal_fragment_keeps_sign_through_build_merge(monkeypatch):
+    monkeypatch.setattr(
+        text_detect, "_estimate_style",
+        lambda *a, **k: {"font_size": 18, "color": "#000000", "bold": False},
+    )
+    image = np.full((100, 300, 3), 255, dtype=np.uint8)
+    raw = [
+        {"box": [10, 20, 40, 40], "text": "-4.", "confidence": 0.99,
+         "words": [{"text": "-4.", "box": [0, 0, 1, 1]}]},
+        {"box": [52, 20, 30, 40], "text": "8", "confidence": 0.99,
+         "words": [{"text": "8", "box": [0, 0, 1, 1]}]},
+    ]
+    items, _ = text_detect._build_text_result(image, raw, 0.7, 6)
+    assert [item["text"] for item in items] == ["-4.8"]
+    assert [word["text"] for word in items[0].get("words", [])] == ["-4.", "8"]

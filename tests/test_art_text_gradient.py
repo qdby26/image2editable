@@ -77,3 +77,20 @@ def test_invalid_gradient_is_rejected_before_shape_creation(gradient):
     from scripts.text_runs import validate_text_runs
     with pytest.raises(ValueError, match="text runs"):
         validate_text_runs({"text": "A", "runs": [{"text": "A", "box": [0, 0, 1, 1], "gradient": gradient}]})
+
+
+def test_bounded_gradient_does_not_extrapolate_beyond_observed_fill():
+    from scripts.art_text import _linear_gradient
+    yy, xx = np.indices((100, 30))
+    region = (np.array([30, 100, 120]) + yy[..., None] * np.array([.5, 1, .8])).astype(np.uint8)
+    interior = (yy >= 20) & (yy < 60)
+    fill = np.ones((100, 30), dtype=bool)
+    original = _linear_gradient(region, interior, fill, 0)
+    assert original == _linear_gradient(region, interior, fill, 0, bound_samples=False)
+    bounded = _linear_gradient(region, interior, fill, 0, bound_samples=True)
+    assert bounded is not None
+    colors = np.array([[int(value[i:i+2], 16) for i in (1, 3, 5)] for value in bounded['colors']])
+    lo, hi = np.percentile(region[interior], (1, 99), axis=0)
+    assert np.all(colors >= lo - 5.5)
+    assert np.all(colors <= hi + 5.5)
+    assert original['colors'] != bounded['colors']

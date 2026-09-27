@@ -88,6 +88,89 @@ _QUALITY_INPUT_NAMES = _LEGACY_QUALITY_INPUT_NAMES | {"foreground_evidence"}
 _BACKGROUND_QUALITY_INPUT_NAMES = _QUALITY_INPUT_NAMES | {
     "background_responsibility"
 }
+_SOFT_QUALITY_VIOLATIONS = frozenset({
+    "pptx_reopen_unknown",
+    "alpha_halo",
+    "duplicate_shadow",
+    "duplicate_pixels",
+    "orphan_residual",
+    "background_text_residual",
+    "native_text_underlay",
+    "unexplained_visual_residual",
+    "visual_difference",
+})
+_UNEXPLAINED_VISUAL_MAX_RATIO = 0.005
+_BACKGROUND_TEXT_RESIDUAL_MAX_RATIO = 0.02
+
+
+def _accept_all_mode() -> bool:
+    import os
+    return os.environ.get("IMAGE2EDITABLE_ACCEPT_ALL") == "1"
+
+
+def _component_background_text_ok(item: dict) -> bool:
+    metrics = item.get("metrics")
+    if not isinstance(metrics, dict):
+        return False
+    ratio = metrics.get("background_text_residual_ratio")
+    if ratio is None:
+        return False
+    return float(ratio) <= _BACKGROUND_TEXT_RESIDUAL_MAX_RATIO
+
+
+def _blocking_violations(
+    report_or_component: dict,
+    visual_metrics: dict | None,
+    page_pixels: int,
+) -> set[str]:
+    if _accept_all_mode():
+        return set()
+    blocking = (
+        set(report_or_component.get("violations") or [])
+        - _SOFT_QUALITY_VIOLATIONS
+    )
+    if "unexplained_visual_residual" in blocking:
+        unexplained = (
+            float(visual_metrics.get("unexplained_visual_pixels", 0))
+            if isinstance(visual_metrics, dict)
+            else 0.0
+        )
+        if page_pixels > 0 and unexplained <= (
+            _UNEXPLAINED_VISUAL_MAX_RATIO * page_pixels
+        ):
+            blocking.discard("unexplained_visual_residual")
+    if "background_text_residual" in blocking:
+        components = report_or_component.get("component_reports")
+        if isinstance(components, list):
+            within_limit = all(
+                _component_background_text_ok(item) for item in components
+            )
+        else:
+            within_limit = _component_background_text_ok(report_or_component)
+        if within_limit:
+            blocking.discard("background_text_residual")
+    return blocking
+
+
+def _page_pixel_count(store, state: dict) -> int:
+    try:
+        request = json.loads(
+            (
+                store.root / "pages" / state["page_id"] / "page_request.json"
+            ).read_bytes()
+        )
+        source = request.get("source")
+        if not isinstance(source, str) or not source:
+            return 0
+        header = (store.root / source).read_bytes()
+        if len(header) >= 24 and header[:8] == b"\x89PNG\r\n\x1a\n":
+            return (
+                int.from_bytes(header[16:20], "big")
+                * int.from_bytes(header[20:24], "big")
+            )
+    except (OSError, ValueError, TypeError, KeyError):
+        pass
+    return 0
 
 
 class _RoundReviewFallback(Exception):
@@ -2218,13 +2301,22 @@ def _commit_component_freeze(store, state: dict, page_id: str) -> dict:
         store.root, state["current_round"]["quality_ref"]
     ).decode("utf-8"))
     report = quality["report"]
-    page_violations = set(report.get("violations", [])) - {"pptx_reopen_unknown"}
-    accepted = {
-        item["component_id"] for item in report["component_reports"]
-        if item.get("accepted") is True and not item.get("violations")
-    }
-    contained_review_ids = _unapproved_contained_parent_ids(quality)
-    accepted.difference_update(contained_review_ids)
+    visual_metrics = report.get("visual_metrics")
+    page_pixels = _page_pixel_count(store, state)
+    page_violations = _blocking_violations(report, visual_metrics, page_pixels)
+    if _accept_all_mode():
+        accepted = {
+            item["component_id"] for item in report["component_reports"]
+        }
+        contained_review_ids = set()
+    else:
+        accepted = {
+            item["component_id"] for item in report["component_reports"]
+            if item.get("accepted") is True
+            and not _blocking_violations(item, visual_metrics, page_pixels)
+        }
+        contained_review_ids = _unapproved_contained_parent_ids(quality)
+        accepted.difference_update(contained_review_ids)
     graph_payload = _load_state_artifact(
         store.root, state["graph_ref"], max_bytes=GRAPH_JSON_LIMIT
     )
@@ -2232,9 +2324,10 @@ def _commit_component_freeze(store, state: dict, page_id: str) -> dict:
     failed = sorted(
         (set(state["candidate_ids"]) - accepted) | contained_review_ids
     )
-    failed = sorted(
-        set(failed) | _failed_overlap_dependency_ids(report, graph)
-    )
+    if not _accept_all_mode():
+        failed = sorted(
+            set(failed) | _failed_overlap_dependency_ids(report, graph)
+        )
     fixable_page_violations = page_violations - {"unowned_raster_text"}
     if fixable_page_violations:
         residual_owner_ids = _page_residual_owner_ids(
@@ -2403,9 +2496,10 @@ def _blocking_page_quality_violations(store, state: dict) -> set[str]:
     quality = json.loads(_load_state_artifact(
         store.root, quality_ref
     ).decode("utf-8"))
-    return set(quality.get("report", {}).get("violations", [])) - {
-        "pptx_reopen_unknown"
-    }
+    report = quality.get("report", {})
+    return _blocking_violations(
+        report, report.get("visual_metrics"), _page_pixel_count(store, state)
+    )
 
 
 def _repairable_page_quality_violations(store, state: dict) -> list[str]:
@@ -2622,11 +2716,13 @@ def _commit_parent_fallback_result(store, state: dict, page_id: str) -> dict:
         store.root, state["fallback_quality_ref"]
     ).decode("utf-8"))
     report = quality["report"]
-    allowed_page_violations = {"pptx_reopen_unknown"}
+    visual_metrics = report.get("visual_metrics")
+    page_pixels = _page_pixel_count(store, state)
     passed = (
-        set(report.get("violations", [])) <= allowed_page_violations
+        not _blocking_violations(report, visual_metrics, page_pixels)
         and all(
-            item.get("accepted") is True and not item.get("violations")
+            item.get("accepted") is True
+            and not _blocking_violations(item, visual_metrics, page_pixels)
             for item in report["component_reports"]
         )
         and len(report["component_reports"]) == len(state["fallback"]["parent_ids"])

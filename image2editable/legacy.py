@@ -31,10 +31,12 @@ from image2editable.component_contracts import (
 from image2editable.component_repair import (
     COMPONENT_STATE_NAME,
     EVIDENCE_NAMES,
+    REQUEST_NAME,
     advance_component_repair,
     build_component_agent_request,
     execute_component_action_round,
     initialize_component_repair_state,
+    load_component_agent_request,
     record_component_execution,
     record_component_quality,
     record_next_component_request,
@@ -44,12 +46,18 @@ from image2editable.component_repair import (
     record_parent_fallback_quality,
     _decode_binary_grayscale_png,
     _read_bound_file,
+    _require_directory_chain_identity,
     _require_held_execution_lease,
     _snapshot_directory_chain,
     _validate_presentation_manifest,
     _write_exclusive,
 )
 from image2editable.inputs import sha256_file
+from image2editable.proposal_review_runtime import (
+    load_proposal_review_state,
+    make_proposal_gate,
+    proposal_review_enabled,
+)
 from image2editable.store import RunStore
 from image2editable.execution import ExecutionLease
 from scripts.psd_assemble import assemble_psd
@@ -700,12 +708,22 @@ def initialize_legacy_page(
     if ocr_worker_pool is not None or visual_worker_pool is not None:
         prepare_kwargs["performance_trace"] = performance_trace
         prepare_kwargs["page_id"] = page_id
+    module = importlib.import_module("image_to_ppt")
+    if proposal_review_enabled():
+        prepare_kwargs["proposal_gate"] = make_proposal_gate(
+            store,
+            page_id,
+            resource_isolation=prepare_kwargs["resource_isolation"],
+            module=module,
+        )
     with performance:
-        prepared = importlib.import_module("image_to_ppt").prepare_component_layers(
+        prepared = module.prepare_component_layers(
             source,
             reconstruction / "initial",
             **prepare_kwargs,
         )
+    if prepared.get("status") == "awaiting_proposal_review":
+        return {"status": "awaiting_proposal_review", "page_id": page_id}
     session = _build_initial_page_session(
         store, page_id, prepared, reconstruction
     )
@@ -1200,18 +1218,24 @@ def _build_presentation_assets(
         higher = np.zeros(source.shape[:2], dtype=bool)
         for z_index in sorted(groups, reverse=True):
             group = groups[z_index]
+            group_ownership = np.zeros(source.shape[:2], dtype=bool)
             for index, node, ownership in group:
                 if node["id"] in frozen_components:
                     components_by_id[node["id"]] = frozen_components[node["id"]]
+                    group_ownership |= ownership
                     continue
                 semantic = assigned_by_id[node["id"]]
+                presentation_ownership = ownership
                 if node["parent_id"] is not None:
-                    semantic = masks[node["parent_id"]] | semantic
-                if np.any(ownership):
+                    parent_mask = masks[node["parent_id"]]
+                    semantic = parent_mask | semantic
+                    presentation_ownership = presentation_ownership | parent_mask
+                group_ownership |= presentation_ownership
+                if np.any(presentation_ownership):
                     layer = build_presentation_layer(
                         source_rgb=source,
                         text_clean_rgb=text_clean,
-                        ownership_mask=ownership,
+                        ownership_mask=presentation_ownership,
                         semantic_mask=semantic,
                         higher_layer_mask=higher,
                         text_mask=text_mask,
@@ -1304,8 +1328,7 @@ def _build_presentation_assets(
                 }
                 components_by_id[node["id"]] = component
                 del arrays, encoded_rgb, layer, payloads
-            for _, _, ownership in group:
-                higher |= ownership
+            higher |= group_ownership
         components = [components_by_id[node["id"]] for node in active_nodes]
         manifest = {
             "schema_version": 1,
@@ -1710,6 +1733,13 @@ def advance_legacy_page(
     if outcome["status"] == "awaiting_agent":
         manifest = store.read_json("job_manifest.json")
         if manifest.get("options", {}).get("pipeline_mode", "strict") == "fast":
+            review_state = load_proposal_review_state(store, page_id)
+            if review_state is not None and review_state["status"] != "recorded":
+                return {
+                    "status": "awaiting_agent",
+                    "page_id": page_id,
+                    "repair_round": outcome.get("repair_round"),
+                }
             state = store.read_json(
                 f"pages/{page_id}/reconstruction/component_state.json"
             )
@@ -1860,6 +1890,24 @@ def _rebuild_canvas_background(
             ancestor_id = by_id[ancestor_id]["parent_id"]
         if not belongs_to_page_surface:
             repairable_visual |= masks_by_id[object_id]
+
+    def ancestor_visual_mask(object_id: str):
+        ancestor_id = by_id[object_id]["parent_id"]
+        while ancestor_id is not None and ancestor_id in by_id:
+            if ancestor_id in inactive_page_surfaces:
+                break
+            yield masks_by_id[ancestor_id]
+            ancestor_id = by_id[ancestor_id]["parent_id"]
+
+    for object_id, node in by_id.items():
+        if (
+            node["kind"] == "text"
+            or node["state"] not in {"pending", "pending_gate", "frozen"}
+            or node["parent_id"] is None
+        ):
+            continue
+        for ancestor_mask in ancestor_visual_mask(object_id):
+            visible_coverage |= ancestor_mask
     repair = (
         cv2.dilate(
             repairable_visual.astype(np.uint8), np.ones((3, 3), dtype=np.uint8)
@@ -1884,8 +1932,11 @@ def _rebuild_canvas_background(
             cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1)
         )
         for object_id in object_ids:
+            request_mask_source = masks_by_id[object_id].copy()
+            for ancestor_mask in ancestor_visual_mask(object_id):
+                request_mask_source |= ancestor_mask
             request_mask = cv2.dilate(
-                masks_by_id[object_id].astype(np.uint8), kernel
+                request_mask_source.astype(np.uint8), kernel
             ) > 0
             if object_id in text_by_id and by_id[object_id]["kind"] == "text":
                 x, y, width, height = map(int, text_by_id[object_id]["box"])
@@ -3576,26 +3627,36 @@ def _execute_legacy_round(
         Image.fromarray(effective_text_clean, mode="RGB").save(
             effective_text_clean_path
         )
-        _rebuild_canvas_background(
-            source_path=source,
-            current_background_path=(
-                current_background
-                if current_background is not None
-                else Path(prepared["background_original_path"])
-            ),
-            restore_background_path=effective_text_clean_path,
-            repair_requests=repair_requests,
-            graph=next_graph,
-            graph_dir=output_dir,
-            text_mask_path=effective_text_mask_path,
-            text_items=effective_text_items,
-            output_path=output_dir / "background-rebuilt.png",
-            repair_all_active=(
-                current_background is None
-                or sha256_file(current_background)
-                == sha256_file(Path(prepared["background_original_path"]))
-            ),
-        )
+        if (reconstruction / "initial" / "external-background.json").is_file():
+            shutil.copyfile(
+                (
+                    current_background
+                    if current_background is not None
+                    else Path(prepared["background_original_path"])
+                ),
+                output_dir / "background-rebuilt.png",
+            )
+        else:
+            _rebuild_canvas_background(
+                source_path=source,
+                current_background_path=(
+                    current_background
+                    if current_background is not None
+                    else Path(prepared["background_original_path"])
+                ),
+                restore_background_path=effective_text_clean_path,
+                repair_requests=repair_requests,
+                graph=next_graph,
+                graph_dir=output_dir,
+                text_mask_path=effective_text_mask_path,
+                text_items=effective_text_items,
+                output_path=output_dir / "background-rebuilt.png",
+                repair_all_active=(
+                    current_background is None
+                    or sha256_file(current_background)
+                    == sha256_file(Path(prepared["background_original_path"]))
+                ),
+            )
     refs = _quality_assets(
         store, page_id, next_graph, output_dir, output_dir,
         previous_quality_refs=previous_refs,
@@ -3619,6 +3680,123 @@ def _execute_legacy_round(
         output_graph_path=output_graph, _lease=lease,
     )
     return False
+
+
+def _verify_interrupted_evidence_dir(
+    target: Path,
+    *,
+    trusted_source: Path,
+    trusted_graph: Path,
+) -> None:
+    for name, trusted in (
+        ("source.png", trusted_source),
+        ("component-graph.json", trusted_graph),
+    ):
+        candidate = target / name
+        try:
+            status = candidate.lstat()
+        except FileNotFoundError as error:
+            raise RuntimeError(
+                f"Interrupted evidence round is unverifiable: {target}"
+            ) from error
+        if _is_link_or_reparse(status) or not stat.S_ISREG(status.st_mode):
+            raise RuntimeError(
+                f"Interrupted evidence round is unverifiable: {target}"
+            )
+        if sha256_file(candidate) != sha256_file(trusted):
+            raise RuntimeError(
+                f"Interrupted evidence round does not match this page: {target}"
+            )
+
+
+def _verify_interrupted_agent_dir(
+    target: Path,
+    repair_round: int,
+    *,
+    expected_source_sha256: str,
+    expected_graph_sha256: str,
+) -> None:
+    try:
+        request = load_component_agent_request(target / REQUEST_NAME)
+    except Exception as error:
+        raise RuntimeError(
+            f"Interrupted agent round is unverifiable: {target}"
+        ) from error
+    if (
+        request["repair_round"] != repair_round
+        or request["source_sha256"] != expected_source_sha256
+        or request["graph_sha256"] != expected_graph_sha256
+    ):
+        raise RuntimeError(
+            f"Interrupted agent round does not match this page: {target}"
+        )
+
+
+def _quarantine_interrupted_round_artifact(
+    store: RunStore,
+    reconstruction: Path,
+    target: Path,
+    repair_round: int,
+    state: dict,
+    *,
+    evidence_binding: tuple[Path, Path] | None = None,
+    agent_binding: tuple[str, str] | None = None,
+) -> None:
+    if target.parent != reconstruction and (
+        target.parent != reconstruction / "agent"
+    ):
+        raise RuntimeError(f"Round artifact parent is invalid: {target}")
+    current_round = state.get("current_round", {})
+    if (
+        current_round.get("round") == repair_round
+        and current_round.get("request_ref") is not None
+    ):
+        raise RuntimeError(
+            f"Round {repair_round} artifact is already recorded: {target}"
+        )
+    try:
+        status = target.lstat()
+    except FileNotFoundError:
+        return
+    if _is_link_or_reparse(status):
+        raise RuntimeError(
+            f"Refusing to move a link or reparse point: {target}"
+        )
+    if not stat.S_ISDIR(status.st_mode):
+        raise RuntimeError(
+            f"Refusing to move a non-directory artifact path: {target}"
+        )
+    target_identity = _directory_identity(status)
+    chain = _snapshot_directory_chain(target.parent, reconstruction)
+    if evidence_binding is not None:
+        trusted_source, trusted_graph = evidence_binding
+        _verify_interrupted_evidence_dir(
+            target,
+            trusted_source=trusted_source,
+            trusted_graph=trusted_graph,
+        )
+    elif agent_binding is not None:
+        expected_source_sha256, expected_graph_sha256 = agent_binding
+        _verify_interrupted_agent_dir(
+            target,
+            repair_round,
+            expected_source_sha256=expected_source_sha256,
+            expected_graph_sha256=expected_graph_sha256,
+        )
+    else:
+        raise RuntimeError(f"Round artifact binding is unknown: {target}")
+    _require_directory_chain_identity(chain)
+    current_status = target.lstat()
+    if (
+        _is_link_or_reparse(current_status)
+        or not stat.S_ISDIR(current_status.st_mode)
+        or _directory_identity(current_status) != target_identity
+    ):
+        raise RuntimeError(f"Round artifact identity changed: {target}")
+    quarantine = target.parent / (
+        f".{target.name}.interrupted-{uuid.uuid4().hex[:12]}"
+    )
+    _rename_directory_exclusive(target, quarantine, target_identity)
 
 
 def _publish_next_legacy_request(
@@ -3677,7 +3855,27 @@ def _publish_next_legacy_request(
         repair_round=repair_round,
     )
     evidence_root = reconstruction / f"evidence-round-{repair_round:02d}"
-    evidence_root.mkdir(exist_ok=False)
+    _quarantine_interrupted_round_artifact(
+        store,
+        reconstruction,
+        evidence_root,
+        repair_round,
+        state,
+        evidence_binding=(source, graph_path),
+    )
+    _quarantine_interrupted_round_artifact(
+        store,
+        reconstruction,
+        reconstruction / "agent" / f"round-{repair_round:02d}",
+        repair_round,
+        state,
+        agent_binding=(sha256_file(source), sha256_file(graph_path)),
+    )
+    staging = reconstruction / (
+        f".evidence-round-{repair_round:02d}.staging-{uuid.uuid4().hex[:12]}"
+    )
+    staging.mkdir(exist_ok=False)
+    staging_identity = _directory_identity(staging.lstat())
     evidence = {}
     copies = {
         "source.png": source,
@@ -3686,47 +3884,62 @@ def _publish_next_legacy_request(
     }
     if "foreground_evidence" in refs:
         copies["unexplained-mask.png"] = quality_path.parent / "unexplained-mask.png"
-    for name, source_path in copies.items():
-        target = evidence_root / name
-        shutil.copyfile(source_path, target)
-        evidence[name] = target
-    previous_manifest_path = _state_artifact(store, refs["presentation_manifest"])
-    execution = json.loads(_state_artifact(
-        store, state["current_round"]["execution_ref"]
-    ).read_text(encoding="utf-8"))
-    previous_manifest = _validate_presentation_manifest(
-        previous_manifest_path,
-        reconstruction,
-        source_sha256=state["source_sha256"],
-        graph_sha256=execution["output_graph_sha256"],
-    )
-    previous_manifest["graph_sha256"] = sha256_file(graph_path)
-    presentation_manifest = evidence_root / "presentation-manifest.json"
-    with presentation_manifest.open("x", encoding="utf-8") as stream:
-        json.dump(
-            previous_manifest,
-            stream,
-            ensure_ascii=False,
-            indent=2,
-            sort_keys=True,
+    try:
+        for name, source_path in copies.items():
+            target = staging / name
+            shutil.copyfile(source_path, target)
+            evidence[name] = target
+        previous_manifest_path = _state_artifact(
+            store, refs["presentation_manifest"]
         )
-        stream.write("\n")
-    evidence["presentation-manifest.json"] = presentation_manifest
-    shutil.copytree(graph_path.parent / "masks", evidence_root / "masks")
-    evidence.update(
-        _render_component_evidence(
-            source_path=evidence["source.png"],
-            graph=graph,
-            text_mask_path=_state_artifact(store, refs["text_mask"]),
-            background_path=_state_artifact(store, refs["background"]),
-            presentation_manifest_path=evidence["presentation-manifest.json"],
-            run_root=store.root,
-            reconstruction=reconstruction,
-            graph_sha256=sha256_file(evidence["component-graph.json"]),
-            output_dir=evidence_root,
-            text_items=text_items,
+        execution = json.loads(_state_artifact(
+            store, state["current_round"]["execution_ref"]
+        ).read_text(encoding="utf-8"))
+        previous_manifest = _validate_presentation_manifest(
+            previous_manifest_path,
+            reconstruction,
+            source_sha256=state["source_sha256"],
+            graph_sha256=execution["output_graph_sha256"],
         )
-    )
+        previous_manifest["graph_sha256"] = sha256_file(graph_path)
+        presentation_manifest = staging / "presentation-manifest.json"
+        with presentation_manifest.open("x", encoding="utf-8") as stream:
+            json.dump(
+                previous_manifest,
+                stream,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            stream.write("\n")
+        evidence["presentation-manifest.json"] = presentation_manifest
+        shutil.copytree(graph_path.parent / "masks", staging / "masks")
+        evidence.update(
+            _render_component_evidence(
+                source_path=evidence["source.png"],
+                graph=graph,
+                text_mask_path=_state_artifact(store, refs["text_mask"]),
+                background_path=_state_artifact(store, refs["background"]),
+                presentation_manifest_path=evidence["presentation-manifest.json"],
+                run_root=store.root,
+                reconstruction=reconstruction,
+                graph_sha256=sha256_file(evidence["component-graph.json"]),
+                output_dir=staging,
+                text_items=text_items,
+            )
+        )
+        if not staging.resolve().is_relative_to(store.root.resolve()):
+            raise RuntimeError(
+                f"Evidence staging escaped the run directory: {staging}"
+            )
+    except BaseException:
+        _safe_rmtree(staging, staging_identity)
+        raise
+    _rename_directory_exclusive(staging, evidence_root, staging_identity)
+    evidence = {
+        name: evidence_root / path.relative_to(staging)
+        for name, path in evidence.items()
+    }
     session = {
         "page_id": page_id, "provider": state["provider"],
         "reconstruction_dir": reconstruction, "evidence": evidence,

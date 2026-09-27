@@ -2,6 +2,7 @@
 from pathlib import Path
 import hashlib
 import json
+import re
 import tempfile
 import unicodedata
 
@@ -140,11 +141,160 @@ def _restore_context_edges(source_path, items, readings):
             if i not in removed or i in replacements]
 
 
+def _restore_numeric_edges(source_path, items, work_dir, *, lang, **kwargs):
+    """Re-recognize bare numbers when unowned same-line ink sits at their left."""
+    candidates = []
+    for index, item in enumerate(items):
+        text = item.get("text", "").strip()
+        if (not re.fullmatch(r"[+−-]?\d{1,4}%?", text)
+                or item.get("rotation", 0) or "runs" in item
+                or float(item.get("font_size", 0) or 0) < 24
+                or item["box"][3] < 24):
+            continue
+        candidates.append(index)
+    if not candidates:
+        return items
+    replacements = {}
+    with Image.open(source_path) as source, tempfile.TemporaryDirectory(
+            prefix="numeric-context-", dir=work_dir) as temporary:
+        pixels = np.asarray(source.convert("RGB"))
+        paths, frames, selected = [], [], []
+        pixels_used = 0
+        for index in candidates[:8]:
+            x, y, w, h = (int(v) for v in items[index]["box"])
+            frame = [max(0, int(x - 1.5 * h)), max(0, int(y - .1 * h)),
+                     min(source.width, int(x + w + .35 * h)),
+                     min(source.height, int(y + h + .1 * h))]
+            width, height = frame[2] - frame[0], frame[3] - frame[1]
+            if min(width, height) <= 0 or pixels_used + 2 * width * height > 6_291_456:
+                continue
+            with source.crop(frame).convert("RGB") as view:
+                crop = np.asarray(view)
+                border = np.concatenate(
+                    (crop[0], crop[-1], crop[:, 0], crop[:, -1])).astype(np.float32)
+                median = np.median(border, axis=0)
+                distance = np.linalg.norm(
+                    crop.astype(np.int16) - median.astype(np.int16), axis=2)
+                peak = float(distance.max())
+                if peak < 8:
+                    continue
+                ink = distance > .25 * peak
+                ink[y - frame[1]:y - frame[1] + h,
+                    x - frame[0]:x - frame[0] + w] = False
+                for other_index, other in enumerate(items):
+                    if other_index == index:
+                        continue
+                    ox, oy, ow, oh = (int(v) for v in other["box"])
+                    rx, ry = ox - frame[0], oy - frame[1]
+                    left, top = max(0, rx), max(0, ry)
+                    right, bottom = min(width, rx + ow), min(height, ry + oh)
+                    if right > left and bottom > top:
+                        ink[top:bottom, left:right] = False
+                _, _, stats, _ = cv2.connectedComponentsWithStats(
+                    ink.astype(np.uint8), connectivity=8)
+                found = False
+                for cx, cy, cw, ch, _area in stats[1:]:
+                    edge = frame[0] + cx + cw
+                    if (ch >= .3 * h and cw >= .12 * h
+                            and edge <= x and x - edge <= 1.5 * h):
+                        found = True
+                        break
+                if not found:
+                    continue
+                pixels_used += 2 * width * height
+                for scale in (1, .85):
+                    path = Path(temporary) / f"{len(paths):04d}.png"
+                    view.resize((max(1, round(width * scale)),
+                                 max(1, round(height * scale))),
+                                Image.Resampling.LANCZOS).save(path)
+                    paths.append(path)
+            selected.append(index)
+            frames.append(frame)
+        if not paths:
+            return items
+        readings = _recognize_context_views(paths, work_dir, lang=lang, **kwargs)
+        if readings is None:
+            return items
+        for position, (index, frame) in enumerate(zip(selected, frames)):
+            first, second = readings[2 * position:2 * position + 2]
+            if len(first) != 1 or len(second) != 1:
+                continue
+            normalized = _normalized(first[0]["text"])
+            if normalized != _normalized(second[0]["text"]):
+                continue
+            if min(first[0].get("confidence", 0),
+                   second[0].get("confidence", 0)) < .995:
+                continue
+            text = first[0]["text"].strip()
+            old = _normalized(items[index]["text"])
+            if (not re.fullmatch(r"[+−-]?\d+[.,]\d+%?", text)
+                    or not normalized.endswith(old)
+                    or len(normalized) <= len(old)
+                    or len(normalized) - len(old) > 3):
+                continue
+            words = first[0].get("words")
+            if not words or not text_detect._validated_words(text, words):
+                continue
+            ix, iy, iw, ih = (int(v) for v in items[index]["box"])
+            region = pixels[frame[1]:frame[3], frame[0]:frame[2]]
+            border = np.concatenate(
+                (region[0], region[-1], region[:, 0], region[:, -1]))
+            distance = np.linalg.norm(
+                region.astype(np.int16)
+                - np.median(border, axis=0).astype(np.int16), axis=2)
+            peak = float(distance.max())
+            if peak < 8:
+                continue
+            _, _, stats, _ = cv2.connectedComponentsWithStats(
+                (distance > .25 * peak).astype(np.uint8), connectivity=8)
+            kept = [component for component in stats[1:]
+                    if component[4] >= .002 * ih * ih]
+            if not kept:
+                continue
+            ox0, oy0 = ix - frame[0], iy - frame[1]
+            if not any(
+                    min(component[0] + component[2], ox0 + iw)
+                    - max(component[0], ox0) > 0
+                    and min(component[1] + component[3], oy0 + ih)
+                    - max(component[1], oy0) > 0
+                    for component in kept):
+                continue
+            left = min(component[0] for component in kept)
+            top = min(component[1] for component in kept)
+            right = max(component[0] + component[2] for component in kept)
+            bottom = max(component[1] + component[3] for component in kept)
+            padding = max(2, round(.03 * ih))
+            bx0 = max(frame[0], frame[0] + int(left) - padding)
+            by0 = max(frame[1], frame[1] + int(top) - padding)
+            bx1 = min(frame[2], frame[0] + int(right) + padding)
+            by1 = min(frame[3], frame[1] + int(bottom) + padding)
+            raw = {**first[0], "box": [bx0, by0, bx1 - bx0, by1 - by0]}
+            raw.pop("words", None)
+            styled, _ = text_detect._build_text_result(pixels, [raw], .98, 6)
+            if len(styled) != 1 or _normalized(styled[0]["text"]) != normalized:
+                continue
+            sx, sy, sw, sh = (int(v) for v in styled[0]["box"])
+            if any(other_index != index
+                   and min(sx + sw, ox + ow) - max(sx, ox) > 0
+                   and min(sy + sh, oy + oh) - max(sy, oy) > 0
+                   for other_index, other in enumerate(items)
+                   for ox, oy, ow, oh in [other["box"]]):
+                continue
+            replacements[index] = styled[0]
+    return [replacements[i] if i in replacements else item
+            for i, item in enumerate(items)]
+
+
 def refine_overlapping_text(source_path, items, work_dir, *, lang, worker_pool=None,
                             performance_trace=None, page_id=None, context_readings=None):
     items = _restore_label_leaders(source_path, items)
     if context_readings:
         items = _restore_context_edges(source_path, items, context_readings)
+    items = _restore_numeric_edges(
+        source_path, items, work_dir, lang=lang,
+        worker_pool=worker_pool, performance_trace=performance_trace,
+        page_id=page_id,
+    )
     groups = [[index] for index in range(len(items))]
     while True:
         pair = None

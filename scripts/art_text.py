@@ -95,7 +95,8 @@ def _outlined_ink(region, *, ownership=None, return_mask=False):
     return _measure_ink(region, fill_mask, ink, dark)
 
 
-def _linear_gradient(region, interior, fill_mask, rotation):
+def _linear_gradient(region, interior, fill_mask, rotation, *,
+                     min_inlier_fraction=.95, max_rmse=8.0, bound_samples=False):
     yy, xx = np.nonzero(interior)
     coords = np.column_stack((xx, yy)).astype(float)
     samples = region[interior].astype(float)
@@ -105,7 +106,7 @@ def _linear_gradient(region, interior, fill_mask, rotation):
     inliers = errors <= max(8, float(np.percentile(errors, 85)))
     coefficients = np.linalg.lstsq(design[inliers], samples[inliers], rcond=None)[0]
     errors = np.linalg.norm(design @ coefficients-samples, axis=1)
-    if np.mean(errors < 20) < .95 or np.sqrt(np.mean(errors[inliers]**2)) > 8:
+    if np.mean(errors < 20) < min_inlier_fraction or np.sqrt(np.mean(errors[inliers]**2)) > max_rmse:
         return None
     directions, strengths, _ = np.linalg.svd(coefficients[:2], full_matrices=False)
     if strengths[0] < .05 or strengths[1] > strengths[0]*.15:
@@ -126,6 +127,10 @@ def _linear_gradient(region, interior, fill_mask, rotation):
     base = np.append(center, 1) @ coefficients
     slope = direction @ coefficients[:2]
     colors = [np.clip(base+(position-center @ direction)*slope, 0, 255) for position in (limits.min(), limits.max())]
+    if bound_samples:
+        low_color, high_color = np.percentile(samples, (1, 99), axis=0)
+        colors = [np.clip(color, np.maximum(0, low_color - 5),
+                          np.minimum(255, high_color + 5)) for color in colors]
     if np.linalg.norm(colors[0]-colors[1]) < 20:
         return None
     return {"angle": float(np.degrees(np.arctan2(local_direction[1], local_direction[0])) % 360),

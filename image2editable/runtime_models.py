@@ -227,7 +227,7 @@ def _quarantine_asset(path: Path, cache: Path) -> None:
         strict_file_record(path, cache)
     destination = path.with_name(f".{path.name}.rejected-{secrets.token_hex(16)}")
     parent_status = _directory_status(path.parent, "repair parent")
-    binding = _open_directory(path.parent)
+    binding = _open_directory(path.parent, delete=False)
     try:
         _validate_parent(path.parent, binding, parent_status)
         current = path.lstat()
@@ -346,7 +346,7 @@ def _install_snapshot(cache: Path, entry: dict[str, object]) -> dict[str, object
     except FileExistsError:
         pass
     parent_status = _directory_status(parent, "snapshot parent")
-    parent_binding = _open_directory(parent)
+    parent_binding = _open_directory(parent, delete=False)
     staging_binding = None
     try:
         _validate_parent(parent, parent_binding, parent_status)
@@ -446,10 +446,10 @@ def _require_directory_identity(
         raise RuntimeError(f"runtime {label} identity changed: {path}")
 
 
-def _open_directory(path: Path) -> tuple[int, tuple[int, int] | None]:
+def _open_directory(path: Path, *, delete: bool = True) -> tuple[int, tuple[int, int] | None]:
     if os.name == "nt":
         before = _directory_status(path, "directory")
-        handle = _open_windows_directory(path)
+        handle = _open_windows_directory(path, delete=delete)
         after = _directory_status(path, "directory")
         if _directory_identity(before) != _directory_identity(after):
             _close_windows_handle(handle)
@@ -560,7 +560,7 @@ def _validate_directory_binding(
         raise RuntimeError(f"runtime {label} identity changed: {path}")
 
 
-def _open_windows_directory(path: Path) -> int:
+def _open_windows_directory(path: Path, *, delete: bool = True) -> int:
     from ctypes import wintypes
 
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -577,7 +577,7 @@ def _open_windows_directory(path: Path) -> int:
     create_file.restype = wintypes.HANDLE
     handle = create_file(
         str(path),
-        0x80000000 | 0x00010000,
+        0x80000000 | (0x00010000 if delete else 0),
         0x00000001 | 0x00000002,
         None,
         3,

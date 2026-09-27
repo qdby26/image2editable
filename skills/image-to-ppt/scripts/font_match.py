@@ -85,12 +85,18 @@ def _normalize(mask):
     return cv2.resize(cropped, (64, 64), interpolation=cv2.INTER_AREA), width, height
 
 
-@lru_cache(maxsize=128)
-def match_text_face(pixels: bytes, width: int, height: int, text: str):
-    """Match a straight text line locally; whitespace does not determine weight."""
+GROUP_ITALIC_MIN_MEAN = 0.70
+GROUP_ITALIC_MIN_EACH = 0.65
+
+
+def _prepare_target(region, binary=False):
+    """Clean an OCR crop and return (normalized_ink_target, contrast) or None.
+
+    binary=True thresholds the cleaned contrast map at half its peak before
+    normalization so gradient fills and halo shading do not bias the ink mask.
+    """
     from scripts.text_detect import _normalized_ink
 
-    region = np.frombuffer(pixels, dtype=np.uint8).reshape(height, width, 3)
     gray = cv2.cvtColor(region, cv2.COLOR_RGB2GRAY).astype(np.float32)
     border = np.concatenate((gray[0], gray[-1], gray[:, 0], gray[:, -1]))
     contrast = np.abs(gray - np.median(border))
@@ -100,14 +106,14 @@ def match_text_face(pixels: bytes, width: int, height: int, text: str):
     )
     for label in range(1, count):
         x, y, w, h, _ = stats[label]
-        if (h == height and w <= 2 and (x == 0 or x + w == width)) or (
-            w == width and h <= 2 and (y == 0 or y + h == height)
+        if (h == region.shape[0] and w <= 2 and (x == 0 or x + w == region.shape[1])) or (
+            w == region.shape[1] and h <= 2 and (y == 0 or y + h == region.shape[0])
         ):
             contrast[labels == label] = 0
     # OCR boxes may include the descenders of the preceding line. Do not
     # measure that fragment as part of this line's font height.
     rows = np.flatnonzero((contrast > contrast.max() * .2).any(axis=1))
-    bands = np.split(rows, np.flatnonzero(np.diff(rows) > max(2, height * .05)) + 1)
+    bands = np.split(rows, np.flatnonzero(np.diff(rows) > max(2, region.shape[0] * .05)) + 1)
     if len(bands) > 1:
         weights = [float(contrast[band].sum()) for band in bands]
         selected = int(np.argmax(weights))
@@ -116,10 +122,21 @@ def match_text_face(pixels: bytes, width: int, height: int, text: str):
         keep = bands[selected]
         contrast[:keep[0]] = 0
         contrast[keep[-1] + 1:] = 0
-    target = _normalized_ink(contrast)
+    if binary:
+        maximum = float(contrast.max())
+        if maximum <= 0:
+            return None
+        target = _normalized_ink((contrast > .5 * maximum).astype(np.float32))
+    else:
+        target = _normalized_ink(contrast)
     if target is None:
         return None
-    compact = target[:, target.max(axis=0) > .2]
+    return target, contrast
+
+
+def _target_letters(target, text):
+    from scripts.text_detect import _normalized_ink
+
     edges = np.diff(np.pad((target.max(axis=0) > .2).astype(np.int8), 1))
     intervals = list(zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)))
     chars = [char for char in text if not char.isspace()]
@@ -128,6 +145,112 @@ def match_text_face(pixels: bytes, width: int, height: int, text: str):
         for char, (left, right) in zip(chars, intervals):
             if char.isalnum() and len(letters) < 6:
                 letters.setdefault(char, _normalized_ink(target[:, left:right]))
+    return letters
+
+
+def _ink_similarity(observed, reference):
+    from scripts.text_detect import _normalized_ink
+
+    fitted = cv2.resize(reference, (observed.shape[1], observed.shape[0]), interpolation=cv2.INTER_AREA)
+    fitted = _normalized_ink(fitted)
+    if fitted.shape != observed.shape:
+        fitted = cv2.resize(fitted, (observed.shape[1], observed.shape[0]), interpolation=cv2.INTER_AREA)
+    overlap = np.minimum(observed, fitted).sum() / np.maximum(observed, fitted).sum()
+    aspect = abs(np.log((reference.shape[1] / reference.shape[0]) / (observed.shape[1] / observed.shape[0])))
+    return float(overlap - .15 * aspect)
+
+
+def _score_member(target, letters, face, text):
+    """match_text_face's search scoring against one prepared target."""
+    from scripts.text_detect import _normalized_ink
+
+    compact = target[:, target.max(axis=0) > .2]
+    glyph = _glyph.__wrapped__(face, text)
+    if glyph is None:
+        return None
+    reference = _normalized_ink(np.asarray(glyph, dtype=np.float32))
+    if reference is None:
+        return None
+    size = 128 * target.shape[0] / reference.shape[0]
+    score = max(_ink_similarity(target, reference), _ink_similarity(
+        compact, reference[:, reference.max(axis=0) > .2],
+    ))
+    if len(letters) >= 3:
+        letter_scores = []
+        for char, observed in letters.items():
+            letter = _glyph(face, char)
+            if letter is None:
+                break
+            letter_scores.append(_ink_similarity(
+                observed, _normalized_ink(np.asarray(letter, dtype=np.float32))))
+        if len(letter_scores) == len(letters):
+            score = max(score, sum(letter_scores) / len(letter_scores))
+    return score, size
+
+
+@lru_cache(maxsize=128)
+def match_text_group(members):
+    """Pick one italic face shared by a row of same-style text siblings.
+
+    members: tuple of (pixels: bytes, width, height, text). Only italic faces
+    are searched and a face must render every member's text. Acceptance needs
+    both the mean and the weakest member score over the group thresholds, so
+    siblings keep one font instead of drifting to per-item near-misses.
+    """
+    from scripts.text_detect import _normalized_ink
+
+    prepared = []
+    for pixels, width, height, text in members:
+        region = np.frombuffer(pixels, dtype=np.uint8).reshape(height, width, 3)
+        item = _prepare_target(region, binary=True)
+        if item is None:
+            return None
+        target, contrast = item
+        prepared.append((target, contrast, _target_letters(target, text), text))
+    scores = []
+    for face in installed_faces():
+        if not face[2]:
+            continue
+        member_scores = []
+        for target, _, letters, text in prepared:
+            scored = _score_member(target, letters, face, text)
+            if scored is None:
+                member_scores = None
+                break
+            member_scores.append(scored)
+        if member_scores is not None:
+            scores.append((sum(s for s, _ in member_scores) / len(member_scores),
+                           face, member_scores))
+    if not scores:
+        return None
+    scores.sort(key=lambda entry: entry[0], reverse=True)
+    mean, face, member_scores = scores[0]
+    if mean < GROUP_ITALIC_MIN_MEAN or min(s for s, _ in member_scores) < GROUP_ITALIC_MIN_EACH:
+        return None
+    results = []
+    for (target, contrast, _, _), (_, size) in zip(prepared, member_scores):
+        ys, xs = np.nonzero(contrast > contrast.max() * .2)
+        results.append({'font': face[0], 'bold': face[1], 'italic': True,
+                        'font_size_px': size,
+                        'ink_box': [int(xs.min()), int(ys.min()),
+                                    int(xs.max() - xs.min() + 1),
+                                    int(ys.max() - ys.min() + 1)]})
+    return results
+
+
+@lru_cache(maxsize=128)
+def match_text_face(pixels: bytes, width: int, height: int, text: str,
+                    italic: bool = False):
+    """Match a straight text line locally; whitespace does not determine weight."""
+    from scripts.text_detect import _normalized_ink
+
+    region = np.frombuffer(pixels, dtype=np.uint8).reshape(height, width, 3)
+    prepared = _prepare_target(region)
+    if prepared is None:
+        return None
+    target, contrast = prepared
+    compact = target[:, target.max(axis=0) > .2]
+    letters = _target_letters(target, text)
 
     def similarity(observed, reference):
         fitted = cv2.resize(reference, (observed.shape[1], observed.shape[0]), interpolation=cv2.INTER_AREA)
@@ -138,57 +261,68 @@ def match_text_face(pixels: bytes, width: int, height: int, text: str):
         aspect = abs(np.log((reference.shape[1] / reference.shape[0]) / (observed.shape[1] / observed.shape[0])))
         return float(overlap - .15 * aspect)
 
-    best = None
-    measured_faces = []
-    for face in installed_faces():
-        if face[2]:
-            continue
-        try:
-            glyph = _glyph.__wrapped__(face, text)
-            if glyph is None:
-                continue
-            reference = _normalized_ink(np.asarray(glyph, dtype=np.float32))
-            if reference is None:
-                continue
-            size = 128 * target.shape[0] / reference.shape[0]
-            measured_faces.append((face, round(size)))
-            score = max(similarity(target, reference), similarity(
-                compact, reference[:, reference.max(axis=0) > .2],
-            ))
-            if len(letters) >= 3:
-                letter_scores = []
-                for char, observed in letters.items():
-                    letter = _glyph(face, char)
-                    if letter is None:
-                        break
-                    letter_scores.append(similarity(observed, _normalized_ink(np.asarray(letter, dtype=np.float32))))
-                if len(letter_scores) == len(letters):
-                    score = max(score, sum(letter_scores) / len(letter_scores))
-            if best is None or score > best[0]:
-                best = (score, face, size)
-        except OSError:
-            continue
-    if best is not None and best[0] < .75:
-        # Small raster text is hinted at its actual size. Downsampling a large
-        # reference can reject the right face, so retry at the measured size.
-        for face, size in measured_faces:
+    def search(faces):
+        best = None
+        measured_faces = []
+        for face in faces:
             try:
-                for pixels in range(max(1, size - 1), size + 2):
-                    glyph = _glyph.__wrapped__(face, text, pixels)
-                    reference = _normalized_ink(np.asarray(glyph, dtype=np.float32))
-                    if reference is None:
-                        continue
-                    score = similarity(target, reference)
-                    if score > best[0]:
-                        best = (score, face, pixels)
+                glyph = _glyph.__wrapped__(face, text)
+                if glyph is None:
+                    continue
+                reference = _normalized_ink(np.asarray(glyph, dtype=np.float32))
+                if reference is None:
+                    continue
+                size = 128 * target.shape[0] / reference.shape[0]
+                measured_faces.append((face, round(size)))
+                score = max(similarity(target, reference), similarity(
+                    compact, reference[:, reference.max(axis=0) > .2],
+                ))
+                if len(letters) >= 3:
+                    letter_scores = []
+                    for char, observed in letters.items():
+                        letter = _glyph(face, char)
+                        if letter is None:
+                            break
+                        letter_scores.append(similarity(observed, _normalized_ink(np.asarray(letter, dtype=np.float32))))
+                    if len(letter_scores) == len(letters):
+                        score = max(score, sum(letter_scores) / len(letter_scores))
+                if best is None or score > best[0]:
+                    best = (score, face, size)
             except OSError:
                 continue
+        if best is not None and best[0] < .75:
+            # Small raster text is hinted at its actual size. Downsampling a large
+            # reference can reject the right face, so retry at the measured size.
+            for face, size in measured_faces:
+                try:
+                    for pixels in range(max(1, size - 1), size + 2):
+                        glyph = _glyph.__wrapped__(face, text, pixels)
+                        reference = _normalized_ink(np.asarray(glyph, dtype=np.float32))
+                        if reference is None:
+                            continue
+                        score = similarity(target, reference)
+                        if score > best[0]:
+                            best = (score, face, pixels)
+                except OSError:
+                    continue
+        return best
+
+    faces = installed_faces()
+    if italic:
+        best = search(face for face in faces if face[2])
+        if best is None or best[0] < .75:
+            best = search(face for face in faces if not face[2])
+    else:
+        best = search(face for face in faces if not face[2])
     if best is None or best[0] < .75:
         return None
     score, face, size = best
     ys, xs = np.nonzero(contrast > contrast.max() * .2)
-    return {'font': face[0], 'bold': face[1], 'font_size_px': size,
-            'ink_box': [int(xs.min()), int(ys.min()), int(xs.max()-xs.min()+1), int(ys.max()-ys.min()+1)]}
+    result = {'font': face[0], 'bold': face[1], 'font_size_px': size,
+              'ink_box': [int(xs.min()), int(ys.min()), int(xs.max()-xs.min()+1), int(ys.max()-ys.min()+1)]}
+    if italic:
+        result['italic'] = True
+    return result
 
 
 def match_glyph(mask, text, preferred_font="Arial"):

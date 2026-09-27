@@ -73,6 +73,7 @@ from scripts.initial_diagnostics import (
 from scripts.visual_segment import (
     MaskCandidate,
     VisualSegmentationError,
+    apply_region_grouping,
     background_residual_metrics,
     complete_initial_visual_element_masks,
     combine_residual_candidates,
@@ -124,6 +125,56 @@ except ModuleNotFoundError as error:
     from scripts.worker_pool import JsonLineWorker, TaskWorkerPool
 
 logger = logging.getLogger(__name__)
+
+
+def _external_background_override(
+    height: int, width: int
+) -> tuple[np.ndarray, dict] | None:
+    raw = os.environ.get("IMAGE2EDITABLE_EXTERNAL_BACKGROUND")
+    if not raw:
+        return None
+    path = Path(raw).expanduser().resolve()
+    if not path.is_file():
+        raise ValueError(
+            f"IMAGE2EDITABLE_EXTERNAL_BACKGROUND file not found: {path}"
+        )
+    with Image.open(path) as image:
+        background = np.asarray(image.convert("RGB"))
+    original_size = [background.shape[1], background.shape[0]]
+    if background.shape[:2] != (height, width):
+        background = np.asarray(
+            Image.fromarray(background, mode="RGB").resize(
+                (width, height), Image.LANCZOS
+            )
+        )
+    record = {
+        "path": str(path),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "original_size": original_size,
+        "applied_size": [width, height],
+    }
+    return background.astype(np.uint8), record
+
+
+def _region_layout_override(width: int, height: int):
+    raw = os.environ.get("IMAGE2EDITABLE_REGIONS_JSON")
+    if not raw:
+        return None
+    path = Path(raw).expanduser().resolve()
+    if not path.is_file():
+        raise ValueError(f"IMAGE2EDITABLE_REGIONS_JSON file not found: {path}")
+    from scripts.visual_segment import load_region_layout
+
+    layout = load_region_layout(path, (width, height))
+    return {
+        "layout": layout,
+        "record": {
+            "path": str(path),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "cards": [list(box) for box in layout["cards"]],
+            "graphics": layout["graphics"],
+        },
+    }
 
 
 def _worker_script_path(name: str) -> Path:
@@ -1680,6 +1731,129 @@ def _component_text_overlap_reports(
     return reports
 
 
+def confirmed_object_proposals(
+    objects: list,
+    image_size: tuple[int, int],
+) -> list[ObjectProposal]:
+    """Convert persisted proposal-review objects into ObjectProposal prompts.
+
+    Strictly validates the internal confirmed-object seam; rejects malformed
+    or out-of-bounds records instead of repairing them.
+    """
+    required = {
+        "id", "source_proposal_ids", "box_xyxy", "role", "labels", "scores",
+    }
+    if not isinstance(objects, list) or not objects or len(objects) > 256:
+        raise ValueError("confirmed objects list is invalid")
+    if (
+        type(image_size) is not tuple
+        or len(image_size) != 2
+        or any(type(value) is not int or value <= 0 for value in image_size)
+    ):
+        raise ValueError("confirmed objects image size is invalid")
+    image_width, image_height = image_size
+    proposals = []
+    seen_ids = set()
+    for record in objects:
+        if not isinstance(record, dict) or set(record) != required:
+            raise ValueError("confirmed object record is invalid")
+        object_id = record["id"]
+        if not isinstance(object_id, str) or not object_id or object_id in seen_ids:
+            raise ValueError("confirmed object id is invalid or duplicated")
+        seen_ids.add(object_id)
+        source_ids = record["source_proposal_ids"]
+        if (
+            not isinstance(source_ids, list)
+            or not source_ids
+            or any(not isinstance(value, str) or not value for value in source_ids)
+        ):
+            raise ValueError("confirmed object source_proposal_ids is invalid")
+        box = record["box_xyxy"]
+        if (
+            not isinstance(box, (list, tuple))
+            or len(box) != 4
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                for value in box
+            )
+        ):
+            raise ValueError("confirmed object box is invalid")
+        left, top, right, bottom = (float(value) for value in box)
+        if not (
+            0 <= left < right <= image_width
+            and 0 <= top < bottom <= image_height
+        ):
+            raise ValueError("confirmed object box is out of bounds")
+        if not isinstance(record["role"], str) or not record["role"]:
+            raise ValueError("confirmed object role is invalid")
+        labels = record["labels"]
+        if (
+            not isinstance(labels, list)
+            or not labels
+            or any(not isinstance(value, str) or not value for value in labels)
+        ):
+            raise ValueError("confirmed object labels are invalid")
+        scores = record["scores"]
+        if (
+            not isinstance(scores, list)
+            or not scores
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or not 0 <= value <= 1
+                for value in scores
+            )
+        ):
+            raise ValueError("confirmed object scores are invalid")
+        crop_box = (
+            int(math.floor(left)),
+            int(math.floor(top)),
+            int(math.ceil(right) - math.floor(left)),
+            int(math.ceil(bottom) - math.floor(top)),
+        )
+        proposals.append(
+            ObjectProposal(
+                box_xyxy=(left, top, right, bottom),
+                score=float(max(scores)),
+                label="|".join(labels),
+                role=str(record["role"]),
+                source="proposal_review",
+                crop_box=crop_box,
+                touches_crop_edge=(
+                    left <= 0
+                    or top <= 0
+                    or right >= image_width
+                    or bottom >= image_height
+                ),
+            )
+        )
+    return proposals
+
+
+def _confirmed_proposals(text_analysis: dict | None) -> list | None:
+    """Return validated confirmed objects from the internal seam, or None."""
+    if not isinstance(text_analysis, dict):
+        return None
+    payload = text_analysis.get("confirmed_objects")
+    if payload is None:
+        return None
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"request_sha256", "objects"}
+        or not isinstance(payload["request_sha256"], str)
+        or len(payload["request_sha256"]) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in payload["request_sha256"]
+        )
+    ):
+        raise ValueError("confirmed objects payload is invalid")
+    return payload["objects"]
+
+
 def _generate_filtered_object_proposals(
     image: np.ndarray,
     text_mask: np.ndarray,
@@ -1755,6 +1929,33 @@ def _generate_filtered_object_proposals_isolated(
         )
         for record in records
     ]
+
+
+def generate_proposal_review_candidates(
+    image_path: str | Path,
+    text_mask_path: str | Path,
+    work_dir: str | Path,
+    *,
+    resource_isolation: bool,
+) -> list[ObjectProposal]:
+    """Proposal-only stage for the page-level proposal-review gate.
+
+    Runs the same filtered DINO/object proposal path as the visual worker,
+    stopping before any SAM/resolve/export work.
+    """
+    image = _load_rgb(str(image_path))
+    with Image.open(text_mask_path) as stored_mask:
+        text_mask = np.asarray(stored_mask.convert("L")).copy()
+    if resource_isolation:
+        return _generate_filtered_object_proposals_isolated(
+            image, text_mask, Path(work_dir)
+        )
+    try:
+        return _generate_filtered_object_proposals(image, text_mask, None)
+    finally:
+        image = None
+        text_mask = None
+        gc.collect()
 
 
 def _generate_sam_candidates_isolated(
@@ -2746,6 +2947,7 @@ def _process_image(
     proposal_detector = (
         None if _resource_isolation else object_detector
     )
+    confirmed_objects = _confirmed_proposals(text_analysis)
     if page_policy.route == "direct":
         # High-confidence layout pages can be represented by deterministic
         # geometry without paying for DINO/SAM model startup.  The existing
@@ -2764,6 +2966,12 @@ def _process_image(
             text_ink_mask,
         )
         prompt_free_candidates = []
+    elif confirmed_objects is not None:
+        # Reviewed page: only confirmed objects may become SAM prompts. No
+        # residual DINO discovery or prompt-free SAM runs in this mode.
+        proposals = confirmed_object_proposals(
+            confirmed_objects, (img_w, img_h)
+        )
     elif _resource_isolation:
         proposals = _generate_filtered_object_proposals_isolated(
             img,
@@ -2779,7 +2987,7 @@ def _process_image(
     if page_policy.route == "direct":
         pass
     elif _resource_isolation:
-        if page_policy.automatic_sam:
+        if page_policy.automatic_sam and confirmed_objects is None:
             (
                 candidates,
                 prompt_free_candidates,
@@ -2813,7 +3021,7 @@ def _process_image(
                 include_geometry=False,
                 min_score=0.90,
             )
-            if page_policy.automatic_sam
+            if page_policy.automatic_sam and confirmed_objects is None
             else []
         )
     candidates.extend(
@@ -2824,7 +3032,12 @@ def _process_image(
         )
     )
     previous_residual_signature = None
-    for round_index in range(page_policy.max_residual_rounds):
+    # Confirmed pages never re-enter residual proposal discovery: unreviewed
+    # candidates must not reach SAM or export.
+    residual_rounds = (
+        0 if confirmed_objects is not None else page_policy.max_residual_rounds
+    )
+    for round_index in range(residual_rounds):
         elements = resolve_visual_elements(candidates)
         complete_initial_visual_element_masks(elements, img)
         element_masks = [element.mask for element in elements]
@@ -2962,6 +3175,13 @@ def _process_image(
             )
         else:
             recheck_visual_element_holes(img, elements, mask_generator)
+    region_layout = _region_layout_override(img.shape[1], img.shape[0])
+    if region_layout is not None:
+        elements = apply_region_grouping(elements, region_layout["layout"])
+        (work_dir / "region-grouping.json").write_text(
+            json.dumps(region_layout["record"], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
     element_masks = [element.mask for element in elements]
     semantic_masks = [element.semantic_mask for element in elements]
     validate_visual_masks(element_masks)
@@ -2973,6 +3193,15 @@ def _process_image(
         text_restore_mask=text_mask,
         **background_kwargs,
     )
+    external_background = _external_background_override(
+        img.shape[0], img.shape[1]
+    )
+    if external_background is not None:
+        clean_background, external_record = external_background
+        (work_dir / "external-background.json").write_text(
+            json.dumps(external_record, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
     export_kwargs = {"semantic_masks": semantic_masks}
     if valid_text_items:
         export_kwargs["text_items"] = text_items
@@ -4327,6 +4556,15 @@ def _reuse_disjoint_text_delta(
             text_restore_mask=new_text_mask,
             **background_kwargs,
         )
+    external_background = _external_background_override(
+        source_image.shape[0], source_image.shape[1]
+    )
+    if external_background is not None:
+        clean_background, external_record = external_background
+        (work_dir / "external-background.json").write_text(
+            json.dumps(external_record, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
     background_original_path = work_dir / "targeted-background-original.png"
     background_widescreen_path = work_dir / "targeted-background-16x9.png"
     background_removal_mask_path = work_dir / "targeted-background-removal-mask.png"
@@ -4483,6 +4721,7 @@ def prepare_component_layers(
     visual_worker_pool_factory=None,
     performance_trace=None,
     page_id: str | None = None,
+    proposal_gate=None,
 ) -> dict:
     """Persist recoverable OCR and visual layers for Agent review."""
     source = _resolve_image_path(image_path)
@@ -4660,6 +4899,27 @@ def prepare_component_layers(
                 primary_traceback,
                 exception_boundary,
             )
+
+    if proposal_gate is not None and page_policy.route != "direct":
+        gate_outcome = proposal_gate(
+            image_path=owned_source,
+            text_mask_path=text_analysis["mask_path"],
+            work_dir=owned_work_dir,
+            route=page_policy.route,
+        )
+        if gate_outcome is not None:
+            if gate_outcome.get("status") == "awaiting_proposal_review":
+                return gate_outcome
+            if gate_outcome.get("status") != "proposals_confirmed":
+                raise RuntimeError(
+                    f"Unknown proposal gate outcome: {gate_outcome.get('status')}"
+                )
+            # Confirmed objects ride the hash-bound text_analysis payload into
+            # both the in-process and isolated-worker visual paths.
+            text_analysis["confirmed_objects"] = {
+                "request_sha256": gate_outcome["request_sha256"],
+                "objects": gate_outcome["objects"],
+            }
 
     initial_diagnostics = []
     # Recovered text needs a second visual pass unless verified assets are reused.

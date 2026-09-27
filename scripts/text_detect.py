@@ -155,6 +155,37 @@ def detect_text_batch(
     ]
 
 
+def _is_badged_cross(image: np.ndarray, box, text: str) -> bool:
+    if text.strip() not in {'X', 'x', '×', '✗', '✕'}:
+        return False
+    x, y, w, h = map(int, box)
+    if min(w, h) <= 0 or not .65 <= w / h <= 1.5:
+        return False
+    pad = max(w, h)
+    left, top = max(0, x - pad), max(0, y - pad)
+    crop = image[top:min(image.shape[0], y+h+pad), left:min(image.shape[1], x+w+pad)]
+    if not crop.size:
+        return False
+    saturation = cv2.cvtColor(crop, cv2.COLOR_RGB2HSV)[:, :, 1]
+    contours, _ = cv2.findContours((saturation >= 30).astype(np.uint8),
+                                  cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for contour in contours:
+        bx, by, bw, bh = cv2.boundingRect(contour)
+        area, perimeter = cv2.contourArea(contour), cv2.arcLength(contour, True)
+        if not perimeter or not .85 <= bw / bh <= 1.15:
+            continue
+        if not (1.3*w <= bw <= 3*w and 1.3*h <= bh <= 3*h):
+            continue
+        if not (.65 <= area / (bw*bh) <= .85 and 4*np.pi*area/perimeter**2 >= .8):
+            continue
+        bx, by = bx + left, by + top
+        if (bx <= x and by <= y and bx+bw >= x+w and by+bh >= y+h
+                and abs(bx+bw/2-x-w/2) <= .2*min(bw, bh)
+                and abs(by+bh/2-y-h/2) <= .2*min(bw, bh)):
+            return True
+    return False
+
+
 def _build_text_result(
     img_rgb: np.ndarray,
     raw_boxes: list[dict],
@@ -174,6 +205,8 @@ def _build_text_result(
 
     # Filter out noise lines (pure symbols, very short, etc.)
     raw_boxes = _filter_noise(raw_boxes, confidence_threshold)
+    raw_boxes = [box for box in raw_boxes
+                 if not _is_badged_cross(img_rgb, box['box'], box['text'])]
 
     # Clean up OCR edge noise while preserving semantic sentence endings.
     for rb in raw_boxes:
@@ -181,12 +214,12 @@ def _build_text_result(
         text = rb["text"].strip()
         if (
             len(text) == 1 and text in "?!" and rb.get("confidence", 0) >= .9
-        ) or re.fullmatch(r"[+-]\d+(?:[.,]\d+)?%?", text) or (
+        ) or re.fullmatch(r"[+−-]?\d+(?:[.,]\d*)?%?", text) or (
             rb.get("confidence", 0) >= .99 and text.endswith(("/", "\\"))
         ):
             rb["text"] = text
         else:
-            rb["text"] = text.lstrip("|/\\-_=.,:;!?~`'\"").rstrip("|/\\-_=,:;~`'\"")
+            rb["text"] = text.lstrip("|/\\-_=.,:;!?~`'\"").rstrip("|/\\-_=:;~`'\"")
         rb["text"], rb["box"] = _recover_trailing_heading_period(
             img_rgb,
             rb["text"],
@@ -804,6 +837,10 @@ def _filter_noise(
         if _is_likely_vertical_decorative_fragment(b):
             continue
 
+        if re.fullmatch(r"[+−-]?\d+(?:[.,]\d*)?%?", text):
+            filtered.append(b)
+            continue
+
         # Count meaningful characters (letters, digits, CJK)
         meaningful = sum(
             1 for c in text
@@ -1074,37 +1111,177 @@ def _estimate_style(
     return {"font_size": round(font_size, 1), "color": color_hex, "bold": bold}
 
 
+ITALIC_MIN_SLANT_DEG = 6.0
+PLAIN_GRADIENT_MIN_PT = 24.0
+PLAIN_GRADIENT_MIN_INLIER = .85
+PLAIN_GRADIENT_MAX_RMSE = 12.0
+
+
 def _select_font(text: str, font_size: float) -> str:
     """Choose an editable font that better matches common Chinese slide styles."""
     return "Microsoft YaHei" if _has_cjk(text) else "Arial"
 
 
-def refine_plain_text_fonts(image: np.ndarray, items: list[dict]) -> list[dict]:
-    from scripts.font_match import match_text_face
+def _estimate_slant(region: np.ndarray) -> float:
+    """Estimate the italic shear angle (degrees) of the ink in a text crop."""
+    if region.size == 0 or region.shape[0] < 3 or region.shape[1] < 3:
+        return 0.0
+    gray = cv2.cvtColor(region, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    height, width = gray.shape
+    border = np.concatenate((gray[0], gray[-1], gray[:, 0], gray[:, -1]))
+    contrast = np.abs(gray - float(np.median(border)))
+    maximum = float(contrast.max())
+    if maximum <= 0:
+        return 0.0
+    ink = (contrast > 0.4 * maximum).astype(np.float32)
+    if np.count_nonzero(ink) < 8:
+        return 0.0
+    best_score = -1.0
+    best_angle = 0.0
+    for angle in range(-5, 31):
+        k = float(np.tan(np.radians(angle)))
+        matrix = np.float32([[1, k, -k * height / 2], [0, 1, 0]])
+        sheared = cv2.warpAffine(ink, matrix, (width + height, height))
+        projection = sheared.sum(axis=0)
+        score = float((projection ** 2).sum())
+        if score > best_score:
+            best_score = score
+            best_angle = float(angle)
+    return best_angle
 
-    refined = []
-    for item in items:
+
+def refine_plain_text_fonts(image: np.ndarray, items: list[dict]) -> list[dict]:
+    from scripts.art_text import _linear_gradient
+    from scripts.font_match import match_text_face, match_text_group
+
+    area_limit = 170000 * max(
+        1.0, image.shape[0] * image.shape[1] / (1920 * 1080))
+    eligible = {}
+    for index, item in enumerate(items):
         text = item.get('text', '')
         x, y, width, height = map(int, item['box'])
         if (item.get('runs') or item.get('rotation') or item.get('italic')
                 or item.get('outline_width') or item.get('gradient')
                 or 'font_size_pt' in item or item.get('box_kind') == 'ink'
-                or not 3 <= len(text) <= 128 or '\n' in text
-                or x < 0 or y < 0 or width * height > 170000):
-            refined.append(item)
+                or '\n' in text or x < 0 or y < 0
+                or width * height > area_limit):
             continue
         crop = np.ascontiguousarray(image[y:y+height, x:x+width])
         if crop.shape != (height, width, 3) or not crop.size:
+            continue
+        slanted = (
+            _estimate_slant(crop) >= ITALIC_MIN_SLANT_DEG
+            and not _has_cjk(text)
+        )
+        if not (2 if slanted else 3) <= len(text) <= 128:
+            continue
+        eligible[index] = {
+            'text': text, 'x': x, 'y': y, 'width': width, 'height': height,
+            'crop': crop, 'slanted': slanted,
+        }
+
+    # Same-style slanted siblings (one row, similar height) should share one
+    # italic face rather than drift to different near-miss faces.
+    grouped = {}
+    pending = [i for i, entry in eligible.items() if entry['slanted']]
+    while pending:
+        group = [pending.pop(0)]
+        changed = True
+        while changed:
+            changed = False
+            for index in list(pending):
+                entry = eligible[index]
+                if any(
+                    abs(entry['y'] + entry['height'] / 2
+                        - eligible[member]['y'] - eligible[member]['height'] / 2)
+                    <= 0.5 * min(entry['height'], eligible[member]['height'])
+                    and min(entry['height'], eligible[member]['height']) / max(
+                        entry['height'], eligible[member]['height']) >= 0.85
+                    for member in group
+                ):
+                    group.append(index)
+                    pending.remove(index)
+                    changed = True
+        if len(group) < 2:
+            continue
+        matched = match_text_group(tuple(
+            (eligible[i]['crop'].tobytes(), eligible[i]['width'],
+             eligible[i]['height'], eligible[i]['text'])
+            for i in group
+        ))
+        if matched is None:
+            continue
+        for index, match in zip(group, matched):
+            entry = eligible[index]
+            left, top, ink_width, ink_height = match['ink_box']
+            grouped[index] = {
+                **items[index], 'font': match['font'], 'bold': match['bold'],
+                'italic': True,
+                'font_size': match['font_size_px'] * 13.333 * 72
+                / image.shape[1],
+                'box': [entry['x'] + left, entry['y'] + top,
+                        ink_width, ink_height],
+                'box_kind': 'ink',
+            }
+
+    refined = []
+    for index, item in enumerate(items):
+        if index in grouped:
+            refined.append(grouped[index])
+            continue
+        entry = eligible.get(index)
+        if entry is None:
             refined.append(item)
             continue
-        match = match_text_face(crop.tobytes(), width, height, text)
+        match = match_text_face(
+            entry['crop'].tobytes(), entry['width'], entry['height'],
+            entry['text'], italic=entry['slanted'])
         if match is None:
-            refined.append(item)
+            if entry['slanted']:
+                refined.append({**item, 'italic': True})
+            else:
+                refined.append(item)
             continue
         left, top, ink_width, ink_height = match['ink_box']
-        refined.append({**item, 'font': match['font'], 'bold': match['bold'],
-                        'font_size': match['font_size_px'] * 13.333 * 72 / image.shape[1],
-                        'box': [x+left, y+top, ink_width, ink_height], 'box_kind': 'ink'})
+        refined_item = {
+            **item, 'font': match['font'], 'bold': match['bold'],
+            'font_size': match['font_size_px'] * 13.333 * 72 / image.shape[1],
+            'box': [entry['x']+left, entry['y']+top, ink_width, ink_height],
+            'box_kind': 'ink',
+        }
+        if match.get('italic'):
+            refined_item['italic'] = True
+        refined.append(refined_item)
+    for item in refined:
+        if (item.get('runs') or item.get('rotation')
+                or item.get('outline_width') or item.get('gradient')
+                or 'font_size_pt' in item):
+            continue
+        if float(item.get('font_size') or 0) < PLAIN_GRADIENT_MIN_PT:
+            continue
+        x, y, width, height = map(int, item['box'])
+        crop = np.ascontiguousarray(image[y:y+height, x:x+width])
+        if crop.shape != (height, width, 3) or not crop.size:
+            continue
+        gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY).astype(np.float32)
+        border = np.concatenate((gray[0], gray[-1], gray[:, 0], gray[:, -1]))
+        contrast = np.abs(gray - float(np.median(border)))
+        maximum = float(contrast.max())
+        if maximum <= 0:
+            continue
+        fill = contrast > 0.5 * maximum
+        interior = cv2.erode(
+            fill.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+        if np.count_nonzero(interior) < 50:
+            continue
+        gradient = _linear_gradient(
+            crop, interior, fill, 0,
+            min_inlier_fraction=PLAIN_GRADIENT_MIN_INLIER,
+            max_rmse=PLAIN_GRADIENT_MAX_RMSE,
+            bound_samples=True,
+        )
+        if gradient is not None:
+            item['gradient'] = gradient
     return refined
 
 
@@ -1256,6 +1433,13 @@ def _estimate_reference_bold(region: np.ndarray, text: str) -> bool | None:
         return None
     polarity = 1 if float(np.median(foreground)) > 0 else -1
     ink = _normalized_ink(np.maximum(difference * polarity, 0))
+    numeric = (region.shape[0] >= 24 and re.fullmatch(
+        r'[+−-]?\d+(?:[.,]\d+)?%?', text.strip()) is not None)
+    if numeric:
+        rgb = region.astype(np.float32)
+        rgb_border = np.concatenate((rgb[0], rgb[-1], rgb[:, 0], rgb[:, -1]))
+        distance = np.linalg.norm(rgb - np.median(rgb_border, axis=0), axis=2)
+        ink = _normalized_ink((distance > .25 * float(distance.max())).astype(np.float32))
     if ink is None:
         return None
     height, width = ink.shape
@@ -1269,7 +1453,10 @@ def _estimate_reference_bold(region: np.ndarray, text: str) -> bool | None:
             return None
         reference = Image.new("L", (right - left + 8, bottom - top + 8), 0)
         ImageDraw.Draw(reference).text((4 - left, 4 - top), text, font=font, fill=255)
-        reference_ink = _normalized_ink(np.asarray(reference, dtype=np.float32))
+        reference_pixels = np.asarray(reference, dtype=np.float32)
+        if numeric:
+            reference_pixels = (reference_pixels > 127).astype(np.float32)
+        reference_ink = _normalized_ink(reference_pixels)
         if reference_ink is None:
             return None
         # Match raster scale before normalizing so small antialiased glyphs are comparable.
@@ -1397,6 +1584,10 @@ def _merge_text_pair(left: dict, right: dict) -> dict:
     if not (
         (_has_cjk(left_char) and _has_cjk(right_char))
         or (left_char.isdigit() and _has_cjk(right_char))
+        or (
+            re.fullmatch(r"[+−-]?\d+\.", left["text"])
+            and re.fullmatch(r"\d+%?", right["text"])
+        )
     ):
         separator = " "
     merged = dict(left)
@@ -1436,7 +1627,8 @@ def _refine_alignment(text_items: list[dict], img_width: int) -> list[dict]:
     left/right alignment based on which side of the image it's on.
     This handles column layouts where text is left-aligned within a column.
     """
-    for item in text_items:
+    boxes = [item["box"] for item in text_items]
+    for index, item in enumerate(text_items):
         x, y, w, h = item["box"]
         center_x = x + w / 2
         img_center = img_width / 2
@@ -1446,8 +1638,25 @@ def _refine_alignment(text_items: list[dict], img_width: int) -> list[dict]:
         is_near_center = abs(center_x - img_center) < img_width * 0.05
 
         if is_near_center:
-            # Any text (narrow or wide) very close to center → center
-            item["align"] = 1
+            # Near-center text belongs to a column when it shares a row or a
+            # left edge with sibling items; only isolated items center.
+            row_peer = False
+            edge_partner = False
+            for other, (x2, y2, w2, h2) in enumerate(boxes):
+                if other == index:
+                    continue
+                overlap_v = min(y + h, y2 + h2) - max(y, y2)
+                if (overlap_v >= 0.5 * min(h, h2)
+                        and min(h, h2) / max(h, h2) >= 0.7
+                        and (x + w <= x2 or x2 + w2 <= x)):
+                    row_peer = True
+                gap_v = max(0.0, y2 - (y + h), y - (y2 + h2))
+                if (abs(x - x2) <= max(0.005 * img_width, 0.3 * h)
+                        and gap_v <= 2 * max(h, h2)):
+                    edge_partner = True
+                if row_peer and edge_partner:
+                    break
+            item["align"] = 0 if (row_peer or edge_partner) else 1
         elif is_wide and abs(center_x - img_center) < img_width * 0.15:
             # Wide text near center → full-width centered box
             item["align"] = 1

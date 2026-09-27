@@ -53,6 +53,48 @@ def test_visible_lower_surface_stays_owned_beside_higher_object(underlay_engine,
     assert np.all(moved[np.roll(higher, 12, axis=1)] == 255)
 
 
+def test_underlay_metrics_cover_text_hole_and_visual_hole(underlay_engine):
+    y, x = np.mgrid[:140, :170]
+    base = np.dstack((
+        np.full((140, 170), 30.0),
+        150 + 0.6 * y + 0.15 * x,
+        160 + 0.6 * y + 0.15 * x,
+    ))
+    base[:, 111, 1] -= 20
+    base[:, 111, 2] -= 20
+    card = np.clip(base, 0, 255).astype(np.uint8)
+    source = np.full((140, 170, 3), (235, 240, 242), dtype=np.uint8)
+    semantic = np.zeros((140, 170), dtype=bool)
+    semantic[15:125, 15:155] = True
+    source[semantic] = card[semantic]
+    higher = np.zeros_like(semantic)
+    bleed = np.zeros_like(semantic)
+    for row in (30, 48, 66, 84, 102):
+        higher[row:row + 7, 40:108] = True
+        bleed[row:row + 7, 108:110] = True
+    source[higher] = (245, 250, 251)
+    source[bleed] = (242, 247, 248)
+    text = cv2.dilate(higher.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+    text_clean = source.copy()
+    text_clean[text] = card[text]
+    layer = underlay_engine.build_presentation_layer(
+        source_rgb=source,
+        text_clean_rgb=text_clean,
+        ownership_mask=semantic,
+        semantic_mask=semantic,
+        higher_layer_mask=higher,
+        text_mask=text,
+    )
+    generated = layer["generated_underlay_mask"]
+    assert np.count_nonzero(generated & ~text) > 0
+    assert np.count_nonzero(generated & text) > np.count_nonzero(generated & ~text)
+    expected = underlay_engine._visual_metrics(
+        layer["rgb"], source, layer["ownership_mask"], generated
+    )
+    assert layer["metrics"] == expected
+    assert layer["metrics"]["gradient_jump_p95"] <= 12.0
+
+
 def test_actual_higher_color_bleed_is_removed_from_movable_lower_layer(underlay_engine):
     source = np.full((80, 120, 3), (220, 230, 240), dtype=np.uint8)
     semantic = np.zeros((80, 120), dtype=bool)

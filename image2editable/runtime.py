@@ -760,6 +760,42 @@ def _transition_pages(
     store.write_json("page_jobs.json", page_jobs)
 
 
+def _proposal_review_waiting(
+    store: RunStore, manifest: dict[str, Any], page_id: str
+) -> dict[str, Any]:
+    from image2editable.proposal_review_runtime import (
+        load_proposal_review_state,
+    )
+
+    page_jobs = store.read_json("page_jobs.json")
+    if (
+        page_jobs["pages"][page_id]["status"]
+        != PageStatus.AWAITING_AGENT.value
+    ):
+        _transition_pages(store, [page_id], PageStatus.AWAITING_AGENT)
+    if (
+        store.read_json("run_state.json")["status"]
+        != RunStatus.AWAITING_AGENT.value
+    ):
+        store.transition_run(RunStatus.AWAITING_AGENT)
+    state = load_proposal_review_state(store, page_id)
+    if state is None:
+        raise RuntimeError("Proposal review state is missing")
+    summary = {
+        "schema_version": SCHEMA_VERSION,
+        "status": RunStatus.AWAITING_AGENT.value,
+        "provider": manifest["options"]["agent_provider"],
+        "current_page": page_id,
+        "proposal_review": {
+            "status": state["status"],
+            "request_sha256": state["request_sha256"],
+        },
+        "updated_at": utc_now(),
+    }
+    store.write_json("run_summary.json", summary)
+    return summary
+
+
 def _legacy_waiting_summary(
     store: RunStore, manifest: dict[str, Any], page_id: str, outcome: dict
 ) -> dict[str, Any]:
@@ -925,7 +961,11 @@ def _advance_legacy_pages(
                     )
                 if page_id in batch_ocr:
                     initialize_kwargs["ocr_result"] = batch_ocr[page_id]
-                initialize_legacy_page(store, page_id, **initialize_kwargs)
+                init_outcome = initialize_legacy_page(
+                    store, page_id, **initialize_kwargs
+                )
+                if init_outcome.get("status") == "awaiting_proposal_review":
+                    return _proposal_review_waiting(store, manifest, page_id)
             for _ in range(MAX_REPAIR_ROUNDS * 6 + 4):
                 advance_kwargs = {
                     "_lease": lease,
@@ -2165,7 +2205,11 @@ def _run_job(
                     initialize_kwargs["visual_worker_pool_factory"] = (
                         ensure_visual_worker_pool
                     )
-                initialize_legacy_page(store, page_id, **initialize_kwargs)
+                init_outcome = initialize_legacy_page(
+                    store, page_id, **initialize_kwargs
+                )
+                if init_outcome.get("status") == "awaiting_proposal_review":
+                    return _proposal_review_waiting(store, manifest, page_id)
             existing_component_pages = [
                 page_id
                 for page_id in page_ids

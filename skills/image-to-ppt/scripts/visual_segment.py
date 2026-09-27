@@ -1486,6 +1486,198 @@ def resolve_visual_elements(
     return elements
 
 
+def load_region_layout(path: str | Path, image_size: tuple[int, int]) -> dict:
+    """Parse and validate a legacy img2pptx regions.json layout.
+
+    ``cards`` are integer ``[x, y, w, h]`` pixel rects of opaque card panels
+    that must be mutually disjoint; ``graphics`` are ``{"label", "bbox"}``
+    objects that stay independently selectable even inside a card. Any
+    ambiguity or malformed entry (overlap, out-of-bounds, fractional,
+    non-finite or non-integer coordinates, null sections) rejects the file.
+    """
+    path = Path(path)
+    if not path.is_file():
+        raise ValueError(f"region layout file not found: {path}")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"region layout is not valid JSON: {path}") from error
+    if not isinstance(data, dict):
+        raise ValueError("region layout must be a JSON object")
+    if (
+        not isinstance(image_size, (list, tuple))
+        or len(image_size) != 2
+        or not all(
+            isinstance(v, int) and not isinstance(v, bool) and v > 0
+            for v in image_size
+        )
+    ):
+        raise ValueError(f"image_size must be two positive ints: {image_size!r}")
+    width, height = int(image_size[0]), int(image_size[1])
+
+    def _box(entry, kind):
+        if not isinstance(entry, (list, tuple)) or len(entry) != 4:
+            raise ValueError(f"{kind} entry must be [x, y, w, h]: {entry!r}")
+        for value in entry:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or int(value) != value
+            ):
+                raise ValueError(
+                    f"{kind} box requires integer pixel coordinates: {entry!r}"
+                )
+        x, y, w, h = (int(v) for v in entry)
+        if w <= 0 or h <= 0:
+            raise ValueError(f"{kind} box has non-positive size: {entry!r}")
+        if x < 0 or y < 0 or x + w > width or y + h > height:
+            raise ValueError(
+                f"{kind} box out of bounds {entry!r} for {width}x{height}"
+            )
+        return (x, y, w, h)
+
+    if "cards" in data and data["cards"] is None:
+        raise ValueError("region layout 'cards' is null")
+    if "graphics" in data and data["graphics"] is None:
+        raise ValueError("region layout 'graphics' is null")
+    cards = data.get("cards") or []
+    if not isinstance(cards, list):
+        raise ValueError("region layout 'cards' must be a list")
+    card_boxes = [_box(entry, "card") for entry in cards]
+    for index, first in enumerate(card_boxes):
+        for second in card_boxes[index + 1 :]:
+            x_overlap = min(first[0] + first[2], second[0] + second[2]) - max(
+                first[0], second[0]
+            )
+            y_overlap = min(first[1] + first[3], second[1] + second[3]) - max(
+                first[1], second[1]
+            )
+            if x_overlap > 0 and y_overlap > 0:
+                raise ValueError(
+                    "card boxes overlap, refusing ambiguous grouping: "
+                    f"{first} vs {second}"
+                )
+    graphics = data.get("graphics") or []
+    if not isinstance(graphics, list):
+        raise ValueError("region layout 'graphics' must be a list")
+    graphic_boxes = []
+    for entry in graphics:
+        if not isinstance(entry, dict):
+            raise ValueError(f"graphic entry must be an object: {entry!r}")
+        graphic_boxes.append(
+            {
+                "label": str(entry.get("label", "")),
+                "bbox": _box(entry.get("bbox"), "graphic"),
+            }
+        )
+    return {"cards": card_boxes, "graphics": graphic_boxes}
+
+
+def apply_region_grouping(
+    elements: list[VisualElement],
+    layout: dict,
+    *,
+    graphic_dominance: float = 0.50,
+) -> list[VisualElement]:
+    """Merge per-card element fragments into one body per declared card.
+
+    An element joins a card body only when its visible mask lies entirely
+    inside that single card rect and less than ``graphic_dominance`` of its
+    own pixels fall inside any ``graphics`` bbox — so a shell that merely
+    wraps an icon merges while the icon itself stays independent. Elements
+    outside every card or split across a boundary are declined whole; no
+    source pixels are dropped. Each merged body's ``semantic_mask`` excludes
+    every independent element's visible pixels so export underlay repair
+    cannot paint owned foreground (icon ink) into the body. Without cards,
+    without graphics, or without members the input is returned unchanged.
+    """
+    cards = layout.get("cards") or []
+    graphics = layout.get("graphics") or []
+    if not elements or not cards or not graphics:
+        return elements
+    height, width = elements[0].mask.shape
+    card_masks = []
+    for x, y, w, h in cards:
+        region = np.zeros((height, width), dtype=bool)
+        region[y : y + h, x : x + w] = True
+        card_masks.append(region)
+    graphic_masks = []
+    for graphic in graphics:
+        x, y, w, h = graphic["bbox"]
+        region = np.zeros((height, width), dtype=bool)
+        region[y : y + h, x : x + w] = True
+        graphic_masks.append(region)
+
+    def _own_share(mask: np.ndarray, region: np.ndarray) -> float:
+        area = int(np.count_nonzero(mask))
+        if not area:
+            return 0.0
+        return int(np.count_nonzero(mask & region)) / area
+
+    members: list[list[int]] = [[] for _ in cards]
+    membership = {}
+    for index, element in enumerate(elements):
+        mask = _binary_visual_mask(element.mask)
+        if not np.any(mask):
+            continue
+        inside = [
+            i
+            for i, region in enumerate(card_masks)
+            if not np.any(mask & ~region)
+        ]
+        if len(inside) != 1:
+            continue
+        if any(
+            _own_share(mask, region) >= graphic_dominance
+            for region in graphic_masks
+        ):
+            continue
+        members[inside[0]].append(index)
+        membership[index] = inside[0]
+    if not any(members):
+        return elements
+
+    independent_visible = np.zeros((height, width), dtype=bool)
+    for index, element in enumerate(elements):
+        if index not in membership:
+            independent_visible |= _binary_visual_mask(element.mask)
+
+    bodies = {}
+    for card_index, member_ids in enumerate(members):
+        if not member_ids:
+            continue
+        mask = np.zeros((height, width), dtype=bool)
+        semantic = np.zeros((height, width), dtype=bool)
+        for member_index in member_ids:
+            member = elements[member_index]
+            mask |= member.mask
+            semantic |= np.asarray(member.semantic_mask, dtype=bool)
+        semantic = (semantic & ~independent_visible) | mask
+        bodies[card_index] = VisualElement(
+            mask=mask,
+            z_index=min(elements[i].z_index for i in member_ids),
+            score=min(elements[i].score for i in member_ids),
+            source="card_group",
+            semantic_mask=semantic,
+        )
+
+    grouped = []
+    emitted = set()
+    for index, element in enumerate(elements):
+        card_index = membership.get(index)
+        if card_index is None:
+            grouped.append(element)
+            continue
+        if card_index in emitted:
+            continue
+        emitted.add(card_index)
+        grouped.append(bodies[card_index])
+    for z_index, element in enumerate(grouped):
+        element.z_index = z_index
+    return grouped
+
+
 def complete_initial_visual_element_masks(
     elements: list[VisualElement], image: np.ndarray
 ) -> None:

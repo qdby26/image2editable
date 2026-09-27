@@ -73,6 +73,7 @@ from scripts.initial_diagnostics import (
 from scripts.visual_segment import (
     MaskCandidate,
     VisualSegmentationError,
+    apply_region_grouping,
     background_residual_metrics,
     complete_initial_visual_element_masks,
     combine_residual_candidates,
@@ -124,6 +125,56 @@ except ModuleNotFoundError as error:
     from scripts.worker_pool import JsonLineWorker, TaskWorkerPool
 
 logger = logging.getLogger(__name__)
+
+
+def _external_background_override(
+    height: int, width: int
+) -> tuple[np.ndarray, dict] | None:
+    raw = os.environ.get("IMAGE2EDITABLE_EXTERNAL_BACKGROUND")
+    if not raw:
+        return None
+    path = Path(raw).expanduser().resolve()
+    if not path.is_file():
+        raise ValueError(
+            f"IMAGE2EDITABLE_EXTERNAL_BACKGROUND file not found: {path}"
+        )
+    with Image.open(path) as image:
+        background = np.asarray(image.convert("RGB"))
+    original_size = [background.shape[1], background.shape[0]]
+    if background.shape[:2] != (height, width):
+        background = np.asarray(
+            Image.fromarray(background, mode="RGB").resize(
+                (width, height), Image.LANCZOS
+            )
+        )
+    record = {
+        "path": str(path),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "original_size": original_size,
+        "applied_size": [width, height],
+    }
+    return background.astype(np.uint8), record
+
+
+def _region_layout_override(width: int, height: int):
+    raw = os.environ.get("IMAGE2EDITABLE_REGIONS_JSON")
+    if not raw:
+        return None
+    path = Path(raw).expanduser().resolve()
+    if not path.is_file():
+        raise ValueError(f"IMAGE2EDITABLE_REGIONS_JSON file not found: {path}")
+    from scripts.visual_segment import load_region_layout
+
+    layout = load_region_layout(path, (width, height))
+    return {
+        "layout": layout,
+        "record": {
+            "path": str(path),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "cards": [list(box) for box in layout["cards"]],
+            "graphics": layout["graphics"],
+        },
+    }
 
 
 def _worker_script_path(name: str) -> Path:
@@ -2962,6 +3013,13 @@ def _process_image(
             )
         else:
             recheck_visual_element_holes(img, elements, mask_generator)
+    region_layout = _region_layout_override(img.shape[1], img.shape[0])
+    if region_layout is not None:
+        elements = apply_region_grouping(elements, region_layout["layout"])
+        (work_dir / "region-grouping.json").write_text(
+            json.dumps(region_layout["record"], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
     element_masks = [element.mask for element in elements]
     semantic_masks = [element.semantic_mask for element in elements]
     validate_visual_masks(element_masks)
@@ -2973,6 +3031,15 @@ def _process_image(
         text_restore_mask=text_mask,
         **background_kwargs,
     )
+    external_background = _external_background_override(
+        img.shape[0], img.shape[1]
+    )
+    if external_background is not None:
+        clean_background, external_record = external_background
+        (work_dir / "external-background.json").write_text(
+            json.dumps(external_record, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
     export_kwargs = {"semantic_masks": semantic_masks}
     if valid_text_items:
         export_kwargs["text_items"] = text_items
@@ -4326,6 +4393,15 @@ def _reuse_disjoint_text_delta(
             text_clean_image=text_clean_image,
             text_restore_mask=new_text_mask,
             **background_kwargs,
+        )
+    external_background = _external_background_override(
+        source_image.shape[0], source_image.shape[1]
+    )
+    if external_background is not None:
+        clean_background, external_record = external_background
+        (work_dir / "external-background.json").write_text(
+            json.dumps(external_record, ensure_ascii=False, indent=2),
+            encoding="utf-8",
         )
     background_original_path = work_dir / "targeted-background-original.png"
     background_widescreen_path = work_dir / "targeted-background-16x9.png"
