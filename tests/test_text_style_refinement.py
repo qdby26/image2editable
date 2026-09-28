@@ -384,3 +384,51 @@ def test_numeric_weight_uses_shape_with_gradient(text, bold, background, monkeyp
     colors = np.array(top) + (yy / 210)[..., None] * (np.array(bottom) - top)
     pixels = (np.array(background) * (1 - alpha[..., None]) + colors * alpha[..., None]).astype(np.uint8)
     assert text_detect._estimate_reference_bold(pixels, text) is bold
+
+
+def _gradient_digit_image(top, bottom, size=100, canvas=(800, 300),
+                          pos=(60, 60), text='4.8'):
+    ref = text_detect._weight_reference_font(False, True)
+    mask = Image.new('L', canvas, 0)
+    ImageDraw.Draw(mask).text(pos, text, font=ref.font_variant(size=size),
+                              fill=255)
+    alpha = np.asarray(mask).astype(float) / 255
+    ink_rows = np.where(alpha.max(axis=1) > 0)[0]
+    yy, _ = np.indices(alpha.shape)
+    frac = np.clip((yy - ink_rows.min()) / max(1, ink_rows.max() - ink_rows.min()),
+                   0, 1)
+    colors = np.array(top) + frac[..., None] * (np.array(bottom) - np.array(top))
+    return (255 * (1 - alpha[..., None]) + colors * alpha[..., None]).astype(np.uint8)
+
+
+def test_estimate_style_measures_full_gradient_digit_height():
+    if text_detect._weight_reference_font(False, True) is None:
+        pytest.skip('arial bold reference font unavailable')
+    pixels = _gradient_digit_image((40, 140, 160), (120, 225, 230))
+    est = text_detect._estimate_style(pixels, (0, 0, 800, 300), text='4.8')
+    truth = 100 * 72 / (800 / 13.333)
+    assert abs(est['font_size'] - truth) <= truth * .05
+
+
+def test_estimate_style_ignores_unrelated_label_band_below_digits():
+    ref = text_detect._weight_reference_font(False, True)
+    if ref is None:
+        pytest.skip('arial bold reference font unavailable')
+    mask = Image.new('L', (800, 300), 0)
+    draw = ImageDraw.Draw(mask)
+    draw.text((60, 40), '4.8', font=ref.font_variant(size=100), fill=255)
+    draw.text((80, 220), 'notes', font=ref.font_variant(size=34), fill=255)
+    pixels = np.full((300, 800, 3), 255, np.uint8)
+    alpha = np.asarray(mask) > 0
+    pixels[alpha] = (24, 129, 146)
+    est = text_detect._estimate_style(pixels, (0, 0, 800, 300), text='4.8')
+    truth = 100 * 72 / (800 / 13.333)
+    assert abs(est['font_size'] - truth) <= truth * .05
+
+
+def test_estimate_style_solid_control_matches_previous_value():
+    if text_detect._weight_reference_font(False, True) is None:
+        pytest.skip('arial bold reference font unavailable')
+    pixels = _gradient_digit_image((24, 129, 146), (24, 129, 146))
+    est = text_detect._estimate_style(pixels, (0, 0, 800, 300), text='4.8')
+    assert abs(est['font_size'] - 118.0) <= 118.0 * .02

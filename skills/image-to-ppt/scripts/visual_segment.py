@@ -1322,6 +1322,7 @@ class VisualElement:
     source: str
     semantic_mask: np.ndarray | None = None
     object_box: tuple[float, float, float, float] | None = None
+    role: str = ""
 
     def __post_init__(self) -> None:
         if self.semantic_mask is None:
@@ -1476,6 +1477,7 @@ def resolve_visual_elements(
                 source=candidate.source,
                 semantic_mask=semantic_support,
                 object_box=candidate.object_box,
+                role=candidate.role,
             )
         )
         claimed |= visible
@@ -1689,9 +1691,41 @@ def complete_initial_visual_element_masks(
         elements, key=lambda value: getattr(value, "z_index", 0), reverse=True
     ):
         semantic = _complete_opaque_mask_regions(element.semantic_mask, image)
+        if getattr(element, "role", "") in {"icon", "badge", "logo"} and np.any(semantic):
+            hole_limit = max(64, int(0.005 * np.count_nonzero(semantic)))
+            hole_mask = _enclosed_holes_conn4(semantic)
+            hole_count, hole_labels, hole_stats, _ = (
+                cv2.connectedComponentsWithStats(
+                    hole_mask.astype(np.uint8), 8
+                )
+            )
+            for hole_label in range(1, hole_count):
+                if (
+                    int(hole_stats[hole_label, cv2.CC_STAT_AREA])
+                    <= hole_limit
+                ):
+                    semantic |= hole_labels == hole_label
         element.semantic_mask = semantic
         element.mask = semantic & ~claimed
         claimed |= element.mask
+
+
+def _enclosed_holes_conn4(mask: np.ndarray) -> np.ndarray:
+    # Icon hole fill must not leak through diagonal gaps: background
+    # components are labelled with 4-connectivity here, unlike
+    # _enclosed_holes which stays 8-connected for other callers.
+    background = ~np.asarray(mask, dtype=bool)
+    if not np.any(background):
+        return np.zeros(background.shape, dtype=bool)
+    count, labels = cv2.connectedComponents(background.astype(np.uint8), connectivity=4)
+    border_labels = set(labels[0, :])
+    border_labels.update(labels[-1, :])
+    border_labels.update(labels[:, 0])
+    border_labels.update(labels[:, -1])
+    keep = np.ones(count, dtype=bool)
+    keep[list(border_labels)] = False
+    keep[0] = False
+    return keep[labels]
 
 
 def _enclosed_holes(mask: np.ndarray) -> np.ndarray:

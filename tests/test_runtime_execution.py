@@ -6863,6 +6863,402 @@ def test_background_rebuild_restores_selected_text_inside_active_visual(
             assert rebuilt.getpixel((31, 15)) == expected
 
 
+def test_background_rebuild_unattached_text_uses_text_clean_donor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.png"
+    current = tmp_path / "current.png"
+    restored = tmp_path / "text-clean.png"
+    text_mask = tmp_path / "text-mask.png"
+    graph_dir = tmp_path / "graph"
+    masks = graph_dir / "masks"
+    masks.mkdir(parents=True)
+    canvas = Image.new("RGB", (40, 30), (200, 200, 200))
+    ImageDraw.Draw(canvas).rectangle((14, 10, 25, 19), fill=(30, 30, 30))
+    canvas.save(source)
+    canvas.save(current)
+    donor = Image.new("RGB", (40, 30), (200, 200, 200))
+    ImageDraw.Draw(donor).rectangle((14, 10, 25, 19), fill=(205, 200, 195))
+    donor.save(restored)
+    glyph = Image.new("L", (40, 30), 0)
+    ImageDraw.Draw(glyph).rectangle((14, 10, 25, 19), fill=255)
+    glyph.save(text_mask)
+    text_component_mask = masks / "text.png"
+    glyph.save(text_component_mask)
+    visual_mask = masks / "visual.png"
+    visual = Image.new("L", (40, 30), 0)
+    ImageDraw.Draw(visual).rectangle((2, 2, 8, 8), fill=255)
+    visual.save(visual_mask)
+    graph = {"nodes": [{
+        "id": "visual", "kind": "parent", "parent_id": None,
+        "state": "frozen", "mask": "masks/visual.png",
+        "mask_sha256": hashlib.sha256(visual_mask.read_bytes()).hexdigest(),
+        "bbox": [2, 2, 9, 9], "z_index": 0, "text_ids": [],
+    }, {
+        "id": "text", "kind": "text", "parent_id": None,
+        "state": "frozen", "mask": "masks/text.png",
+        "mask_sha256": hashlib.sha256(
+            text_component_mask.read_bytes()
+        ).hexdigest(),
+        "bbox": [14, 10, 26, 20], "z_index": 1, "text_ids": [],
+    }]}
+    from scripts import component_underlay
+
+    def gray_fill(**kwargs):
+        filled = kwargs["rgb"].copy()
+        filled[kwargs["visual_hole"]] = 160
+        return filled, None
+
+    monkeypatch.setattr(component_underlay, "_choose_visual_fill", gray_fill)
+    output = tmp_path / "rebuilt.png"
+
+    legacy._rebuild_canvas_background(
+        source_path=source, current_background_path=current,
+        restore_background_path=restored, repair_requests=[],
+        graph=graph, graph_dir=graph_dir, text_mask_path=text_mask,
+        output_path=output,
+    )
+
+    with Image.open(output) as rebuilt:
+        assert rebuilt.getpixel((20, 15)) == (205, 200, 195)
+        assert rebuilt.getpixel((5, 5)) == (160, 160, 160)
+
+
+def test_background_rebuild_residual_ink_repairs_only_speck_neighbourhood(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.png"
+    current = tmp_path / "current.png"
+    restored = tmp_path / "text-clean.png"
+    text_mask = tmp_path / "text-mask.png"
+    graph_dir = tmp_path / "graph"
+    masks = graph_dir / "masks"
+    masks.mkdir(parents=True)
+    canvas = Image.new("RGB", (40, 30), (200, 200, 200))
+    canvas_draw = ImageDraw.Draw(canvas)
+    for bar_x in (12, 19, 26):
+        canvas_draw.rectangle((bar_x, 6, bar_x + 1, 22), fill=(30, 30, 30))
+    canvas.save(source)
+    canvas.save(current)
+    donor = Image.new("RGB", (40, 30), (200, 200, 200))
+    ImageDraw.Draw(donor).rectangle((19, 11, 21, 13), fill=(30, 30, 30))
+    donor.save(restored)
+    glyph = Image.new("L", (40, 30), 0)
+    ImageDraw.Draw(glyph).rectangle((10, 4, 34, 24), fill=255)
+    glyph.save(text_mask)
+    text_component_mask = masks / "text.png"
+    glyph.save(text_component_mask)
+    graph = {"nodes": [{
+        "id": "text", "kind": "text", "parent_id": None,
+        "state": "frozen", "mask": "masks/text.png",
+        "mask_sha256": hashlib.sha256(
+            text_component_mask.read_bytes()
+        ).hexdigest(),
+        "bbox": [10, 4, 35, 25], "z_index": 1, "text_ids": [],
+    }]}
+    from scripts import component_underlay
+
+    fills = []
+
+    def record_fill(**kwargs):
+        filled = kwargs["rgb"].copy()
+        fills.append(kwargs["visual_hole"].copy())
+        # Fill with the surrounding tone so the repaired area does not
+        # read as residual ink on the recheck pass.
+        filled[kwargs["visual_hole"]] = (200, 200, 200)
+        return filled, None
+
+    monkeypatch.setattr(component_underlay, "_choose_visual_fill", record_fill)
+    output = tmp_path / "rebuilt.png"
+
+    legacy._rebuild_canvas_background(
+        source_path=source, current_background_path=current,
+        restore_background_path=restored, repair_requests=[],
+        graph=graph, graph_dir=graph_dir, text_mask_path=text_mask,
+        output_path=output,
+    )
+
+    assert len(fills) == 1
+    # The speck neighbourhood is repaired, the rest of the component is not.
+    assert fills[0][11:14, 19:22].all()
+    assert not fills[0][5, 12]
+    assert not fills[0][23, 33]
+    with Image.open(output) as rebuilt:
+        assert rebuilt.getpixel((20, 12)) == (200, 200, 200)
+        assert rebuilt.getpixel((11, 5)) == (200, 200, 200)
+
+
+def test_background_rebuild_dense_residual_repairs_whole_text_surface(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.png"
+    current = tmp_path / "current.png"
+    restored = tmp_path / "text-clean.png"
+    text_mask = tmp_path / "text-mask.png"
+    graph_dir = tmp_path / "graph"
+    masks = graph_dir / "masks"
+    masks.mkdir(parents=True)
+    canvas = Image.new("RGB", (40, 30), (200, 200, 200))
+    canvas_draw = ImageDraw.Draw(canvas)
+    for bar_x in (12, 19, 26):
+        canvas_draw.rectangle((bar_x, 6, bar_x + 1, 22), fill=(30, 30, 30))
+    canvas.save(source)
+    canvas.save(current)
+    donor = Image.new("RGB", (40, 30), (200, 200, 200))
+    ImageDraw.Draw(donor).rectangle((19, 11, 21, 13), fill=(30, 30, 30))
+    donor.save(restored)
+    glyph = Image.new("L", (40, 30), 0)
+    ImageDraw.Draw(glyph).rectangle((10, 4, 34, 24), fill=255)
+    glyph.save(text_mask)
+    text_component_mask = masks / "text.png"
+    glyph.save(text_component_mask)
+    graph = {"nodes": [{
+        "id": "text", "kind": "text", "parent_id": None,
+        "state": "frozen", "mask": "masks/text.png",
+        "mask_sha256": hashlib.sha256(
+            text_component_mask.read_bytes()
+        ).hexdigest(),
+        "bbox": [10, 4, 35, 25], "z_index": 1, "text_ids": [],
+    }]}
+    from scripts import component_underlay
+    from image2editable import component_quality
+    from types import SimpleNamespace
+
+    fills = []
+
+    def record_fill(**kwargs):
+        filled = kwargs["rgb"].copy()
+        fills.append(kwargs["visual_hole"].copy())
+        filled[kwargs["visual_hole"]] = 160
+        return filled, None
+
+    monkeypatch.setattr(component_underlay, "_choose_visual_fill", record_fill)
+
+    real_context = component_quality._prepare_page_quality_context
+    context_calls = []
+
+    def patched_context(*args, **kwargs):
+        context_calls.append(1)
+        if len(context_calls) > 1:
+            return real_context(*args, **kwargs)
+        # A dense, spread-out leftover: the donor cannot be trusted for
+        # this component, so the whole surface goes through the repair
+        # fill on the first pass rather than being donor-pasted.
+        leftover = np.zeros((30, 40), dtype=bool)
+        leftover[6:23, 11:34] = True
+        leftover &= np.asarray(
+            Image.open(text_mask).convert("L")
+        ) > 0
+        return SimpleNamespace(background_residual_text_ink=leftover)
+
+    monkeypatch.setattr(
+        component_quality, "_prepare_page_quality_context", patched_context
+    )
+    output = tmp_path / "rebuilt.png"
+
+    legacy._rebuild_canvas_background(
+        source_path=source, current_background_path=current,
+        restore_background_path=restored, repair_requests=[],
+        graph=graph, graph_dir=graph_dir, text_mask_path=text_mask,
+        output_path=output,
+    )
+
+    # Whole text component (and its node surface) is repaired at once.
+    assert fills
+    assert fills[0][4:25, 10:35].all()
+    with Image.open(output) as rebuilt:
+        assert rebuilt.getpixel((20, 15)) == (160, 160, 160)
+
+
+def test_background_rebuild_without_donor_still_repairs_unattached_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.png"
+    current = tmp_path / "current.png"
+    text_mask = tmp_path / "text-mask.png"
+    graph_dir = tmp_path / "graph"
+    masks = graph_dir / "masks"
+    masks.mkdir(parents=True)
+    canvas = Image.new("RGB", (40, 30), (200, 200, 200))
+    ImageDraw.Draw(canvas).rectangle((14, 10, 25, 19), fill=(30, 30, 30))
+    canvas.save(source)
+    canvas.save(current)
+    glyph = Image.new("L", (40, 30), 0)
+    ImageDraw.Draw(glyph).rectangle((14, 10, 25, 19), fill=255)
+    glyph.save(text_mask)
+    text_component_mask = masks / "text.png"
+    glyph.save(text_component_mask)
+    graph = {"nodes": [{
+        "id": "text", "kind": "text", "parent_id": None,
+        "state": "frozen", "mask": "masks/text.png",
+        "mask_sha256": hashlib.sha256(
+            text_component_mask.read_bytes()
+        ).hexdigest(),
+        "bbox": [14, 10, 26, 20], "z_index": 1, "text_ids": [],
+    }]}
+    from scripts import component_underlay
+
+    def gray_fill(**kwargs):
+        filled = kwargs["rgb"].copy()
+        filled[kwargs["visual_hole"]] = 160
+        return filled, None
+
+    monkeypatch.setattr(component_underlay, "_choose_visual_fill", gray_fill)
+    output = tmp_path / "rebuilt.png"
+
+    legacy._rebuild_canvas_background(
+        source_path=source, current_background_path=current,
+        restore_background_path=None, repair_requests=[],
+        graph=graph, graph_dir=graph_dir, text_mask_path=text_mask,
+        output_path=output,
+    )
+
+    with Image.open(output) as rebuilt:
+        assert rebuilt.getpixel((20, 15)) == (160, 160, 160)
+
+
+def test_background_rebuild_card_internal_text_stays_repaired(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.png"
+    current = tmp_path / "current.png"
+    restored = tmp_path / "text-clean.png"
+    text_mask = tmp_path / "text-mask.png"
+    graph_dir = tmp_path / "graph"
+    masks = graph_dir / "masks"
+    masks.mkdir(parents=True)
+    canvas = Image.new("RGB", (40, 30), (200, 200, 200))
+    ImageDraw.Draw(canvas).rectangle((14, 10, 25, 19), fill=(30, 30, 30))
+    canvas.save(source)
+    canvas.save(current)
+    donor = Image.new("RGB", (40, 30), (200, 200, 200))
+    ImageDraw.Draw(donor).rectangle((14, 10, 25, 19), fill=(205, 200, 195))
+    donor.save(restored)
+    glyph = Image.new("L", (40, 30), 0)
+    ImageDraw.Draw(glyph).rectangle((14, 10, 25, 19), fill=255)
+    glyph.save(text_mask)
+    text_component_mask = masks / "text.png"
+    glyph.save(text_component_mask)
+    card_mask = masks / "card.png"
+    card = Image.new("L", (40, 30), 0)
+    card_draw = ImageDraw.Draw(card)
+    card_draw.rectangle((5, 5, 34, 24), fill=255)
+    card_draw.rectangle((14, 10, 25, 19), fill=0)
+    card.save(card_mask)
+    graph = {"nodes": [{
+        "id": "card", "kind": "parent", "parent_id": None,
+        "state": "frozen", "mask": "masks/card.png",
+        "mask_sha256": hashlib.sha256(card_mask.read_bytes()).hexdigest(),
+        "bbox": [5, 5, 30, 20], "z_index": 0, "text_ids": [],
+    }, {
+        "id": "text", "kind": "text", "parent_id": None,
+        "state": "frozen", "mask": "masks/text.png",
+        "mask_sha256": hashlib.sha256(
+            text_component_mask.read_bytes()
+        ).hexdigest(),
+        "bbox": [14, 10, 26, 20], "z_index": 1, "text_ids": [],
+    }]}
+    from scripts import component_underlay
+
+    def gray_fill(**kwargs):
+        filled = kwargs["rgb"].copy()
+        filled[kwargs["visual_hole"]] = 160
+        return filled, None
+
+    monkeypatch.setattr(component_underlay, "_choose_visual_fill", gray_fill)
+    output = tmp_path / "rebuilt.png"
+
+    legacy._rebuild_canvas_background(
+        source_path=source, current_background_path=current,
+        restore_background_path=restored, repair_requests=[],
+        graph=graph, graph_dir=graph_dir, text_mask_path=text_mask,
+        output_path=output,
+    )
+
+    with Image.open(output) as rebuilt:
+        # Text sits inside the hole-filled card silhouette, so it keeps the
+        # repair path instead of taking the donor.
+        assert rebuilt.getpixel((20, 15)) == (160, 160, 160)
+        assert rebuilt.getpixel((8, 8)) == (160, 160, 160)
+
+
+def test_background_rebuild_residual_component_falls_back_to_whole_repair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.png"
+    current = tmp_path / "current.png"
+    restored = tmp_path / "text-clean.png"
+    text_mask = tmp_path / "text-mask.png"
+    graph_dir = tmp_path / "graph"
+    masks = graph_dir / "masks"
+    masks.mkdir(parents=True)
+    canvas = Image.new("RGB", (40, 30), (200, 200, 200))
+    canvas_draw = ImageDraw.Draw(canvas)
+    for bar_x in (12, 19, 26):
+        canvas_draw.rectangle((bar_x, 6, bar_x + 1, 22), fill=(30, 30, 30))
+    canvas.save(source)
+    canvas.save(current)
+    donor = Image.new("RGB", (40, 30), (200, 200, 200))
+    ImageDraw.Draw(donor).rectangle((19, 11, 21, 13), fill=(30, 30, 30))
+    donor.save(restored)
+    glyph = Image.new("L", (40, 30), 0)
+    ImageDraw.Draw(glyph).rectangle((10, 4, 34, 24), fill=255)
+    glyph.save(text_mask)
+    text_component_mask = masks / "text.png"
+    glyph.save(text_component_mask)
+    graph = {"nodes": [{
+        "id": "text", "kind": "text", "parent_id": None,
+        "state": "frozen", "mask": "masks/text.png",
+        "mask_sha256": hashlib.sha256(
+            text_component_mask.read_bytes()
+        ).hexdigest(),
+        "bbox": [10, 4, 35, 25], "z_index": 1, "text_ids": [],
+    }]}
+    from scripts import component_underlay
+    from image2editable import component_quality
+    from types import SimpleNamespace
+
+    fills = []
+
+    def record_fill(**kwargs):
+        filled = kwargs["rgb"].copy()
+        fills.append(kwargs["visual_hole"].copy())
+        filled[kwargs["visual_hole"]] = 160
+        return filled, None
+
+    monkeypatch.setattr(component_underlay, "_choose_visual_fill", record_fill)
+
+    real_context = component_quality._prepare_page_quality_context
+    context_calls = []
+
+    def patched_context(*args, **kwargs):
+        context_calls.append(1)
+        if len(context_calls) == 1:
+            return real_context(*args, **kwargs)
+        leftover = np.zeros((30, 40), dtype=bool)
+        leftover[20, 30] = True
+        return SimpleNamespace(background_residual_text_ink=leftover)
+
+    monkeypatch.setattr(
+        component_quality, "_prepare_page_quality_context", patched_context
+    )
+    output = tmp_path / "rebuilt.png"
+
+    legacy._rebuild_canvas_background(
+        source_path=source, current_background_path=current,
+        restore_background_path=restored, repair_requests=[],
+        graph=graph, graph_dir=graph_dir, text_mask_path=text_mask,
+        output_path=output,
+    )
+
+    # First pass repairs the speck neighbourhood; the recheck flags leftover
+    # residual ink, so the whole text component is repaired on the redo.
+    assert len(fills) == 2
+    assert fills[1][4:25, 10:35].all()
+    with Image.open(output) as rebuilt:
+        assert rebuilt.getpixel((11, 5)) == (160, 160, 160)
+
+
 def test_background_rebuild_without_donors_does_not_retain_foreground(tmp_path: Path) -> None:
     source = tmp_path / "source.png"
     current = tmp_path / "current.png"

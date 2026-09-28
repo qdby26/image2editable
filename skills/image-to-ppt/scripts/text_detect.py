@@ -273,6 +273,7 @@ def _build_text_result(
         })
 
         words = _validated_words(text, rb.get("words"))
+        text_items[-1]["text"] = _insert_cjk_latin_spaces(text, words, box)
         if words:
             text_items[-1]["words"] = words
 
@@ -1092,20 +1093,33 @@ def _estimate_style(
     # OCR rectangles include variable padding; measure glyphs for known fonts.
     reference_font = _weight_reference_font(_has_cjk(text), bold) if text and "\n" not in text else None
     if reference_font is not None:
-        gray = cv2.cvtColor(region, cv2.COLOR_RGB2GRAY).astype(np.float32)
-        border = np.concatenate((gray[0], gray[-1], gray[:, 0], gray[:, -1]))
-        contrast = np.abs(gray - float(np.median(border)))
-        foreground = (contrast > float(contrast.max()) * 0.1).astype(np.uint8)
+        rgb = region.astype(np.float32)
+        border = np.concatenate((rgb[0], rgb[-1], rgb[:, 0], rgb[:, -1]))
+        distance = np.linalg.norm(rgb - np.median(border, axis=0), axis=2)
+        foreground = (distance > float(distance.max()) * 0.1).astype(np.uint8)
         horizontal = cv2.morphologyEx(
             foreground, cv2.MORPH_OPEN,
             np.ones((1, max(13, int(region.shape[1] * 0.8) | 1)), dtype=np.uint8),
         )
-        contrast[horizontal > 0] = 0
-        rows = np.flatnonzero(np.any(contrast > float(contrast.max()) * 0.5, axis=1))
+        distance[horizontal > 0] = 0
+        ink_mask = distance > float(distance.max()) * 0.5
+        rows = np.flatnonzero(np.any(ink_mask, axis=1))
         bounds = reference_font.getbbox(text)
         glyph_height = bounds[3] - bounds[1]
         if len(rows) and glyph_height > 0:
-            size_px = (rows[-1] - rows[0] + 1) * reference_font.size / glyph_height
+            gap = max(3, int(0.08 * region.shape[0]))
+            runs = []
+            start = previous = rows[0]
+            for row in rows[1:]:
+                if row - previous > gap:
+                    runs.append((start, previous))
+                    start = row
+                previous = row
+            runs.append((start, previous))
+            top_row, bottom_row = max(
+                runs, key=lambda span: int(ink_mask[span[0]:span[1] + 1].sum()))
+            size_px = ((bottom_row - top_row + 1)
+                       * reference_font.size / glyph_height)
             font_size = max(6.0, min(size_px * 72.0 / pixels_per_inch, 200.0))
 
     return {"font_size": round(font_size, 1), "color": color_hex, "bold": bold}
@@ -1317,6 +1331,74 @@ def _should_force_regular_weight(text: str, font_size: float) -> bool:
 
 def _has_cjk(text: str) -> bool:
     return any('\u4e00' <= c <= '\u9fff' for c in text)
+
+
+def _is_cjk_latin_boundary(left_text: str, right_text: str) -> bool:
+    left_char = left_text.rstrip()[-1:]
+    right_char = right_text.lstrip()[:1]
+    if not left_char or not right_char:
+        return False
+    return (
+        (_has_cjk(left_char) and right_char.isascii() and right_char.isalnum())
+        or (_has_cjk(right_char) and left_char.isascii() and left_char.isalnum())
+    )
+
+
+_MIDDLE_DOT_CHARS = frozenset("\u00b7\u30fb\uff65\u2022")
+
+
+def _is_middle_dot_word(text: str) -> bool:
+    stripped = text.strip()
+    return bool(stripped) and all(
+        char in _MIDDLE_DOT_CHARS for char in stripped
+    )
+
+
+def _is_cjk_or_alnum_word(text: str) -> bool:
+    return any(
+        _has_cjk(char) or (char.isascii() and char.isalnum())
+        for char in text.strip()
+    )
+
+
+def _insert_cjk_latin_spaces(text: str, words: list[dict], box) -> str:
+    if len(words) < 2:
+        return text
+    _, _, width, height = box
+    if height <= 0:
+        return text
+    positions = []
+    cursor = 0
+    for word in words:
+        index = text.find(word["text"], cursor)
+        if index < 0:
+            return text
+        positions.append(index)
+        cursor = index + len(word["text"])
+    result = text[:positions[0]] + words[0]["text"]
+    for index in range(1, len(words)):
+        previous = words[index - 1]["box"]
+        current = words[index]["box"]
+        between = text[
+            positions[index - 1] + len(words[index - 1]["text"]):positions[index]
+        ]
+        left_word = words[index - 1]["text"]
+        right_word = words[index]["text"]
+        boundary = _is_cjk_latin_boundary(left_word, right_word) or (
+            (_is_middle_dot_word(left_word)
+             and _is_cjk_or_alnum_word(right_word))
+            or (_is_middle_dot_word(right_word)
+                and _is_cjk_or_alnum_word(left_word))
+        )
+        if (
+            not between
+            and boundary
+            and (current[0] - (previous[0] + previous[2])) * width
+                >= 0.25 * height
+        ):
+            between = " "
+        result += between + words[index]["text"]
+    return result + text[cursor:]
 
 
 def _sample_text_color(region: np.ndarray) -> str:
@@ -1581,7 +1663,15 @@ def _merge_text_pair(left: dict, right: dict) -> dict:
     left_char = left["text"][-1:]
     right_char = right["text"][:1]
     separator = ""
-    if not (
+    lwords = _validated_words(left["text"], left.get("words"))
+    rwords = _validated_words(right["text"], right.get("words"))
+    if lwords and rwords and _is_cjk_latin_boundary(
+            left["text"], right["text"]):
+        last_word = lwords[-1]["box"]
+        first_word = rwords[0]["box"]
+        gap = (rx + first_word[0] * rw) - (lx + (last_word[0] + last_word[2]) * lw)
+        separator = " " if gap >= 0.25 * max(lh, rh) else ""
+    elif not (
         (_has_cjk(left_char) and _has_cjk(right_char))
         or (left_char.isdigit() and _has_cjk(right_char))
         or (

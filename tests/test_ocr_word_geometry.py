@@ -278,3 +278,94 @@ def test_signed_decimal_fragment_keeps_sign_through_build_merge(monkeypatch):
     items, _ = text_detect._build_text_result(image, raw, 0.7, 6)
     assert [item["text"] for item in items] == ["-4.8"]
     assert [word["text"] for word in items[0].get("words", [])] == ["-4.", "8"]
+
+
+def test_cjk_digit_boundary_merge_inserts_space_when_word_gap_large():
+    left = {"box": [229, 234, 263, 102], "text": "2025", "confidence": 0.99,
+            "font_size": 60, "color": "#00354b", "bold": True,
+            "words": [{"text": "2025", "box": [0.129, 0.0, 0.711, 1.0]}]}
+    right = {"box": [482, 225, 817, 120], "text": "与 2026 关键指标",
+             "confidence": 0.99, "font_size": 60, "color": "#00354b",
+             "bold": True,
+             "words": [{"text": "与", "box": [0.0533, 0.0, 0.10, 1.0]},
+                        {"text": "2026", "box": [0.208, 0.0, 0.30, 1.0]},
+                        {"text": "关键指标", "box": [0.55, 0.0, 0.42, 1.0]}]}
+    merged = text_detect._merge_adjacent_text_items([left, right])
+    assert [item["text"] for item in merged] == ["2025 与 2026 关键指标"]
+
+
+def test_cjk_digit_boundary_merge_small_gap_stays_unspaced():
+    left = {"box": [10, 10, 60, 40], "text": "护理部", "confidence": 0.99,
+            "font_size": 20, "color": "#000000", "bold": False,
+            "words": [{"text": "护理部", "box": [0.0, 0.0, 1.0, 1.0]}]}
+    right = {"box": [71, 10, 60, 40], "text": "2026", "confidence": 0.99,
+             "font_size": 20, "color": "#000000", "bold": False,
+             "words": [{"text": "2026", "box": [0.0, 0.0, 1.0, 1.0]}]}
+    merged = text_detect._merge_text_pair(left, right)
+    assert merged["text"] == "护理部2026"
+
+
+def test_cjk_boundary_merge_without_words_keeps_old_separator_rule():
+    left = {"box": [229, 234, 263, 102], "text": "2025", "confidence": 0.99,
+            "font_size": 60, "color": "#00354b", "bold": True}
+    right = {"box": [482, 225, 817, 120], "text": "与 2026 关键指标",
+             "confidence": 0.99, "font_size": 60, "color": "#00354b",
+             "bold": True}
+    merged = text_detect._merge_text_pair(left, right)
+    assert merged["text"] == "2025与 2026 关键指标"
+
+
+def test_insert_cjk_latin_spaces_restores_dropped_space():
+    words = [{"text": "与", "box": [0.096, 0.0, 0.058, 0.8]},
+             {"text": "2026", "box": [0.208, 0.0, 0.30, 0.8]},
+             {"text": "关键指标", "box": [0.55, 0.0, 0.42, 0.8]}]
+    assert text_detect._insert_cjk_latin_spaces(
+        "与2026 关键指标", words, [482, 225, 817, 120]) == "与 2026 关键指标"
+
+
+def test_insert_cjk_latin_spaces_skips_small_gap_and_zero_gap():
+    tight = [{"text": "(", "box": [0.0, 0.0, 0.20, 1.0]},
+             {"text": "满分", "box": [0.21, 0.0, 0.30, 1.0]},
+             {"text": "5", "box": [0.5377, 0.0, 0.10, 1.0]},
+             {"text": ")", "box": [0.65, 0.0, 0.10, 1.0]}]
+    assert text_detect._insert_cjk_latin_spaces(
+        "(满分5)", tight, [100, 50, 300, 100]) == "(满分5)"
+    flush = [{"text": "护理部·", "box": [0.0, 0.0, 0.28, 1.0]},
+             {"text": "2026", "box": [0.28, 0.0, 0.20, 1.0]},
+             {"text": "年度工作汇报", "box": [0.48, 0.0, 0.50, 1.0]}]
+    assert text_detect._insert_cjk_latin_spaces(
+        "护理部·2026年度工作汇报", flush, [50, 50, 1000, 80]) == "护理部·2026年度工作汇报"
+
+
+def test_insert_cjk_latin_spaces_separates_middle_dot_word():
+    # R3 subtitle: OCR emits each glyph as its own word and the "·" is a
+    # standalone word with ~47 px before and ~62 px after it (height 92).
+    words = [{"text": "部", "box": [0.0, 0.0, 0.04, 0.9]},
+             {"text": "·", "box": [0.087, 0.0, 0.02, 0.9]},
+             {"text": "2026", "box": [0.169, 0.0, 0.08, 0.9]},
+             {"text": "年", "box": [0.26, 0.0, 0.04, 0.9]}]
+    assert text_detect._insert_cjk_latin_spaces(
+        "部·2026年", words, [100, 50, 1000, 92]) == "部 · 2026年"
+
+
+def test_insert_cjk_latin_spaces_keeps_tight_middle_dot():
+    words = [{"text": "部", "box": [0.0, 0.0, 0.04, 0.9]},
+             {"text": "·", "box": [0.05, 0.0, 0.02, 0.9]},
+             {"text": "2026", "box": [0.09, 0.0, 0.08, 0.9]}]
+    assert text_detect._insert_cjk_latin_spaces(
+        "部·2026", words, [100, 50, 1000, 92]) == "部·2026"
+
+
+def test_build_text_result_restores_cjk_digit_space(monkeypatch):
+    monkeypatch.setattr(
+        text_detect, "_estimate_style",
+        lambda *a, **k: {"font_size": 18, "color": "#000000", "bold": False},
+    )
+    image = np.full((400, 1400, 3), 255, dtype=np.uint8)
+    raw = [{"box": [482, 225, 817, 120], "text": "与2026 关键指标",
+            "confidence": 0.99,
+            "words": [{"text": "与", "box": [0.096, 0.0, 0.058, 0.8]},
+                        {"text": "2026", "box": [0.208, 0.0, 0.30, 0.8]},
+                        {"text": "关键指标", "box": [0.55, 0.0, 0.42, 0.8]}]}]
+    items, _ = text_detect._build_text_result(image, raw, 0.7, 6)
+    assert items[0]["text"] == "与 2026 关键指标"

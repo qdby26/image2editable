@@ -1876,6 +1876,25 @@ def _rebuild_canvas_background(
         and node["bbox"][2] >= text_repair.shape[1] - edge_margin
         and node["bbox"][3] >= text_repair.shape[0] - edge_margin
     }
+    # Union of every non-text node silhouette (any state), with enclosed
+    # holes filled so card regions cover the text sitting inside them.
+    visual_extent = np.zeros(text_repair.shape, dtype=bool)
+    for object_id, node in by_id.items():
+        if node["kind"] != "text":
+            visual_extent |= masks_by_id[object_id]
+    extent_background = ~visual_extent
+    if np.any(extent_background):
+        extent_count, extent_labels = cv2.connectedComponents(
+            extent_background.astype(np.uint8), connectivity=4
+        )
+        extent_border = set(extent_labels[0, :])
+        extent_border.update(extent_labels[-1, :])
+        extent_border.update(extent_labels[:, 0])
+        extent_border.update(extent_labels[:, -1])
+        extent_keep = np.ones(extent_count, dtype=bool)
+        extent_keep[list(extent_border)] = False
+        extent_keep[0] = False
+        visual_extent |= extent_keep[extent_labels]
     for object_id, node in by_id.items():
         ancestor_id = node["parent_id"]
         belongs_to_page_surface = object_id in inactive_page_surfaces
@@ -1889,7 +1908,13 @@ def _rebuild_canvas_background(
                 break
             ancestor_id = by_id[ancestor_id]["parent_id"]
         if not belongs_to_page_surface:
-            repairable_visual |= masks_by_id[object_id]
+            node_mask = masks_by_id[object_id]
+            if restored is not None and node["kind"] == "text":
+                # Text inside a visual silhouette keeps the old repair
+                # path; only free-surface text takes the donor.
+                repairable_visual |= node_mask & visual_extent
+            else:
+                repairable_visual |= node_mask
 
     def ancestor_visual_mask(object_id: str):
         ancestor_id = by_id[object_id]["parent_id"]
@@ -1972,13 +1997,70 @@ def _rebuild_canvas_background(
             source, restored, restored, text_repair,
             calibration=calibrate_page(source, text_repair),
         )
-        if text_labels is None:
-            _, text_labels = cv2.connectedComponents(text_repair.astype(np.uint8), 8)
-        touched = np.unique(text_labels[text_context.background_residual_text_ink])
-        touched = touched[touched > 0]
-        residual_text_repair = np.isin(text_labels, touched)
+        residual_ink = text_context.background_residual_text_ink.astype(
+            np.uint8
+        )
+        # Detection marks stroke edges only; close gaps so a stale stroke
+        # is covered end to end while isolated specks stay pixel-sized.
+        residual_strokes = (
+            cv2.morphologyEx(
+                residual_ink,
+                cv2.MORPH_CLOSE,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21)),
+            )
+            > 0
+        )
+        residual_patch = (
+            cv2.dilate(
+                residual_strokes.astype(np.uint8),
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
+            )
+            > 0
+        )
+        residual_text_repair = np.zeros(text_repair.shape, dtype=bool)
+        stale_surface = np.zeros(text_repair.shape, dtype=bool)
+        if np.any(residual_strokes):
+            if text_labels is None:
+                _, text_labels = cv2.connectedComponents(
+                    text_repair.astype(np.uint8), 8
+                )
+            # Dense leftover strokes mark the donor as untrusted for the
+            # whole component: the smooth fill cannot reproduce locally
+            # structured leftovers, so the component is rebuilt through
+            # the repair fill instead of pasted from the donor.  Sparse
+            # specks stay pixel-sized and keep the donor elsewhere.
+            for label in np.unique(text_labels[residual_strokes]):
+                if not label:
+                    continue
+                component = text_labels == label
+                coverage = int(np.count_nonzero(residual_strokes & component))
+                area = int(np.count_nonzero(component))
+                if coverage >= max(64, int(round(area * 0.005))):
+                    residual_text_repair |= component
+                    stale_surface |= component
+                else:
+                    residual_text_repair |= residual_patch & component
+            if np.any(stale_surface):
+                # Widen to the owning text nodes: donor leftovers inside
+                # the same surface would otherwise stay as fill donors
+                # and seed new residual specks around the hole.
+                for object_id, node in by_id.items():
+                    if node["kind"] != "text":
+                        continue
+                    if np.any(masks_by_id[object_id] & stale_surface):
+                        stale_surface |= masks_by_id[object_id]
         repair |= residual_text_repair
         restore_repair &= ~residual_text_repair
+        if np.any(stale_surface):
+            repairable_visual |= stale_surface
+            repair |= (
+                cv2.dilate(
+                    stale_surface.astype(np.uint8),
+                    np.ones((3, 3), dtype=np.uint8),
+                )
+                > 0
+            )
+            restore_repair &= ~stale_surface
     rebuilt = current.copy()
     if restored is not None:
         restore_canvas = source.copy()
@@ -1986,23 +2068,53 @@ def _rebuild_canvas_background(
         rebuilt[~repairable_visual] = restore_canvas[~repairable_visual]
         rebuilt[restore_repair] = restored[restore_repair]
         repair &= ~restore_repair
-    if np.all(repair):
-        # Inpainting without a donor silently returns the foreground unchanged.
-        # The canvas is fully covered by movable layers; infer its base tone.
-        border = np.concatenate((source[0], source[-1], source[:, 0], source[:, -1]))
-        rebuilt[:] = np.median(border, axis=0).astype(np.uint8)
-    elif np.any(repair):
-        from scripts.component_underlay import _choose_visual_fill
+    def _apply_repair_fill(canvas: np.ndarray) -> np.ndarray:
+        if np.all(repair):
+            # Inpainting without a donor silently returns the foreground
+            # unchanged; infer the base tone from the page border.
+            border = np.concatenate(
+                (source[0], source[-1], source[:, 0], source[:, -1])
+            )
+            canvas[:] = np.median(border, axis=0).astype(np.uint8)
+        elif np.any(repair):
+            from scripts.component_underlay import _choose_visual_fill
 
-        rebuilt, _ = _choose_visual_fill(
-            rgb=rebuilt,
-            source_rgb=current,
-            semantic_mask=repair,
-            donor_mask=~repair,
-            visual_hole=repair,
-            allow_smooth_surface=True,
-            allow_original=False,
+            canvas, _ = _choose_visual_fill(
+                rgb=canvas,
+                source_rgb=current,
+                semantic_mask=repair,
+                donor_mask=~repair,
+                visual_hole=repair,
+                allow_smooth_surface=True,
+                allow_original=False,
+            )
+        return canvas
+
+    rebuilt = _apply_repair_fill(rebuilt)
+    if restored is not None and np.any(text_repair):
+        from image2editable.component_quality import (
+            _prepare_page_quality_context, calibrate_page,
         )
+
+        # Pixel-level repair can leave residual ink that still reads as
+        # text; fall back to repairing the whole text component once.
+        recheck = _prepare_page_quality_context(
+            source, rebuilt, rebuilt, text_repair,
+            calibration=calibrate_page(source, text_repair),
+        )
+        residual_left = recheck.background_residual_text_ink & text_repair
+        if np.any(residual_left):
+            _, region_labels = cv2.connectedComponents(
+                text_repair.astype(np.uint8), 8
+            )
+            stale_labels = np.unique(region_labels[residual_left])
+            stale_labels = stale_labels[stale_labels > 0]
+            if stale_labels.size:
+                component_fallback = np.isin(region_labels, stale_labels)
+                restore_repair &= ~component_fallback
+                repair |= component_fallback
+                repair &= ~restore_repair
+                rebuilt = _apply_repair_fill(rebuilt)
     if restored is not None:
         # Expanded donor exclusion must not erase uncovered source texture.
         uncovered = ~(visible_coverage | text_repair | restore_repair)
