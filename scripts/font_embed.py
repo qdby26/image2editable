@@ -16,6 +16,13 @@ _A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
 _P_NS = "http://schemas.openxmlformats.org/presentationml/2006/main"
 _PP_SAVE_AS_OPENXML = 24
 _MSO_TRUE = -1
+# Per-instance guards against Open/SaveAs stalling on a hidden modal or
+# an add-in/macro event handler on the dedicated automation instance.
+_MSO_AUTOMATION_SECURITY_FORCE_DISABLE = 3
+_PP_ALERTS_NONE = 1
+_EMBED_WATCHDOG_S = float(
+    os.environ.get("IMAGE2EDITABLE_FONT_EMBED_TIMEOUT", "240")
+)
 # Microsoft PowerPoint's fixed Application CLSID. DispatchEx by CLSID
 # bypasses WPS Office hijacking the "PowerPoint.Application" ProgID —
 # WPS registers itself under that ProgID but the CLSID still points at
@@ -154,25 +161,24 @@ def _com_powerpoint():
 
 
 def _start_powerpoint(timeout_s: float = 90.0):
-    """Return a dedicated real-PowerPoint COM instance, or None.
+    """Return ``(app, proc)`` for a dedicated real-PowerPoint instance.
 
-    WPS hijacks the PowerPoint ProgID/CLSID under HKCU and squats in the
-    Running Object Table, so a bare activation while real PowerPoint is
-    not running yields wpp.exe — whose SaveAs silently drops embedded
-    fonts. Once real POWERPNT.EXE is running, activation resolves to it
+    Returns ``(None, None)`` when unavailable: no POWERPNT.EXE, real
+    PowerPoint already running as a user session, or activation kept
+    resolving to WPS (which hijacks the PowerPoint ProgID/CLSID under
+    HKCU and squats in the Running Object Table) until the deadline.
+    Once real POWERPNT.EXE is running, activation resolves to it
     (running servers win over HKCU registrations), so we spawn it and
     poll. WPS may answer while PowerPoint is still starting — that is
-    not fatal, keep polling until the deadline. If real POWERPNT.EXE was
-    already running it belongs to a user session and embedding is
-    skipped rather than risking a Quit on someone else's documents.
-    The caller must already have called pythoncom.CoInitialize().
+    not fatal, keep polling until the deadline. The caller must already
+    have called pythoncom.CoInitialize().
     """
     import subprocess
     import time
 
     exe = _powerpoint_exe_path()
     if exe is None or _powerpoint_running():
-        return None
+        return None, None
     proc = subprocess.Popen([str(exe), "/automation"])
     deadline = time.monotonic() + timeout_s
     diag = []
@@ -188,10 +194,10 @@ def _start_powerpoint(timeout_s: float = 90.0):
                 if app.Presentations.Count > 0:
                     # A user session appeared between our checks; leave it.
                     proc = None
-                    return None
+                    return None, None
             except Exception:
                 pass
-            return app
+            return app, proc
         # WPS answered (or activation failed) while real PP still starts.
         diag.append(
             f"{time.monotonic() - (deadline - timeout_s):.1f}s "
@@ -213,7 +219,26 @@ def _start_powerpoint(timeout_s: float = 90.0):
         proc.terminate()
     except Exception:
         pass
-    return None
+    return None, None
+
+
+def _embed_watchdog(proc, done, stalled) -> None:
+    """Kill the spawned POWERPNT.EXE if the embed section overruns.
+
+    Presentations.Open/SaveAs are synchronous COM calls; an add-in event
+    handler or hidden modal can stall them indefinitely. Killing the
+    process makes the blocked call return a com_error that the caller
+    converts into a retry with a fresh instance.
+    """
+    if proc is None:
+        return
+    if done.wait(_EMBED_WATCHDOG_S):
+        return
+    stalled.set()
+    try:
+        proc.kill()
+    except Exception:
+        pass
 
 
 def _powerpoint_available() -> bool:
@@ -467,52 +492,93 @@ def embed_fonts(src: str | Path, dst: str | Path) -> dict:
             except Exception:
                 pass
 
+    import threading
+
     pythoncom.CoInitialize()
-    application = None
-    started = False
     com_fonts: list = []
     substitutions: dict[str, str] = {}
     app_info = {}
     try:
-        # Always start a dedicated instance and always quit it: attaching
-        # to an already-running presentation app via GetActiveObject risks
-        # touching user sessions and produces inconsistent dispatch state.
-        application = _start_powerpoint()
-        if application is None:
-            raise RuntimeError(
-                "real Microsoft PowerPoint unavailable: not installed, "
-                "already running as a user session, or hijacked by WPS"
-            )
-        started = True
-        try:
-            app_info = {
-                "name": str(application.Name),
-                "version": str(application.Version),
-                "path": str(application.Path),
-            }
-        except Exception:
-            app_info = {}
+        for attempt in range(2):
+            application = proc = None
+            done = threading.Event()
+            stalled = threading.Event()
+            try:
+                # Always start a dedicated instance and always quit it:
+                # attaching to an already-running presentation app via
+                # GetActiveObject risks touching user sessions and
+                # produces inconsistent dispatch state.
+                application, proc = _start_powerpoint()
+                if application is None:
+                    raise RuntimeError(
+                        "real Microsoft PowerPoint unavailable: not "
+                        "installed, already running as a user session, "
+                        "or hijacked by WPS"
+                    )
+                for attr, value in (
+                    ("AutomationSecurity",
+                     _MSO_AUTOMATION_SECURITY_FORCE_DISABLE),
+                    ("DisplayAlerts", _PP_ALERTS_NONE),
+                ):
+                    try:
+                        setattr(application, attr, value)
+                    except Exception:
+                        pass
+                threading.Thread(
+                    target=_embed_watchdog,
+                    args=(proc, done, stalled),
+                    daemon=True,
+                ).start()
+                try:
+                    app_info = {
+                        "name": str(application.Name),
+                        "version": str(application.Version),
+                        "path": str(application.Path),
+                    }
+                except Exception:
+                    app_info = {}
 
-        com_fonts = embed_once(src_path)
-        dst_usage = collect_font_usage(dst_path)
-        substitutions = _resolve_substitutions(dst_usage["not_embedded"])
-        if substitutions:
-            # Rewrite a copy of the untouched source (never the first-pass
-            # output, whose embeddedFontLst entries would be re-labelled).
-            staging = dst_path.with_suffix(".subst-src.pptx")
-            try:
-                shutil.copyfile(src_path, staging)
-                _rewrite_typefaces(staging, substitutions)
-                com_fonts = embed_once(staging)
-            finally:
-                staging.unlink(missing_ok=True)
-            dst_usage = collect_font_usage(dst_path)
-    finally:
-        if application is not None and started:
-            try:
-                application.Quit()
+                com_fonts = embed_once(src_path)
+                dst_usage = collect_font_usage(dst_path)
+                substitutions = _resolve_substitutions(
+                    dst_usage["not_embedded"]
+                )
+                if substitutions:
+                    # Rewrite a copy of the untouched source (never the
+                    # first-pass output, whose embeddedFontLst entries
+                    # would be re-labelled).
+                    staging = dst_path.with_suffix(".subst-src.pptx")
+                    try:
+                        shutil.copyfile(src_path, staging)
+                        _rewrite_typefaces(staging, substitutions)
+                        com_fonts = embed_once(staging)
+                    finally:
+                        staging.unlink(missing_ok=True)
+                    dst_usage = collect_font_usage(dst_path)
+                break
             except Exception:
-                pass
+                crashed = proc is not None and proc.poll() is not None
+                if attempt == 0 and (stalled.is_set() or crashed):
+                    _LOGGER.warning(
+                        "PowerPoint embed %s; retrying with a fresh "
+                        "instance",
+                        "stalled" if stalled.is_set() else "crashed",
+                    )
+                    continue
+                raise
+            finally:
+                done.set()
+                if application is not None:
+                    try:
+                        application.Quit()
+                    except Exception:
+                        pass
+                if proc is not None and proc.poll() is None:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+    finally:
         pythoncom.CoUninitialize()
 
     from pptx import Presentation
