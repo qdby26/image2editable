@@ -4469,7 +4469,10 @@ def assemble_legacy_results(store: RunStore) -> dict[str, Any]:
                         raise RuntimeError("PSD assembler did not produce output")
                 elif len(slides) == 1:
                     module._assemble_prepared_slide(
-                        slides[0], staging, False, variant
+                        slides[0], staging, False, variant,
+                        embed_report_path=target.with_suffix(
+                            ".embed-report.json"
+                        ),
                     )
                 else:
                     module.assemble_pptx_multi(
@@ -4477,6 +4480,12 @@ def assemble_legacy_results(store: RunStore) -> dict[str, Any]:
                         slide_size=variant,
                         original_aspect_ratio=manifest["input"].get(
                             "page_aspect_ratio"
+                        ),
+                    )
+                    module._embed_delivery_fonts(
+                        staging,
+                        report_path=target.with_suffix(
+                            ".embed-report.json"
                         ),
                     )
                 if output_format != "psd":

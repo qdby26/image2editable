@@ -5915,6 +5915,7 @@ def _assemble_prepared_slide(
     output_path: str | Path,
     add_reference: bool,
     slide_size: str,
+    embed_report_path: str | Path | None = None,
 ) -> str:
     background_key = (
         "background_original_path"
@@ -5922,7 +5923,7 @@ def _assemble_prepared_slide(
         else "background_widescreen_path"
     )
     use_canvas = slide_size == "16:9"
-    return assemble_pptx(
+    result = assemble_pptx(
         background_path=slide_data[background_key],
         components=slide_data["components"],
         text_items=slide_data["text_items"],
@@ -5939,6 +5940,20 @@ def _assemble_prepared_slide(
         visual_elements=slide_data.get("visual_elements"),
         background_rgb=slide_data.get("background_rgb"),
     )
+    _embed_delivery_fonts(result, report_path=embed_report_path)
+    return result
+
+
+def _embed_delivery_fonts(
+    pptx_path: str | Path,
+    report_path: str | Path | None = None,
+) -> None:
+    try:
+        from scripts.font_embed import embed_pptx_in_place
+    except ModuleNotFoundError:
+        from font_embed import embed_pptx_in_place  # type: ignore[no-redef]
+
+    embed_pptx_in_place(pptx_path, report_path=report_path)
 
 
 def convert(
@@ -6130,15 +6145,18 @@ def convert_batch_variants(
             output_path=str(widescreen_output),
             add_reference=add_reference,
         )
+        _embed_delivery_fonts(widescreen_result)
 
     if combine_original:
+        original_output = Path(f"{base}_original.pptx")
         original_result = assemble_pptx_multi(
             slides_data=slides_data,
-            output_path=str(Path(f"{base}_original.pptx")),
+            output_path=str(original_output),
             add_reference=add_reference,
             slide_size="original",
             original_aspect_ratio=original_aspect_ratio,
         )
+        _embed_delivery_fonts(original_result)
         return {"16:9": widescreen_result, "original": original_result}
 
     original_results = []

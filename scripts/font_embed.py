@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import os
 import sys
 import zipfile
 from pathlib import Path
@@ -12,6 +14,13 @@ _A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
 _P_NS = "http://schemas.openxmlformats.org/presentationml/2006/main"
 _PP_SAVE_AS_OPENXML = 24
 _MSO_TRUE = -1
+# Microsoft PowerPoint's fixed Application CLSID. DispatchEx by CLSID
+# bypasses WPS Office hijacking the "PowerPoint.Application" ProgID —
+# WPS registers itself under that ProgID but the CLSID still points at
+# real POWERPNT.EXE, and WPS's SaveAs silently ignores the embed flag.
+_POWERPOINT_CLSID = "{91493441-5A91-11CF-8700-00AA0060263B}"
+EMBED_FONTS_ENV = "IMAGE2EDITABLE_EMBED_FONTS"
+_LOGGER = logging.getLogger(__name__)
 
 
 def collect_font_usage(pptx_path: str | Path) -> dict:
@@ -60,24 +69,141 @@ def _dumb_dispatch(obj):
     )
 
 
+def _powerpoint_exe_path() -> Path | None:
+    if sys.platform != "win32":
+        return None
+    try:
+        import winreg
+
+        key = winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            rf"SOFTWARE\Classes\CLSID\{_POWERPOINT_CLSID}\LocalServer32",
+        )
+        raw = winreg.QueryValueEx(key, "")[0]
+        exe = Path(raw.split('"')[1] if '"' in raw else raw.split(" /")[0])
+        if exe.name.upper() == "POWERPNT.EXE" and exe.exists():
+            return exe
+    except OSError:
+        pass
+    for candidate in sorted(
+        Path("C:/Program Files").glob(
+            "Microsoft Office*/Root/Office*/POWERPNT.EXE"
+        )
+    ) + sorted(
+        Path("C:/Program Files (x86)").glob(
+            "Microsoft Office*/Root/Office*/POWERPNT.EXE"
+        )
+    ):
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _powerpoint_running() -> bool:
+    import subprocess
+
+    try:
+        listing = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq POWERPNT.EXE", "/NH"],
+            capture_output=True, text=True, timeout=15,
+        ).stdout
+    except Exception:
+        return False
+    return "POWERPNT.EXE" in listing.upper()
+
+
+def _is_real_powerpoint(application) -> bool:
+    try:
+        return (Path(str(application.Path)) / "POWERPNT.EXE").exists()
+    except Exception:
+        return False
+
+
+def _com_powerpoint():
+    """Return the activated PowerPoint object (real PP or hijacked WPS)."""
+    import win32com.client
+    for progid in (_POWERPOINT_CLSID, "PowerPoint.Application"):
+        try:
+            return win32com.client.DispatchEx(progid)
+        except Exception:
+            continue
+    return None
+
+
+def _start_powerpoint(timeout_s: float = 90.0):
+    """Return a dedicated real-PowerPoint COM instance, or None.
+
+    WPS hijacks the PowerPoint ProgID/CLSID under HKCU and squats in the
+    Running Object Table, so a bare activation while real PowerPoint is
+    not running yields wpp.exe — whose SaveAs silently drops embedded
+    fonts. Once real POWERPNT.EXE is running, activation resolves to it
+    (running servers win over HKCU registrations), so we spawn it and
+    poll. WPS may answer while PowerPoint is still starting — that is
+    not fatal, keep polling until the deadline. If real POWERPNT.EXE was
+    already running it belongs to a user session and embedding is
+    skipped rather than risking a Quit on someone else's documents.
+    The caller must already have called pythoncom.CoInitialize().
+    """
+    import subprocess
+    import time
+
+    exe = _powerpoint_exe_path()
+    if exe is None or _powerpoint_running():
+        return None
+    proc = subprocess.Popen([str(exe), "/automation"])
+    deadline = time.monotonic() + timeout_s
+    diag = []
+    while time.monotonic() < deadline:
+        app = None
+        err = ""
+        try:
+            app = _com_powerpoint()
+        except Exception as e:  # pragma: no cover - diagnostics
+            err = repr(e)[:120]
+        if app is not None and _is_real_powerpoint(app):
+            try:
+                if app.Presentations.Count > 0:
+                    # A user session appeared between our checks; leave it.
+                    proc = None
+                    return None
+            except Exception:
+                pass
+            return app
+        # WPS answered (or activation failed) while real PP still starts.
+        diag.append(
+            f"{time.monotonic() - (deadline - timeout_s):.1f}s "
+            f"proc={proc.poll()} app={'other' if app is not None else None} {err}"
+        )
+        if proc.poll() is not None:
+            # POWERPNT.EXE exited early (e.g. recycled by an exiting
+            # instance during COM hand-off); respawn once.
+            if getattr(proc, "_respawned", False):
+                break
+            proc = subprocess.Popen([str(exe), "/automation"])
+            proc._respawned = True  # type: ignore[attr-defined]
+        time.sleep(0.5)
+    _LOGGER.warning(
+        "PowerPoint did not become attachable within %.0fs; trace: %s",
+        timeout_s, " | ".join(diag[-8:]),
+    )
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    return None
+
+
 def _powerpoint_available() -> bool:
     if sys.platform != "win32":
         return False
     try:
         import pythoncom  # noqa: F401
-        from win32com.client import DispatchEx  # noqa: F401
-        import win32com.client
-        win32com.client.GetActiveObject("PowerPoint.Application")
-        return True
-    except Exception:
-        try:
-            from win32com.client import DispatchEx
-
-            app = DispatchEx("PowerPoint.Application")
-            app.Quit()
-            return True
-        except Exception:
-            return False
+    except ImportError:
+        return False
+    return (
+        _powerpoint_exe_path() is not None
+        and not _powerpoint_running()
+    )
 
 
 def embed_fonts(src: str | Path, dst: str | Path) -> dict:
@@ -90,6 +216,14 @@ def embed_fonts(src: str | Path, dst: str | Path) -> dict:
         raise RuntimeError(
             "font embedding requires pywin32 and PowerPoint"
         ) from error
+
+    # Fail fast before touching the filesystem: no usable server means the
+    # call cannot succeed regardless of the inputs.
+    if _powerpoint_exe_path() is None or _powerpoint_running():
+        raise RuntimeError(
+            "real Microsoft PowerPoint unavailable: not installed or "
+            "already running as a user session"
+        )
 
     src_path = Path(src).resolve()
     dst_path = Path(dst).resolve()
@@ -104,9 +238,12 @@ def embed_fonts(src: str | Path, dst: str | Path) -> dict:
         # Always start a dedicated instance and always quit it: attaching
         # to an already-running presentation app via GetActiveObject risks
         # touching user sessions and produces inconsistent dispatch state.
-        from win32com.client import DispatchEx
-
-        application = DispatchEx("PowerPoint.Application")
+        application = _start_powerpoint()
+        if application is None:
+            raise RuntimeError(
+                "real Microsoft PowerPoint unavailable: not installed, "
+                "already running as a user session, or hijacked by WPS"
+            )
         started = True
         try:
             app_info = {
@@ -129,26 +266,37 @@ def embed_fonts(src: str | Path, dst: str | Path) -> dict:
         )
         # presentation.Fonts does not yield items via iteration; index it.
         # WPS's typeinfo-backed dispatch rejects Fonts.Count via InvokeTypes,
-        # so wrap it as a dumb (name-only) dispatch.
-        fonts = _dumb_dispatch(presentation.Fonts)
+        # so wrap it as a dumb (name-only) dispatch. The listing is
+        # diagnostic only — embedding itself is done by SaveAs below, so a
+        # host that refuses Fonts enumeration must not abort the embed.
         com_fonts = []
-        for index in range(1, fonts.Count + 1):
-            font = _dumb_dispatch(fonts(index))
-            com_fonts.append(
-                {
-                    "name": str(font.Name),
-                    "embeddable": bool(font.Embeddable),
-                    "embedded": bool(font.Embedded),
-                }
-            )
+        try:
+            fonts = _dumb_dispatch(presentation.Fonts)
+            for index in range(1, fonts.Count + 1):
+                font = _dumb_dispatch(fonts(index))
+                com_fonts.append(
+                    {
+                        "name": str(font.Name),
+                        "embeddable": bool(font.Embeddable),
+                        "embedded": bool(font.Embedded),
+                    }
+                )
+        except Exception as error:
+            _LOGGER.warning("presentation Fonts listing failed: %s", error)
         presentation.SaveAs(
             str(dst_path), _PP_SAVE_AS_OPENXML, _MSO_TRUE
         )
     finally:
         if presentation is not None:
-            presentation.Close()
+            try:
+                presentation.Close()
+            except Exception:
+                pass
         if application is not None and started:
-            application.Quit()
+            try:
+                application.Quit()
+            except Exception:
+                pass
         pythoncom.CoUninitialize()
 
     from pptx import Presentation
@@ -162,6 +310,72 @@ def embed_fonts(src: str | Path, dst: str | Path) -> dict:
         "app": app_info,
         "portable": not dst_usage["not_embedded"],
     }
+
+
+def embed_fonts_enabled() -> bool:
+    raw = os.environ.get(EMBED_FONTS_ENV)
+    if raw is None:
+        return True
+    return raw.strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _default_report_path(pptx_path: Path) -> Path:
+    return pptx_path.with_suffix(".embed-report.json")
+
+
+def _write_report(report_path: Path | None, payload: dict) -> None:
+    if report_path is None:
+        return
+    try:
+        report_path.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except OSError as error:
+        _LOGGER.warning("font embed report write failed: %s", error)
+
+
+def embed_pptx_in_place(
+    pptx_path: str | Path,
+    report_path: str | Path | None = None,
+) -> dict:
+    """Embed fonts into ``pptx_path`` in place; never raises.
+
+    Delivery calls this for every produced PPTX. Failures degrade to a
+    skipped report and keep the original file untouched.
+    """
+    path = Path(pptx_path)
+    report = Path(report_path) if report_path is not None else _default_report_path(path)
+    if not embed_fonts_enabled():
+        payload = {"embedded": False, "skipped": True, "reason": f"{EMBED_FONTS_ENV} disabled"}
+        _write_report(report, payload)
+        return payload
+    try:
+        usage = collect_font_usage(path)
+        if usage["not_embedded"] == [] and usage["embedded"]:
+            payload = {
+                "embedded": True,
+                "already": True,
+                "dst_usage": usage,
+                "portable": True,
+            }
+            _write_report(report, payload)
+            return payload
+        tmp = path.with_name(f".{path.stem}.embed-tmp.pptx")
+        try:
+            result = embed_fonts(path, tmp)
+        except Exception as error:
+            tmp.unlink(missing_ok=True)
+            raise error
+        os.replace(tmp, path)
+        payload = {"embedded": True, **result}
+        _write_report(report, payload)
+        return payload
+    except Exception as error:
+        _LOGGER.warning("font embedding skipped for %s: %s", path, error)
+        payload = {"embedded": False, "skipped": True, "reason": str(error)}
+        _write_report(report, payload)
+        return payload
 
 
 def main() -> None:
