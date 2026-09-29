@@ -440,6 +440,15 @@ def _choose_visual_fill(
     )
 
 
+def _enclosed_holes(mask: np.ndarray) -> np.ndarray:
+    """Pixels inside ``mask``'s outer silhouette that are not in it."""
+    height, width = mask.shape
+    flood = np.zeros((height + 2, width + 2), dtype=np.uint8)
+    inverse = (~mask).astype(np.uint8)
+    cv2.floodFill(inverse, flood, (0, 0), 2)
+    return inverse == 1
+
+
 def _embedded_higher_layer(
     semantic: np.ndarray, higher_layer: np.ndarray,
 ) -> np.ndarray:
@@ -528,6 +537,7 @@ def build_presentation_layer(
     semantic_mask: np.ndarray,
     higher_layer_mask: np.ndarray,
     text_mask: np.ndarray,
+    other_ownership_mask: np.ndarray | None = None,
 ) -> dict:
     """Build a movable component appearance without changing owned pixels."""
     source = _rgb_array("source_rgb", source_rgb)
@@ -611,10 +621,75 @@ def build_presentation_layer(
         rgb[visual_hole] = visual_fill[visual_hole]
     metrics = _visual_metrics(rgb, source, ownership, generated)
 
+    alpha = ownership | generated
+    holes = _enclosed_holes(alpha)
+    if np.any(holes):
+        # Reference the page background just outside the object: pixels
+        # whose source color matches it are genuine see-through holes
+        # (ring interiors, punched windows); pixels that do not are
+        # object content the mask missed — restore them from the source.
+        outline = (
+            cv2.dilate(alpha.astype(np.uint8), np.ones((9, 9), np.uint8))
+            .astype(bool) & ~alpha
+        )
+        if np.count_nonzero(outline) >= 32:
+            exterior_bg = np.median(
+                source[outline].astype(np.int16), axis=0
+            )
+            blocked = (
+                cv2.dilate(
+                    text.astype(np.uint8), np.ones((3, 3), np.uint8)
+                ).astype(bool)
+                | higher_layer
+                | expanded_higher
+            )
+            if other_ownership_mask is not None:
+                blocked |= cv2.dilate(
+                    _mask_array(
+                        "other_ownership_mask", other_ownership_mask, shape
+                    ).astype(np.uint8),
+                    np.ones((3, 3), np.uint8),
+                ).astype(bool)
+            count, labels = cv2.connectedComponents(
+                holes.astype(np.uint8), connectivity=8,
+            )
+            for label in range(1, count):
+                hole = labels == label
+                if np.any(hole & blocked):
+                    continue
+                hole_src = np.median(
+                    source[hole].astype(np.int16), axis=0
+                )
+                inner_ring = (
+                    cv2.dilate(
+                        hole.astype(np.uint8), np.ones((5, 5), np.uint8)
+                    ).astype(bool)
+                    & alpha
+                )
+                ext_diff = float(
+                    np.max(np.abs(hole_src - exterior_bg))
+                )
+                int_diff = (
+                    float(np.max(np.abs(
+                        hole_src
+                        - np.median(
+                            source[inner_ring].astype(np.int16), axis=0
+                        )
+                    )))
+                    if np.any(inner_ring) else 255.0
+                )
+                # Keep the hole only if it looks like the page background
+                # AND discontinuous with the surrounding object interior.
+                if ext_diff <= 24.0 and int_diff > 24.0:
+                    continue
+                ownership |= hole
+                rgb[hole] = source[hole]
+            alpha = ownership | generated
+
     return {
         "rgb": rgb,
         "ownership_mask": ownership,
-        "presentation_alpha_mask": ownership | generated,
+        "presentation_alpha_mask": alpha,
         "generated_underlay_mask": generated,
         "metrics": metrics,
     }

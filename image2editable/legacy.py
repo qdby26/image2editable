@@ -1215,6 +1215,9 @@ def _build_presentation_assets(
         groups = {}
         for item in indexed_layers:
             groups.setdefault(int(item[1]["z_index"]), []).append(item)
+        all_ownership = np.zeros(source.shape[:2], dtype=bool)
+        for ownership in ownership_masks:
+            all_ownership |= ownership
         higher = np.zeros(source.shape[:2], dtype=bool)
         for z_index in sorted(groups, reverse=True):
             group = groups[z_index]
@@ -1239,6 +1242,9 @@ def _build_presentation_assets(
                         semantic_mask=semantic,
                         higher_layer_mask=higher,
                         text_mask=text_mask,
+                        other_ownership_mask=(
+                            all_ownership & ~presentation_ownership
+                        ),
                     )
                 else:
                     empty = np.zeros(source.shape[:2], dtype=bool)
