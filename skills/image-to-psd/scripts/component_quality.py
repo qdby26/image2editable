@@ -365,6 +365,39 @@ def _ratio(numerator: np.ndarray, denominator: int) -> float:
     return float(np.count_nonzero(numerator)) / max(denominator, 1)
 
 
+def _background_responsibility_geometry(candidate: np.ndarray) -> np.ndarray:
+    support = np.asarray(candidate, dtype=bool)
+    if support.ndim != 2:
+        raise ValueError("candidate must be a two-dimensional mask")
+    height, width = support.shape
+    short_side = min(height, width)
+    max_thickness = max(3, (short_side + 150) // 300)
+    min_length = max(32, (short_side + 5) // 10)
+    pixels = support.astype(np.uint8)
+    core = cv2.erode(pixels, np.ones((3, 3), dtype=np.uint8)) > 0
+    accepted = support & ~core
+    for kernel_shape, horizontal in (
+        ((1, min_length), True),
+        ((min_length, 1), False),
+    ):
+        opened = cv2.morphologyEx(
+            pixels,
+            cv2.MORPH_OPEN,
+            np.ones(kernel_shape, dtype=np.uint8),
+        )
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(opened, 8)
+        major = stats[:, cv2.CC_STAT_WIDTH if horizontal else cv2.CC_STAT_HEIGHT]
+        minor = stats[:, cv2.CC_STAT_HEIGHT if horizontal else cv2.CC_STAT_WIDTH]
+        keep = np.zeros(count, dtype=bool)
+        keep[1:] = (
+            (major[1:] >= min_length)
+            & (minor[1:] <= max_thickness)
+            & (major[1:] >= 20 * minor[1:])
+        )
+        accepted |= support & keep[labels]
+    return accepted
+
+
 def _largest_region(mask: np.ndarray) -> tuple[int, np.ndarray]:
     count, labels, stats, _ = cv2.connectedComponentsWithStats(
         np.asarray(mask, dtype=np.uint8), 8
@@ -537,6 +570,19 @@ def _text_ink_mask(
         )
     local_ink = local_delta > ink_threshold
     structural_line = np.zeros(shape, dtype=bool)
+    # Separate grid directions before labeling: crossing lines are not glyphs.
+    line_length = max(32, text_radius * 5)
+    for kernel_shape in ((1, line_length), (line_length, 1)):
+        opened = cv2.morphologyEx(
+            local_ink.astype(np.uint8), cv2.MORPH_OPEN,
+            np.ones(kernel_shape, dtype=np.uint8),
+        )
+        count, labels = cv2.connectedComponents(opened, 8)
+        inside = np.bincount(labels[text], minlength=count)
+        outside = np.bincount(labels[~text], minlength=count)
+        keep = (inside > 0) & (outside > 0)
+        keep[0] = False
+        structural_line |= keep[labels]
     line_count, line_labels, line_stats, _ = cv2.connectedComponentsWithStats(
         local_ink.astype(np.uint8), 8
     )
@@ -630,6 +676,7 @@ def component_metrics(
     *,
     component_mask: np.ndarray,
     parent_mask: np.ndarray | None = None,
+    higher_presentation_alpha_mask: np.ndarray | None = None,
     text_mask: np.ndarray,
     _page_context: _PageQualityContext | None = None,
 ) -> dict:
@@ -644,9 +691,18 @@ def component_metrics(
     support &= ~context.text
     support_pixels = int(np.count_nonzero(support))
     parent_coverage_ratio = 1.0
+    higher_presentation_alpha = None
+    if higher_presentation_alpha_mask is not None:
+        higher_presentation_alpha = _strict_binary_mask(
+            higher_presentation_alpha_mask,
+            shape,
+            "higher presentation alpha mask",
+        )
     if parent_mask is not None:
         parent_support, _ = _project_component_mask(parent_mask, shape)
         parent_support &= ~context.text
+        if higher_presentation_alpha is not None:
+            parent_support &= ~higher_presentation_alpha
         child_support = support & ~context.text
         parent_pixels = int(np.count_nonzero(parent_support))
         if parent_pixels:
@@ -793,6 +849,7 @@ def evaluate_component(
     *,
     component_mask: np.ndarray,
     parent_mask: np.ndarray | None = None,
+    higher_presentation_alpha_mask: np.ndarray | None = None,
     presentation_alpha_mask: np.ndarray | None = None,
     generated_underlay_mask: np.ndarray | None = None,
     underlay_metrics: dict | None = None,
@@ -874,6 +931,7 @@ def evaluate_component(
     metrics = component_metrics(
         source, background, reconstructed, node, graph, calibration,
         component_mask=component_mask, parent_mask=parent_mask,
+        higher_presentation_alpha_mask=higher_presentation_alpha_mask,
         text_mask=text_mask, _page_context=_page_context,
     )
     if presentation_alpha_mask is not None:
@@ -1075,6 +1133,10 @@ def evaluate_page_quality(
                 "editable_text_once_unknown"
                 if editable_state == "unknown" else "editable_text_once"
             )
+    if page_checks is not None and "native_text_underlay" in page_checks:
+        underlay_state = _check_state(page_checks, "native_text_underlay")
+        if underlay_state != "pass":
+            violations.append("native_text_underlay")
     if page_checks is not None and "background_text_clean" in page_checks:
         background_state = _check_state(page_checks, "background_text_clean")
         if background_state != "pass":
@@ -1106,6 +1168,13 @@ def evaluate_page_quality(
             **(
                 {"editable_text_once": _check_state(page_checks, "editable_text_once")}
                 if page_checks is not None and "editable_text_once" in page_checks
+                else {}
+            ),
+            **(
+                {"native_text_underlay": _check_state(
+                    page_checks, "native_text_underlay"
+                )}
+                if page_checks is not None and "native_text_underlay" in page_checks
                 else {}
             ),
             **(
@@ -1155,11 +1224,37 @@ def material_ownership_metrics(
     )
     keep = np.zeros(material.shape, dtype=bool)
     largest = 0
+    boundary_radius = max(1, min(3, calibration.edge_width_px))
+    boundary_thickness = min(
+        4, max(2, int(round(calibration.edge_width_px * 0.35)))
+    )
+    owned_neighborhood = cv2.dilate(
+        owned.astype(np.uint8),
+        np.ones((2 * boundary_radius + 1,) * 2, dtype=np.uint8),
+    ) > 0
+    boundary_area_limit = max(calibration.min_component_pixels * 8, 64)
     for label in range(1, count):
         area = int(stats[label, cv2.CC_STAT_AREA])
         if area < calibration.min_component_pixels:
             continue
-        keep |= labels == label
+        x, y, width, height = stats[label, :4]
+        # One pixel of context preserves distance-transform boundaries.
+        bounds = (
+            slice(max(0, y - 1), min(labels.shape[0], y + height + 1)),
+            slice(max(0, x - 1), min(labels.shape[1], x + width + 1)),
+        )
+        region = labels[bounds] == label
+        thickness = 2.0 * float(
+            cv2.distanceTransform(region.astype(np.uint8), cv2.DIST_L2, 5).max()
+        )
+        is_boundary_residual = (
+            area <= boundary_area_limit
+            and np.any(region & owned_neighborhood[bounds])
+            and thickness <= boundary_thickness
+        )
+        if is_boundary_residual:
+            continue
+        keep[bounds] |= region
         largest = max(largest, area)
     material_pixels = int(np.count_nonzero(material))
     unexplained_pixels = int(np.count_nonzero(keep))

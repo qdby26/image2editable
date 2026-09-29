@@ -17,7 +17,7 @@ def _line_ink(region):
     if region.size == 0 or min(region.shape[:2]) < 8:
         return None
     gray = cv2.cvtColor(region, cv2.COLOR_RGB2GRAY)
-    threshold, dark = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+    _, dark = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
     contours, hierarchy = cv2.findContours(dark, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
     if hierarchy is None:
         return None
@@ -57,10 +57,15 @@ def _line_ink(region):
         if np.count_nonzero(outside) < 8:
             continue
         background = np.median(region[ys, xs][outside], axis=0)
-        # Contrast against the external background is the ownership signal.
-        # A fixed Otsu cutoff drops valid pastel fills whose luminance is near
-        # the row threshold (common in outlined Chinese lettering).
         if np.linalg.norm(fill-background) < 30:
+            continue
+        ring = (cv2.dilate(interior_mask, np.ones((7, 7), np.uint8)) > 0) & (dark > 0)
+        if not np.any(ring):
+            continue
+        # Use the adjacent outline, not the row threshold: pastel letters
+        # can be close to Otsu while faint decorative contours are not ink.
+        stroke = np.median(region[ring], axis=0)
+        if float((fill-stroke) @ [0.299, 0.587, 0.114]) < 30:
             continue
         fill_mask[interior_mask > 0] = 255
     if np.count_nonzero(fill_mask) < 16:
@@ -212,7 +217,18 @@ def estimate_art_text_runs(pixels: np.ndarray, item: dict, *, reference_width: i
     runs, cursor = [], 0
     for word_text, start_x, end_x in positioned:
         region = line[:, start_x:end_x]
-        fitted = match_glyph(fill_mask[:, start_x:end_x], word_text, item.get("font", "Arial"))
+        local_fill = fill_mask[:, start_x:end_x]
+        local_ink = ink[:, start_x:end_x]
+        local_dark = dark[:, start_x:end_x]
+        measured = _measure_ink(region, local_fill, local_ink, local_dark)
+        if measured is None:
+            return None
+        stroke = measured[3]
+        radius = max(1, round(stroke / 2))
+        center_mask = cv2.dilate(local_fill.astype(np.uint8), cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (2*radius+1, 2*radius+1))) > 0
+        center_mask &= local_ink
+        fitted = match_glyph(center_mask, word_text, item.get("font", "Arial"))
         if fitted is None:
             return None
         measured = _measure_ink(region, fill_mask[:, start_x:end_x], ink[:, start_x:end_x], dark[:, start_x:end_x],
@@ -230,7 +246,7 @@ def estimate_art_text_runs(pixels: np.ndarray, item: dict, *, reference_width: i
                      "box_kind": "ink",
                      "font": fitted["font"], "bold": fitted["bold"],
                      "rotation": fitted["rotation"], "font_size": fitted["font_size"]*960/reference_width,
-                     "color": color, "outline_color": outline, "outline_width": 2*stroke*960/reference_width})
+                     "color": color, "outline_color": outline, "outline_width": stroke*960/reference_width})
         if gradient is not None:
             runs[-1]["gradient"] = gradient
     if not runs or item["text"][cursor:].strip():
