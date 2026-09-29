@@ -14,6 +14,14 @@ def installed_faces():
     roots = [Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts",
              Path(os.environ.get("LOCALAPPDATA", ".")) / "Microsoft/Windows/Fonts",
              Path("/usr/share/fonts"), Path.home() / ".local/share/fonts"]
+    # Bundled font pool: fonts/ next to the repo root (or skill dir for the
+    # bundled copies under skills/<name>/scripts/) plus any extra dirs named
+    # by IMAGE2EDITABLE_FONT_POOL. Pool faces keep matching and embed
+    # substitution deterministic across machines that lack the OS fonts.
+    roots.append(Path(__file__).resolve().parents[1] / "fonts")
+    for entry in os.environ.get("IMAGE2EDITABLE_FONT_POOL", "").split(os.pathsep):
+        if entry.strip():
+            roots.append(Path(entry))
     faces = {}
     for root in roots:
         if not root.is_dir():

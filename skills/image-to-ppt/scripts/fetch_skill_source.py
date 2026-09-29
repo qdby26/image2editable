@@ -22,7 +22,7 @@ SOURCE_PATTERNS = (
     "/image2editable/", "/pyproject.toml", "/README_EN.md", "/LICENSE",
     "/.gitignore", "/.gitattributes",
     "/THIRD_PARTY_NOTICES.md", "/third_party/licenses/", "/constraints/runtime.txt",
-    "/image_to_ppt.py", "/image_to_psd.py",
+    "/image_to_ppt.py", "/image_to_psd.py", "/fonts/",
     *(f"/scripts/{name}" for name in RUNTIME_SCRIPTS),
 )
 

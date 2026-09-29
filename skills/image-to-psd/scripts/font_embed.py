@@ -5,6 +5,8 @@ import argparse
 import json
 import logging
 import os
+import shutil
+import struct
 import sys
 import zipfile
 from pathlib import Path
@@ -21,6 +23,27 @@ _MSO_TRUE = -1
 _POWERPOINT_CLSID = "{91493441-5A91-11CF-8700-00AA0060263B}"
 EMBED_FONTS_ENV = "IMAGE2EDITABLE_EMBED_FONTS"
 _LOGGER = logging.getLogger(__name__)
+
+# Metric-compatible OFL clones for Windows core faces. PowerPoint skips
+# embedding system fonts regardless of their fsType bit, so a used core
+# typeface is rewritten to its clone before the embed SaveAs. The bundled
+# font pool (<repo>/fonts/) ships Arimo and Tinos; the other clones resolve
+# only on hosts that already have them installed.
+SUBSTITUTES = {
+    "Arial": "Arimo",
+    "Times New Roman": "Tinos",
+    "Calibri": "Carlito",
+    "Cambria": "Caladea",
+    "Courier New": "Cousine",
+}
+_XML_FONT_PARTS = (
+    "ppt/slides/",
+    "ppt/slideLayouts/",
+    "ppt/slideMasters/",
+    "ppt/notesSlides/",
+    "ppt/notesMasters/",
+    "ppt/handoutMasters/",
+)
 
 
 def collect_font_usage(pptx_path: str | Path) -> dict:
@@ -206,6 +229,176 @@ def _powerpoint_available() -> bool:
     )
 
 
+def _pool_font_dir() -> Path | None:
+    candidate = Path(__file__).resolve().parents[1] / "fonts"
+    return candidate if candidate.is_dir() else None
+
+
+def _fs_type(path: Path) -> int | None:
+    """OS/2 fsType embedding-permission bits; None if unreadable."""
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return None
+    if len(data) < 12:
+        return None
+    (num_tables,) = struct.unpack(">H", data[4:6])
+    for index in range(num_tables):
+        entry = 12 + index * 16
+        if data[entry : entry + 4] == b"OS/2":
+            (offset,) = struct.unpack(">I", data[entry + 8 : entry + 12])
+            return struct.unpack(">H", data[offset + 8 : offset + 10])[0]
+    return None
+
+
+def _pool_faces() -> dict[str, list[Path]]:
+    """family.casefold() -> all font files of that family in the pool."""
+    root = _pool_font_dir()
+    faces: dict[str, list[Path]] = {}
+    if root is None:
+        return faces
+    from PIL import ImageFont
+
+    for path in sorted(root.rglob("*")):
+        if path.suffix.lower() not in {".ttf", ".otf"}:
+            continue
+        try:
+            family, _style = ImageFont.truetype(str(path), 32).getname()
+        except OSError:
+            continue
+        faces.setdefault(family.casefold(), []).append(path)
+    return faces
+
+
+def _installed_font_names() -> set[str]:
+    """Family names registered in HKLM/HKCU Fonts (casefolded)."""
+    names: set[str] = set()
+    if sys.platform != "win32":
+        return names
+    import winreg
+
+    for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+        try:
+            key = winreg.OpenKey(
+                hive, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"
+            )
+        except OSError:
+            continue
+        index = 0
+        try:
+            while True:
+                name, _value, _type = winreg.EnumValue(key, index)
+                names.add(name.split(" (")[0].casefold())
+                index += 1
+        except OSError:
+            pass
+        finally:
+            winreg.CloseKey(key)
+    return names
+
+
+def _install_pool_faces(paths: list[Path]) -> list[Path]:
+    """Per-user font install (no admin): copy + HKCU + session GDI resource."""
+    local = os.environ.get("LOCALAPPDATA")
+    if not local:
+        return []
+    user_fonts = Path(local) / "Microsoft" / "Windows" / "Fonts"
+    installed: list[Path] = []
+    try:
+        import ctypes
+        import winreg
+        from PIL import ImageFont
+
+        user_fonts.mkdir(parents=True, exist_ok=True)
+        key = winreg.CreateKey(
+            winreg.HKEY_CURRENT_USER,
+            r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts",
+        )
+        try:
+            for src in paths:
+                dest = user_fonts / src.name
+                try:
+                    if not dest.exists():
+                        shutil.copyfile(src, dest)
+                    family, style = ImageFont.truetype(
+                        str(dest), 32
+                    ).getname()
+                    label = family
+                    if style.casefold() not in ("regular", "normal"):
+                        label = f"{family} {style}"
+                    winreg.SetValueEx(
+                        key, f"{label} (TrueType)", 0,
+                        winreg.REG_SZ, str(dest),
+                    )
+                    ctypes.windll.gdi32.AddFontResourceW(str(dest))
+                    installed.append(dest)
+                except OSError:
+                    continue
+        finally:
+            winreg.CloseKey(key)
+    except OSError:
+        pass
+    return installed
+
+
+def _rewrite_typefaces(
+    pptx_path: str | Path, mapping: dict[str, str]
+) -> dict[str, str]:
+    """Rewrite typeface= attributes in slide XML; return the applied map."""
+    path = Path(pptx_path)
+    with zipfile.ZipFile(path) as archive:
+        members = {name: archive.read(name) for name in archive.namelist()}
+    applied: dict[str, str] = {}
+    for name, payload in members.items():
+        if not (
+            name.endswith(".xml")
+            and name.startswith(_XML_FONT_PARTS)
+        ):
+            continue
+        rewritten = payload
+        for old, new in mapping.items():
+            needle = f'typeface="{old}"'.encode()
+            if needle in rewritten:
+                rewritten = rewritten.replace(
+                    needle, f'typeface="{new}"'.encode()
+                )
+                applied[old] = new
+        if rewritten != payload:
+            members[name] = rewritten
+    if applied:
+        staging = path.with_suffix(".rewrite-tmp.pptx")
+        with zipfile.ZipFile(staging, "w", zipfile.ZIP_DEFLATED) as archive:
+            for name, payload in members.items():
+                archive.writestr(name, payload)
+        shutil.move(staging, path)
+    return applied
+
+
+def _resolve_substitutions(missing: list[str]) -> dict[str, str]:
+    """usable {core: substitute} map; installs pool faces for COM to see."""
+    pool = _pool_faces()
+    installed = _installed_font_names()
+    mapping: dict[str, str] = {}
+    for used in missing:
+        substitute = SUBSTITUTES.get(used)
+        if not substitute:
+            continue
+        key = substitute.casefold()
+        paths = pool.get(key, [])
+        if paths:
+            embeddable = [
+                path
+                for path in paths
+                if ((_fs_type(path) or 0) & 0x0002) == 0
+            ]
+            if _install_pool_faces(embeddable):
+                mapping[used] = substitute
+            continue
+        if key in installed:
+            mapping[used] = substitute
+    return mapping
+
+
 def embed_fonts(src: str | Path, dst: str | Path) -> dict:
     if sys.platform != "win32":
         raise RuntimeError("font embedding requires Windows with PowerPoint")
@@ -230,10 +423,56 @@ def embed_fonts(src: str | Path, dst: str | Path) -> dict:
     dst_path.parent.mkdir(parents=True, exist_ok=True)
     src_usage = collect_font_usage(src_path)
 
+    # A writable open is required: with ReadOnly=True the
+    # EmbedTrueTypeFonts property cannot be set and SaveAs ignores the
+    # embed argument. The source itself is never saved (only SaveAs to
+    # dst), so it is left untouched.
+    def embed_once(from_path: Path) -> list:
+        presentation = application.Presentations.Open(
+            str(from_path),
+            ReadOnly=False,
+            Untitled=False,
+            WithWindow=False,
+        )
+        try:
+            # presentation.Fonts does not yield items via iteration; index
+            # it. WPS's typeinfo-backed dispatch rejects Fonts.Count via
+            # InvokeTypes, so wrap it as a dumb (name-only) dispatch. The
+            # listing is diagnostic only — embedding itself is done by
+            # SaveAs below, so a host that refuses Fonts enumeration must
+            # not abort the embed.
+            com_fonts = []
+            try:
+                fonts = _dumb_dispatch(presentation.Fonts)
+                for index in range(1, fonts.Count + 1):
+                    font = _dumb_dispatch(fonts(index))
+                    com_fonts.append(
+                        {
+                            "name": str(font.Name),
+                            "embeddable": bool(font.Embeddable),
+                            "embedded": bool(font.Embedded),
+                        }
+                    )
+            except Exception as error:
+                _LOGGER.warning(
+                    "presentation Fonts listing failed: %s", error
+                )
+            presentation.SaveAs(
+                str(dst_path), _PP_SAVE_AS_OPENXML, _MSO_TRUE
+            )
+            return com_fonts
+        finally:
+            try:
+                presentation.Close()
+            except Exception:
+                pass
+
     pythoncom.CoInitialize()
     application = None
-    presentation = None
     started = False
+    com_fonts: list = []
+    substitutions: dict[str, str] = {}
+    app_info = {}
     try:
         # Always start a dedicated instance and always quit it: attaching
         # to an already-running presentation app via GetActiveObject risks
@@ -254,44 +493,21 @@ def embed_fonts(src: str | Path, dst: str | Path) -> dict:
         except Exception:
             app_info = {}
 
-        # A writable open is required: with ReadOnly=True the
-        # EmbedTrueTypeFonts property cannot be set and SaveAs ignores the
-        # embed argument. The source itself is never saved (only SaveAs to
-        # dst), so it is left untouched.
-        presentation = application.Presentations.Open(
-            str(src_path),
-            ReadOnly=False,
-            Untitled=False,
-            WithWindow=False,
-        )
-        # presentation.Fonts does not yield items via iteration; index it.
-        # WPS's typeinfo-backed dispatch rejects Fonts.Count via InvokeTypes,
-        # so wrap it as a dumb (name-only) dispatch. The listing is
-        # diagnostic only — embedding itself is done by SaveAs below, so a
-        # host that refuses Fonts enumeration must not abort the embed.
-        com_fonts = []
-        try:
-            fonts = _dumb_dispatch(presentation.Fonts)
-            for index in range(1, fonts.Count + 1):
-                font = _dumb_dispatch(fonts(index))
-                com_fonts.append(
-                    {
-                        "name": str(font.Name),
-                        "embeddable": bool(font.Embeddable),
-                        "embedded": bool(font.Embedded),
-                    }
-                )
-        except Exception as error:
-            _LOGGER.warning("presentation Fonts listing failed: %s", error)
-        presentation.SaveAs(
-            str(dst_path), _PP_SAVE_AS_OPENXML, _MSO_TRUE
-        )
-    finally:
-        if presentation is not None:
+        com_fonts = embed_once(src_path)
+        dst_usage = collect_font_usage(dst_path)
+        substitutions = _resolve_substitutions(dst_usage["not_embedded"])
+        if substitutions:
+            # Rewrite a copy of the untouched source (never the first-pass
+            # output, whose embeddedFontLst entries would be re-labelled).
+            staging = dst_path.with_suffix(".subst-src.pptx")
             try:
-                presentation.Close()
-            except Exception:
-                pass
+                shutil.copyfile(src_path, staging)
+                _rewrite_typefaces(staging, substitutions)
+                com_fonts = embed_once(staging)
+            finally:
+                staging.unlink(missing_ok=True)
+            dst_usage = collect_font_usage(dst_path)
+    finally:
         if application is not None and started:
             try:
                 application.Quit()
@@ -307,6 +523,7 @@ def embed_fonts(src: str | Path, dst: str | Path) -> dict:
         "src_usage": src_usage,
         "dst_usage": dst_usage,
         "com_fonts": com_fonts,
+        "substitutions": substitutions,
         "app": app_info,
         "portable": not dst_usage["not_embedded"],
     }
