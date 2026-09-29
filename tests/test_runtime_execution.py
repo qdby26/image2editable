@@ -441,7 +441,7 @@ def _install_component_e2e_boundaries(
             return prepared_pages[Path(state_path).parents[1].parent.name]
 
         @staticmethod
-        def _assemble_prepared_slide(slide, output, *args):
+        def _assemble_prepared_slide(slide, output, *args, **kwargs):
             assembly_calls.append("single")
             presentation = Presentation()
             presentation.slides.add_slide(presentation.slide_layouts[6])
@@ -1054,7 +1054,9 @@ def test_presentation_higher_masks_use_one_reverse_z_accumulator(
     assert [item["component_id"] for item in manifest["components"]] == [
         item[0] for item in specs
     ]
-    assert len(zero_calls) == 6
+    # Six original allocations plus the all-ownership accumulator used to
+    # shield other components' regions from enclosed-hole backfill.
+    assert len(zero_calls) == 7
     assert not np.any(captured[2])
     assert np.array_equal(captured[0], np.array([[False, False, True, False]]))
     assert np.array_equal(captured[3], np.array([[False, False, True, False]]))
@@ -7252,11 +7254,14 @@ def test_background_rebuild_residual_component_falls_back_to_whole_repair(
     )
 
     # First pass repairs the speck neighbourhood; the recheck flags leftover
-    # residual ink, so the whole text component is repaired on the redo.
+    # residual ink at (20, 30), so a widened blob around it is repaired on
+    # the redo instead of flattening the whole component.
     assert len(fills) == 2
-    assert fills[1][4:25, 10:35].all()
+    assert fills[1][20, 30]
+    assert fills[1][4:25, 10:35].any()
+    assert not fills[1][4:25, 10:35].all()
     with Image.open(output) as rebuilt:
-        assert rebuilt.getpixel((11, 5)) == (160, 160, 160)
+        assert rebuilt.getpixel((30, 20)) == (160, 160, 160)
 
 
 def test_background_rebuild_without_donors_does_not_retain_foreground(tmp_path: Path) -> None:

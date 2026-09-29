@@ -140,9 +140,12 @@ def _blocking_violations(
         ):
             blocking.discard("unexplained_visual_residual")
     if "background_text_residual" in blocking:
+        # Unreachable while the violation stays soft; kept so a future
+        # hardening of the soft set automatically restores the
+        # per-component forgiveness behaviour.
         components = report_or_component.get("component_reports")
         if isinstance(components, list):
-            within_limit = all(
+            within_limit = bool(components) and all(
                 _component_background_text_ok(item) for item in components
             )
         else:
@@ -2303,7 +2306,6 @@ def _commit_component_freeze(store, state: dict, page_id: str) -> dict:
     report = quality["report"]
     visual_metrics = report.get("visual_metrics")
     page_pixels = _page_pixel_count(store, state)
-    page_violations = _blocking_violations(report, visual_metrics, page_pixels)
     if _accept_all_mode():
         accepted = {
             item["component_id"] for item in report["component_reports"]
@@ -2328,7 +2330,13 @@ def _commit_component_freeze(store, state: dict, page_id: str) -> dict:
         failed = sorted(
             set(failed) | _failed_overlap_dependency_ids(report, graph)
         )
-    fixable_page_violations = page_violations - {"unowned_raster_text"}
+    # Residual-owner reopening keys off the raw page violations: soft
+    # violations such as `background_text_residual` never block a freeze,
+    # but they still mark the owning component for the next repair round.
+    fixable_page_violations = (
+        set(report.get("violations") or [])
+        - {"pptx_reopen_unknown", "unowned_raster_text"}
+    )
     if fixable_page_violations:
         residual_owner_ids = _page_residual_owner_ids(
             store,
@@ -2503,10 +2511,40 @@ def _blocking_page_quality_violations(store, state: dict) -> set[str]:
 
 
 def _repairable_page_quality_violations(store, state: dict) -> list[str]:
-    return sorted(
-        _blocking_page_quality_violations(store, state)
+    # Repair eligibility looks at the raw page violations: soft violations
+    # must not block component freezes, but a page-level failure such as
+    # residual text ink still justifies another round. The metric-based
+    # forgiveness rules below only skip rounds the report can attribute to
+    # in-limit components — an empty component list cannot forgive a
+    # page-level violation.
+    quality_ref = state["current_round"].get("quality_ref")
+    if quality_ref is None or _accept_all_mode():
+        return []
+    quality = json.loads(_load_state_artifact(
+        store.root, quality_ref
+    ).decode("utf-8"))
+    report = quality.get("report", {})
+    visual_metrics = report.get("visual_metrics")
+    repairable = (
+        set(report.get("violations") or [])
+        - {"pptx_reopen_unknown"}
         & _REPAIRABLE_PAGE_VIOLATIONS
     )
+    if "unexplained_visual_residual" in repairable:
+        unexplained = (
+            float(visual_metrics.get("unexplained_visual_pixels", 0))
+            if isinstance(visual_metrics, dict)
+            else 0.0
+        )
+        page_pixels = _page_pixel_count(store, state)
+        if page_pixels > 0 and unexplained <= (
+            _UNEXPLAINED_VISUAL_MAX_RATIO * page_pixels
+        ):
+            repairable.discard("unexplained_visual_residual")
+    # A page-level `background_text_clean` failure already means residual
+    # ink exists somewhere; per-component ratios staying in limit only
+    # show the ink is unattributed, so they cannot forgive the round.
+    return sorted(repairable)
 
 
 def _page_progress_key(quality: dict) -> tuple[float, ...]:

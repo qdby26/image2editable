@@ -10,7 +10,7 @@ import subprocess
 REPOSITORY = "https://github.com/DSY-Xueai/image2editable.git"
 RUNTIME_SCRIPTS = (
     "__init__.py", "art_text.py", "bg_model.py", "component_underlay.py",
-    "fg_extract.py", "font_match.py", "initial_diagnostics.py",
+    "fg_extract.py", "font_embed.py", "font_match.py", "initial_diagnostics.py",
     "lama_inpaint.py", "lama_worker.py", "object_detect.py", "object_worker.py",
     "ocr_worker.py", "page_routing.py", "performance_trace.py", "ppt_assemble.py",
     "psd_assemble.py", "runtime_model_paths.py", "sam_worker.py",

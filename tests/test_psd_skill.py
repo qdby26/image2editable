@@ -20,6 +20,7 @@ PSD_COMMON_ENGINE_FILES = {
     "component_quality.py",
     "component_underlay.py",
     "fg_extract.py",
+    "font_embed.py",
     "font_match.py",
     "image_to_ppt.py",
     "initial_diagnostics.py",

@@ -2031,10 +2031,11 @@ def _rebuild_canvas_background(
                     text_repair.astype(np.uint8), 8
                 )
             # Dense leftover strokes mark the donor as untrusted for the
-            # whole component: the smooth fill cannot reproduce locally
-            # structured leftovers, so the component is rebuilt through
-            # the repair fill instead of pasted from the donor.  Sparse
-            # specks stay pixel-sized and keep the donor elsewhere.
+            # whole component: antialias halos around strokes escape the
+            # residual detector, so restoring donor texture between strokes
+            # would re-import faint ghosts. The component is rebuilt through
+            # the repair fill instead; texture fidelity is preserved by the
+            # shifted-donor candidates in _choose_visual_fill.
             for label in np.unique(text_labels[residual_strokes]):
                 if not label:
                     continue
@@ -2110,17 +2111,21 @@ def _rebuild_canvas_background(
         )
         residual_left = recheck.background_residual_text_ink & text_repair
         if np.any(residual_left):
-            _, region_labels = cv2.connectedComponents(
-                text_repair.astype(np.uint8), 8
-            )
-            stale_labels = np.unique(region_labels[residual_left])
-            stale_labels = stale_labels[stale_labels > 0]
-            if stale_labels.size:
-                component_fallback = np.isin(region_labels, stale_labels)
-                restore_repair &= ~component_fallback
-                repair |= component_fallback
-                repair &= ~restore_repair
-                rebuilt = _apply_repair_fill(rebuilt)
+            # Escalate per residual blob with a wide margin instead of
+            # flattening the whole text component: texture survives on
+            # donor-clean interiors while persistent specks still get a
+            # second, larger repair pass.
+            residual_blobs = (
+                cv2.dilate(
+                    residual_left.astype(np.uint8),
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (33, 33)),
+                )
+                > 0
+            ) & text_repair
+            restore_repair &= ~residual_blobs
+            repair |= residual_blobs
+            repair &= ~restore_repair
+            rebuilt = _apply_repair_fill(rebuilt)
     if restored is not None:
         # Expanded donor exclusion must not erase uncovered source texture.
         uncovered = ~(visible_coverage | text_repair | restore_repair)

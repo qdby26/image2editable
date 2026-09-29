@@ -155,10 +155,21 @@ def _visual_metrics(
         interior & (candidate_detail > detail_threshold)
         & (candidate_detail > source_detail + 12.0)
     ))
+    # Seam metrics alone cannot tell a faithful fill from a flat wash on
+    # textured surfaces: a smooth patch has the lowest boundary error by
+    # construction. Compare the fill's interior detail energy against the
+    # donor ring so a candidate that erases visible texture is penalized.
+    texture_deficit = 0.0
+    if np.any(interior) and np.any(donor_ring):
+        ring_detail = float(np.mean(source_detail[donor_ring]))
+        if ring_detail >= 3.0:
+            fill_detail = float(np.mean(candidate_detail[interior]))
+            texture_deficit = max(0.0, 1.0 - fill_detail / ring_detail)
     return {
         "boundary_color_mae": boundary_mae,
         "gradient_jump_p95": gradient_jump_p95,
         "added_high_frequency_pixels": high_frequency,
+        "texture_deficit": texture_deficit,
     }
 
 
@@ -329,11 +340,13 @@ def _choose_visual_fill(
                     6.0,
                     12.0,
                     float(max(4, round(np.count_nonzero(visual_hole) * 0.005))),
+                    0.6,
                 )
                 smooth_values = (
                     smooth_metrics["boundary_color_mae"],
                     smooth_metrics["gradient_jump_p95"],
                     smooth_metrics["added_high_frequency_pixels"],
+                    smooth_metrics["texture_deficit"],
                 )
                 if all(
                     value <= limit
@@ -342,6 +355,47 @@ def _choose_visual_fill(
                     return smooth_full, smooth_metrics
     count, labels = cv2.connectedComponents(hole_crop.astype(np.uint8), 8)
     areas = [int(np.count_nonzero(labels == label)) for label in range(1, count)]
+    if hole_area >= 64:
+        # Textured/dark surfaces are self-similar under translation: a
+        # shifted copy of the surrounding donor preserves grain where
+        # inpainting would smear it flat. Candidate shifts step the hole
+        # away by its own extents; leftovers fall back to inpainting.
+        hole_bbox_y, hole_bbox_x = np.nonzero(hole_crop)
+        hole_h = int(hole_bbox_y.max() - hole_bbox_y.min() + 1)
+        hole_w = int(hole_bbox_x.max() - hole_bbox_x.min() + 1)
+        shift_steps = {
+            (dy, dx)
+            for dy in (-(hole_h + 2), -(hole_h // 2 + 1), hole_h // 2 + 1,
+                       hole_h + 2)
+            for dx in (0, -(hole_w // 2 + 1), hole_w // 2 + 1)
+        }
+        hole_yy, hole_xx = np.nonzero(visual_hole)
+        height, width = visual_hole.shape
+        for dy, dx in shift_steps:
+            if not (dy or dx):
+                continue
+            shifted_full = rgb.copy()
+            src_y, src_x = hole_yy + dy, hole_xx + dx
+            in_bounds = (
+                (src_y >= 0) & (src_y < height)
+                & (src_x >= 0) & (src_x < width)
+            )
+            src_y, src_x = src_y[in_bounds], src_x[in_bounds]
+            dst_y, dst_x = hole_yy[in_bounds], hole_xx[in_bounds]
+            usable = donor_mask[src_y, src_x]
+            src_y, src_x = src_y[usable], src_x[usable]
+            dst_y, dst_x = dst_y[usable], dst_x[usable]
+            if not dst_y.size:
+                continue
+            shifted_full[dst_y, dst_x] = rgb[src_y, src_x]
+            leftover = visual_hole.copy()
+            leftover[dst_y, dst_x] = False
+            if np.any(leftover):
+                shifted_full = cv2.inpaint(
+                    shifted_full, leftover.astype(np.uint8) * 255, 3,
+                    cv2.INPAINT_TELEA,
+                )
+            candidates.append(shifted_full[y0:y1, x0:x1])
     if any(area >= 25 for area in areas):
         local_fill = candidates[1].copy()
         filled = False
@@ -376,11 +430,13 @@ def _choose_visual_fill(
             6.0,
             12.0,
             float(max(4, round(np.count_nonzero(visual_hole) * 0.005))),
+            0.6,
         )
         values = (
             metrics["boundary_color_mae"],
             metrics["gradient_jump_p95"],
             metrics["added_high_frequency_pixels"],
+            metrics["texture_deficit"],
         )
         ratios = tuple(value / limit for value, limit in zip(values, limits))
         key = (
@@ -420,11 +476,13 @@ def _choose_visual_fill(
             6.0,
             12.0,
             float(max(4, round(np.count_nonzero(visual_hole) * 0.005))),
+            0.6,
         )
         values = (
             boundary_metrics["boundary_color_mae"],
             boundary_metrics["gradient_jump_p95"],
             boundary_metrics["added_high_frequency_pixels"],
+            boundary_metrics["texture_deficit"],
         )
         ratios = tuple(value / limit for value, limit in zip(values, limits))
         key = (

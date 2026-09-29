@@ -471,6 +471,7 @@ def test_visual_metrics_limit_filters_to_local_hole(underlay_engine, monkeypatch
         "boundary_color_mae": 105.0,
         "gradient_jump_p95": gradient,
         "added_high_frequency_pixels": detail,
+        "texture_deficit": 0.0,
     }
     assert areas and max(areas) <= (12 + 6) * (14 + 6)
 
