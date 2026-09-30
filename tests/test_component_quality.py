@@ -998,6 +998,63 @@ def test_small_component_full_duplicate_still_fails_hard_gate() -> None:
     assert "duplicate_pixels" in report["violations"]
 
 
+def test_restored_see_through_voids_do_not_count_as_duplicates() -> None:
+    """Voids enclosed by the semantic mask are completion-fill targets.
+
+    A restored hole whose content happens to match the rebuilt background
+    underneath (e.g. a white coat region over a pale inpainted card area)
+    must not trip the duplicate probe: the pixel was mask-acknowledged
+    void deliberately completed, not an ownership claim over background.
+    """
+    case = _synthetic_quality_case()
+    card = case["component_mask"].copy()
+    void = np.zeros_like(card)
+    void[20:28, 24:40] = True
+    # The semantic extent itself excludes the void (a donut mask); the
+    # ownership layer restored it with source content.
+    semantic = card & ~void
+    # The rebuilt background coincidentally reproduces the void colour,
+    # which is exactly what makes the ownership fill look "duplicative".
+    case["background"][void] = case["source"][void]
+    calibration = calibrate_page(case["source"], case["text_mask"])
+
+    report = evaluate_component(
+        case["source"], case["background"], case["reconstructed"],
+        case["node"], case["graph"], calibration,
+        component_mask=card, parent_mask=semantic,
+        text_mask=case["text_mask"],
+        page_checks={"protected_native_overlap": "pass"},
+    )
+
+    assert "duplicate_pixels" not in report["violations"]
+
+
+def test_duplicate_still_flags_ownership_beyond_semantic_voids() -> None:
+    """Owned pixels outside enclosed voids keep the duplicate probe live."""
+    case = _synthetic_quality_case()
+    card = case["component_mask"].copy()
+    void = np.zeros_like(card)
+    void[20:28, 24:40] = True
+    semantic = card & ~void
+    # Duplicate surface is OUTSIDE the semantic void: the border strip is
+    # owned yet matches the rebuilt background, so it must still flag.
+    strip = np.zeros_like(card)
+    strip[12:14, 16:48] = True
+    strip &= card & ~void
+    case["background"][strip] = case["source"][strip]
+    calibration = calibrate_page(case["source"], case["text_mask"])
+
+    report = evaluate_component(
+        case["source"], case["background"], case["reconstructed"],
+        case["node"], case["graph"], calibration,
+        component_mask=card, parent_mask=semantic,
+        text_mask=case["text_mask"],
+        page_checks={"protected_native_overlap": "pass"},
+    )
+
+    assert report["metrics"]["duplicate_pixels"] > 0
+
+
 def test_sparse_child_fails_against_its_text_excluded_parent() -> None:
     case = _synthetic_quality_case()
     parent_mask = case["component_mask"].copy()

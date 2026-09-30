@@ -43,6 +43,15 @@ class _AbsorbedMaskSummary:
     area: int
 
 
+def _enclosed_voids(mask: np.ndarray) -> np.ndarray:
+    """Pixels enclosed by ``mask``'s silhouette that the mask excludes."""
+    height, width = mask.shape
+    inverse = (~mask).astype(np.uint8)
+    flood = np.zeros((height + 2, width + 2), dtype=np.uint8)
+    cv2.floodFill(inverse, flood, (0, 0), 2)
+    return inverse == 1
+
+
 def resolve_visual_mask_ownership(
     nodes: list[dict], masks: list[np.ndarray]
 ) -> list[np.ndarray]:
@@ -718,6 +727,12 @@ def component_metrics(
     background_delta = context.background_delta
     missing = support & (reconstruction_delta > hard_tolerance)
     duplicate = support & (background_delta <= hard_tolerance)
+    if parent_mask is not None:
+        # Pixels restored into voids the semantic extent itself enclosed
+        # are completion fill, not an ownership claim: restored content
+        # may legitimately match the rebuilt background underneath, so
+        # the duplicate probe must not evaluate them.
+        duplicate &= ~_enclosed_voids(parent_support)
     missing_pixels, missing_region = _largest_region(missing)
     radius = calibration.edge_width_px
     edge_kernel = np.ones((2 * radius + 1, 2 * radius + 1), dtype=np.uint8)
