@@ -3374,3 +3374,54 @@ def test_repair_quality_round_rejects_dotdot_escape(tmp_path) -> None:
             page_checks={"protected_native_overlap": "pass", "pptx_reopen": "pass"},
             initial_component_count=1, expected_component_ids=["component_0001"],
         )
+
+
+def test_extended_adjacent_page_element_is_not_shadow_residue() -> None:
+    """A dark element running far past the component is page content, not
+    rim residue: its unchanged-dark mass continues beyond the far ring
+    (axis line under chart bars, card border around a panel)."""
+    case = _synthetic_quality_case()
+    line = np.zeros(case["component_mask"].shape, dtype=bool)
+    line[36:39, :] = True
+    case["source"][line] = 50
+    case["background"][line] = 50
+    case["reconstructed"][line] = 50
+    calibration = calibrate_page(case["source"], case["text_mask"])
+    module = importlib.import_module("image2editable.component_quality")
+    context = module._prepare_page_quality_context(
+        case["source"], case["background"], case["reconstructed"],
+        case["text_mask"], calibration=calibration,
+        component_masks=[case["component_mask"]],
+    )
+    report = evaluate_component(
+        case["source"], case["background"], case["reconstructed"],
+        case["node"], case["graph"], calibration,
+        component_mask=case["component_mask"], text_mask=case["text_mask"],
+        page_checks={"protected_native_overlap": "pass"}, _page_context=context,
+    )
+    assert "duplicate_shadow" not in report["violations"]
+    assert report["metrics"]["exterior_shadow_pixels"] == 0
+
+
+def test_extended_bright_page_element_is_not_alpha_residue() -> None:
+    """Symmetric case for the exterior_alpha (brighter) probe."""
+    case = _synthetic_quality_case()
+    line = np.zeros(case["component_mask"].shape, dtype=bool)
+    line[36:39, :] = True
+    case["source"][line] = 210
+    case["background"][line] = 210
+    case["reconstructed"][line] = 210
+    calibration = calibrate_page(case["source"], case["text_mask"])
+    module = importlib.import_module("image2editable.component_quality")
+    context = module._prepare_page_quality_context(
+        case["source"], case["background"], case["reconstructed"],
+        case["text_mask"], calibration=calibration,
+        component_masks=[case["component_mask"]],
+    )
+    report = evaluate_component(
+        case["source"], case["background"], case["reconstructed"],
+        case["node"], case["graph"], calibration,
+        component_mask=case["component_mask"], text_mask=case["text_mask"],
+        page_checks={"protected_native_overlap": "pass"}, _page_context=context,
+    )
+    assert report["metrics"]["exterior_alpha_pixels"] == 0

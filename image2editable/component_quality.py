@@ -769,11 +769,41 @@ def component_metrics(
     ambiguous_exterior = exterior_duplicate & exterior_changed & (
         context.exterior_owner_count > 1
     )
+    # A rim residue is confined to the component's vicinity.  Candidates
+    # that join a same-signature mass continuing beyond the far ring are
+    # independent page elements (axis lines, card borders, stroke runs),
+    # not residue of this component's silhouette.
+    def _confined_exterior(candidate: np.ndarray, signature: np.ndarray) -> np.ndarray:
+        if not np.any(candidate):
+            return candidate
+        count, labels = cv2.connectedComponents(signature.astype(np.uint8), 8)
+        keep = np.zeros_like(candidate)
+        for value in np.unique(labels[candidate]):
+            if value == 0:
+                continue
+            mass = labels == value
+            if np.any(mass & ~far):
+                continue
+            keep |= candidate & mass
+        return keep
+
+    unchanged_exterior = (
+        (context.background_delta <= hard_tolerance)
+        & (reconstruction_delta <= hard_tolerance)
+        & exterior_changed
+        & ~support
+    )
     exterior_shadow, _ = _largest_region(
-        unique_exterior & (source_luma < baseline_luma - 6.0)
+        _confined_exterior(
+            unique_exterior & (source_luma < baseline_luma - 6.0),
+            unchanged_exterior & (source_luma < baseline_luma - 6.0),
+        )
     )
     exterior_alpha, _ = _largest_region(
-        unique_exterior & (source_luma >= baseline_luma - 3.0)
+        _confined_exterior(
+            unique_exterior & (source_luma >= baseline_luma - 3.0),
+            unchanged_exterior & (source_luma >= baseline_luma - 3.0),
+        )
     )
     largest_shadow = max(largest_inner_shadow, exterior_shadow)
     largest_alpha = max(largest_inner_alpha, exterior_alpha)
