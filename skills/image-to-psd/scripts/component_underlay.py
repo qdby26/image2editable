@@ -677,7 +677,17 @@ def build_presentation_layer(
             allow_smooth_surface=True,
         )
         rgb[visual_hole] = visual_fill[visual_hole]
-    metrics = _visual_metrics(rgb, source, ownership, generated)
+    raw_metrics = _visual_metrics(rgb, source, ownership, generated)
+    # ``texture_deficit`` is a candidate-selection diagnostic consumed by
+    # ``_choose_visual_fill``; the persisted layer metrics are the
+    # underlay contract fields only.
+    metrics = {
+        "boundary_color_mae": raw_metrics["boundary_color_mae"],
+        "gradient_jump_p95": raw_metrics["gradient_jump_p95"],
+        "added_high_frequency_pixels": raw_metrics[
+            "added_high_frequency_pixels"
+        ],
+    }
 
     alpha = ownership | generated
     holes = _enclosed_holes(alpha)

@@ -119,3 +119,32 @@ def test_light_hole_surrounded_by_similar_interior_is_filled() -> None:
     alpha = layer["presentation_alpha_mask"]
     assert not np.any(_enclosed_holes(alpha))
     assert np.all(layer["rgb"][hole] == source[hole])
+
+
+def test_layer_metrics_match_underlay_contract_when_generated_nonempty() -> None:
+    """Layers with a generated underlay must emit contract metrics only.
+
+    The candidate-selection diagnostic ``texture_deficit`` is internal to
+    ``_choose_visual_fill``; leaking it into the persisted layer metrics
+    breaks ``_validate_underlay_metrics`` downstream (real c1 run).
+    """
+    from image2editable.component_quality import _validate_underlay_metrics
+
+    source = np.full((120, 200, 3), (24, 44, 68), dtype=np.uint8)
+    card = np.zeros(source.shape[:2], dtype=bool)
+    card[20:100, 90:180] = True
+    text = np.zeros_like(card)
+    text[40:60, 110:150] = True
+    ownership = card & ~text
+
+    layer = build_presentation_layer(
+        source_rgb=source,
+        text_clean_rgb=source,
+        ownership_mask=ownership,
+        semantic_mask=card,
+        higher_layer_mask=np.zeros_like(card),
+        text_mask=text,
+    )
+
+    assert np.any(layer["generated_underlay_mask"])
+    _validate_underlay_metrics(layer["metrics"])
