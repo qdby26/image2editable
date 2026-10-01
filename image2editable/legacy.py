@@ -4440,6 +4440,20 @@ def assemble_legacy_results(store: RunStore) -> dict[str, Any]:
                     )
                 else:
                     source = _source_path(store, page_id)
+                if (
+                    hybrid_rows.get(page_id, {}).get("delivery_mode")
+                    == "partial"
+                ):
+                    slide = _hybrid_partial_slide_data(
+                        store, reconstruction, prepared, state, source
+                    )
+                    asset_dir = Path(slide.pop("_assembly_assets_dir"))
+                    assembly_asset_dirs.append(
+                        (asset_dir, _directory_identity(asset_dir.lstat()))
+                    )
+                    slides.append(slide)
+                    page_records.append((page_id, state, None, None))
+                    continue
                 slides.append({
                     **prepared,
                     "background_path": str(source),
@@ -4580,6 +4594,12 @@ def assemble_legacy_results(store: RunStore) -> dict[str, Any]:
                     row["page_id"]: {
                         "delivery_mode": row["delivery_mode"],
                         "handoff_ref": row["handoff_ref"],
+                        "editable_component_ids": row[
+                            "editable_component_ids"
+                        ],
+                        "degraded_component_ids": row[
+                            "degraded_component_ids"
+                        ],
                     }
                     for row in hybrid_plan["pages"]
                 }
@@ -5371,6 +5391,122 @@ def _accepted_slide_data(
             "_reconstruction_ir_inputs": reconstruction_inputs,
             "_assembly_assets_dir": str(output_dir),
             "_route_result_ref": route_result_ref,
+        }
+    except Exception:
+        _safe_rmtree(output_dir, output_identity)
+        raise
+
+
+def _hybrid_partial_slide_data(
+    store: RunStore,
+    reconstruction: Path,
+    prepared: dict,
+    state: dict,
+    source: Path,
+) -> dict:
+    """Assemble a warning page keeping its surviving editable layers.
+
+    Frozen components keep their extracted RGBA layers; components that
+    failed the quality gate are re-presented from their own extracted
+    layer and flagged ``degraded`` (an empty layer falls back to a padded
+    source-region patch). The reconstructed background and native text
+    items are preserved. All bound evidence is hash-verified; a failed
+    load raises rather than silently flattening, because the delivery
+    plan already classified the page as partial.
+    """
+    import numpy as np
+
+    input_refs = state["fallback_input_refs"]
+    _, graph_payload = _load_legacy_ref(store, state["fallback_graph_ref"])
+    graph = validate_component_graph(
+        json.loads(graph_payload.decode("utf-8"))
+    )
+    active_nodes = _active_visual_nodes(graph)
+    frozen_ids = set(state.get("frozen") or {})
+    degraded_ids = {
+        node["id"] for node in active_nodes if node["id"] not in frozen_ids
+    }
+    source_payload = source.read_bytes()
+    background_path, _ = _load_legacy_ref(
+        store, input_refs["background"]
+    )
+    manifest_path = _legacy_ref_path(
+        store, input_refs["presentation_manifest"]
+    )
+    with Image.open(io.BytesIO(source_payload)) as image:
+        page_size = image.size
+    output_dir = Path(
+        tempfile.mkdtemp(prefix="assembly-assets-", dir=reconstruction)
+    )
+    output_identity = _directory_identity(output_dir.lstat())
+    try:
+        components = []
+        visual_elements = []
+        layers = _load_presentation_assets(
+            run_root=store.root,
+            reconstruction=reconstruction,
+            manifest_path=manifest_path,
+            source_sha256=state["source_sha256"],
+            graph_sha256=state["fallback_graph_ref"]["sha256"],
+            graph=graph,
+            page_size=page_size,
+        )
+        by_id = {node["id"]: node for node in active_nodes}
+        source_image = Image.open(io.BytesIO(source_payload)).convert("RGB")
+        for index, layer in enumerate(layers, start=1):
+            component_id = layer["component_id"]
+            node = by_id[component_id]
+            alpha = layer["rgba"][:, :, 3] == 255
+            ys, xs = np.nonzero(alpha)
+            if len(xs):
+                left, right = int(xs.min()), int(xs.max()) + 1
+                top, bottom = int(ys.min()), int(ys.max()) + 1
+                crop = layer["rgba"][top:bottom, left:right]
+                component_path = output_dir / f"component-{index:04d}.png"
+                Image.fromarray(crop, mode="RGBA").save(component_path)
+            else:
+                # Empty extracted layer: fall back to a padded opaque
+                # patch of the source region so the page still shows the
+                # component's true pixels.
+                bbox = [int(v) for v in node["bbox"]]
+                pad = 12
+                left = max(0, bbox[0] - pad)
+                top = max(0, bbox[1] - pad)
+                right = min(page_size[0], bbox[2] + pad)
+                bottom = min(page_size[1], bbox[3] + pad)
+                crop = source_image.crop((left, top, right, bottom))
+                component_path = (
+                    output_dir / f"component-{index:04d}-patch.png"
+                )
+                crop.save(component_path)
+            components.append({
+                "component_id": component_id,
+                "path": str(component_path),
+                "x": left, "y": top,
+                "w": right - left, "h": bottom - top,
+                "z_index": node["z_index"],
+                "degraded": component_id in degraded_ids,
+            })
+        components.sort(key=lambda item: item["z_index"])
+        visual_elements = [
+            {
+                "object_id": component["component_id"],
+                "route": "raster_component",
+                "z_index": component["z_index"],
+                "component": component,
+            }
+            for component in components
+        ]
+        return {
+            **prepared,
+            "text_items": prepared.get("text_items", []),
+            "background_path": str(background_path),
+            "background_original_path": str(background_path),
+            "background_widescreen_path": str(background_path),
+            "original_image_path": str(source),
+            "components": components,
+            "visual_elements": visual_elements,
+            "_assembly_assets_dir": str(output_dir),
         }
     except Exception:
         _safe_rmtree(output_dir, output_identity)

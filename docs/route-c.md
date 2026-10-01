@@ -10,9 +10,13 @@ editable-reconstruction quality gates cannot pass a page.
 - `reject` (default, unchanged): a page that exhausts repair without passing
   the quality gates fails the run. No deck is produced.
 - `hybrid`: the run completes and still produces PPTX output. Every page that
-  ended as `preserved_with_warning` is delivered as a **flattened full-page
-  picture** of the bound source snapshot — one picture, no text boxes, no
-  native component overlays — together with a Route A handoff request.
+  ended as `preserved_with_warning` is delivered degraded — either as a
+  **partially editable page** (frozen component layers and native text are
+  kept; quality-failed components are re-presented through the fallback
+  graph's preserved layers and reported via `degraded_component_ids`) or,
+  when the bound fallback assets are unavailable or a failed component lost
+  all of its pixels, as a **flattened full-page picture** of the bound
+  source snapshot — together with a Route A handoff request.
 
 `hybrid` is valid only for **image input producing PPTX output**
 (`input.type == "images"`, `output_format == "pptx"`). Any other combination
@@ -49,14 +53,26 @@ Per output variant (`<stem>_<variant>.pptx`), a sibling
 `<stem>_<variant>.delivery-report.json` is published with:
 
 - `failure_policy`, `variant`, `output_ref` (path + sha256 of the PPTX);
-- `fully_editable`: `true` only when **no** page was flattened;
-- `degraded_pages`, `needs_route_a`: ordered page ids delivered flattened;
-- `warnings`, `pages` (per-page `delivery_mode`, `quality_status`,
-  `unresolved_violations`, `handoff_ref`);
+- `fully_editable`: `true` only when **no** page was degraded;
+- `degraded_pages`, `needs_route_a`: ordered page ids delivered degraded;
+- `warnings`, `pages` (per-page `delivery_mode` — `editable`, `partial`,
+  or `flattened` — plus `quality_status`, `unresolved_violations`,
+  `handoff_ref`, and the `editable_component_ids` /
+  `degraded_component_ids` split for partial pages);
 - `font_portability`: `portable`/`not_embedded`/`report_ref`; `null` means
   unknown (e.g. embedding disabled or no embed report) — never inferred true.
 
-Each flattened page also gets durable handoff evidence under
+Partial delivery caveat: failed components ship through their fallback
+layers — collapsed children are re-presented by the preserved parent
+layer, which carries the source pixels for the whole collapsed region.
+The residual defect the gate rejected (typically a thin edge halo) is
+still present, and moving a degraded component can reveal it.
+`editable_component_ids` names frozen component layers;
+`degraded_component_ids` names the failed components whose content is
+carried by fallback layers. Partial pages remain `awaiting_host` for a
+full Route A rebuild.
+
+Each degraded page also gets durable handoff evidence under
 `pages/<page_id>/route-c/` inside the run directory (outside `reconstruction/`,
 so it survives pruning):
 

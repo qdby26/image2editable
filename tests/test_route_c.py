@@ -641,6 +641,112 @@ def _ready_page(store: RunStore, page_id: str, index: int) -> dict:
     return {"source_path": source_path, "source_sha256": source_sha}
 
 
+def _write_partial_warning_page(
+    store: RunStore, page_id: str, index: int
+) -> dict:
+    """Warning page whose run still carries bound fallback assets: a
+    two-node graph (one frozen, one failed), presentation layers and a
+    reconstructed background — enough for partial delivery."""
+    detail = _write_warning_page(store, page_id, index)
+    reconstruction = store.root / "pages" / page_id / "reconstruction"
+    pf_dir = reconstruction / "pf-0123456789ab"
+    masks = pf_dir / "masks"
+    masks.mkdir(parents=True)
+    # Left half frozen, right half failed; both cover the 16x9 source.
+    import numpy as np
+
+    left = np.zeros((9, 16), dtype=np.uint8)
+    left[:, :8] = 255
+    right = np.zeros((9, 16), dtype=np.uint8)
+    right[:, 8:] = 255
+    mask_paths = {}
+    for name, array in (
+        ("component_0001", left),
+        ("component_0002", right),
+        ("parent_0001", left),
+        ("parent_0002", right),
+    ):
+        mask_path = masks / f"{name}.png"
+        Image.fromarray(array).save(mask_path)
+        mask_paths[name] = mask_path
+
+    def _node(node_id, kind, parent_id, node_state, bbox, z_index):
+        mask_path = mask_paths[node_id]
+        return {
+            "id": node_id, "kind": kind, "parent_id": parent_id,
+            "state": node_state,
+            "mask": f"masks/{node_id}.png",
+            "mask_sha256": _sha256_path(mask_path),
+            "bbox": bbox, "z_index": z_index, "text_ids": [],
+        }
+
+    # Real fallback-graph shape: frozen children stay active under an
+    # inactive parent; collapsed failures flip the parent to
+    # pending_gate and their children to inactive.
+    graph = {
+        "nodes": [
+            _node("parent_0001", "parent", None, "inactive", [0, 0, 8, 9], 0),
+            _node(
+                "component_0001", "child", "parent_0001", "frozen",
+                [0, 0, 8, 9], 0,
+            ),
+            _node(
+                "parent_0002", "parent", None, "pending_gate",
+                [8, 0, 16, 9], 1,
+            ),
+            _node(
+                "component_0002", "child", "parent_0002", "inactive",
+                [8, 0, 16, 9], 1,
+            ),
+        ]
+    }
+    graph_path = pf_dir / "component-graph.json"
+    graph_path.write_text(json.dumps(graph), encoding="utf-8")
+    background = pf_dir / "background.png"
+    Image.new("RGB", (16, 9), (200, 220, 240)).save(background)
+    reconstructed = pf_dir / "reconstructed.png"
+    reconstructed.write_bytes(detail["source_path"].read_bytes())
+    text_mask = pf_dir / "text-mask.png"
+    Image.new("L", (16, 9), 0).save(text_mask)
+    native_check = pf_dir / "native-check.json"
+    native_check.write_text("{}", encoding="utf-8")
+    pf_source = pf_dir / "source.png"
+    pf_source.write_bytes(detail["source_path"].read_bytes())
+    (pf_dir / "presentation-assets").mkdir()
+    manifest_path = legacy._build_presentation_assets(
+        types.SimpleNamespace(root=store.root),
+        source_path=pf_source,
+        text_clean_path=pf_source,
+        graph_path=graph_path,
+        output_dir=pf_dir / "presentation-assets",
+    )
+    state = detail["state"]
+    state["frozen"] = {"component_0001": "0" * 64}
+    state["candidate_ids"] = ["component_0002"]
+    state["failed_ids"] = ["component_0002"]
+    # Terminal warning states clear parent_ids; active parents are
+    # identified from the fallback graph itself.
+    state["fallback"] = {"status": "warning", "parent_ids": []}
+    state["parent_assets"] = {
+        "parent_0002": _store_ref(store, mask_paths["component_0002"])
+    }
+    state["fallback_graph_ref"] = _store_ref(store, graph_path)
+    state["fallback_input_refs"] = {
+        name: _store_ref(store, path)
+        for name, path in {
+            "background": background,
+            "reconstructed": reconstructed,
+            "text_mask": text_mask,
+            "native_check": native_check,
+            "presentation_manifest": manifest_path,
+        }.items()
+    }
+    store.write_json(
+        f"pages/{page_id}/reconstruction/component_state.json", state
+    )
+    return detail
+
+
 def _hybrid_store(
     tmp_path: Path,
     page_kinds: list[str],
@@ -661,6 +767,8 @@ def _hybrid_store(
             detail = _write_warning_page(
                 store, page_id, index, fallback_quality=fallback_quality
             )
+        elif kind == "warning_partial":
+            detail = _write_partial_warning_page(store, page_id, index)
         else:
             detail = _ready_page(store, page_id, index)
         details.append(detail)
@@ -1154,6 +1262,97 @@ def _assembly_hybrid_store(
     return store, manifest, details, output
 
 
+def test_hybrid_partial_delivery_keeps_layers_and_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("IMAGE2EDITABLE_EMBED_FONTS", "0")
+    store, manifest, details, output = _assembly_hybrid_store(
+        tmp_path, ["warning_partial"]
+    )
+    plan = route_c.build_hybrid_delivery(store, manifest)
+    row = plan["pages"][0]
+    assert row["delivery_mode"] == "partial"
+    assert row["editable_component_ids"] == ["component_0001"]
+    assert row["degraded_component_ids"] == ["component_0002"]
+
+    outputs = legacy.assemble_legacy_results(store)
+    presentation = Presentation(outputs["16:9"])
+    shapes = list(presentation.slides[0].shapes)
+    pictures = [
+        shape for shape in shapes
+        if shape.shape_type == MSO_SHAPE_TYPE.PICTURE
+    ]
+    texts = [
+        shape for shape in shapes
+        if getattr(shape, "has_text_frame", False)
+        and shape.text_frame.text.strip()
+    ]
+    # 2 component layers (frozen + degraded) plus background picture.
+    assert len(pictures) == 3
+    assert len(texts) == 1
+    report = json.loads(
+        output.with_suffix(".delivery-report.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert report["pages"][0]["delivery_mode"] == "partial"
+    assert report["fully_editable"] is False
+    assert report["degraded_pages"] == ["page_001"]
+
+
+def test_hybrid_partial_delivery_falls_back_to_flattened(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing fallback manifest collapses to whole-page flattening."""
+    monkeypatch.setenv("IMAGE2EDITABLE_EMBED_FONTS", "0")
+    store, manifest, details, output = _assembly_hybrid_store(
+        tmp_path, ["warning_partial"]
+    )
+    reconstruction = (
+        store.root / "pages/page_001/reconstruction/pf-0123456789ab"
+    )
+    (reconstruction / "background.png").write_bytes(b"corrupt")
+    plan = route_c.build_hybrid_delivery(store, manifest)
+    assert plan["pages"][0]["delivery_mode"] == "flattened"
+    outputs = legacy.assemble_legacy_results(store)
+    presentation = Presentation(outputs["16:9"])
+    shapes = list(presentation.slides[0].shapes)
+    assert len(shapes) == 1
+    assert shapes[0].shape_type == MSO_SHAPE_TYPE.PICTURE
+
+
+def test_hybrid_partial_delivery_flattens_on_lost_component(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed component with no preserved parent layer is lost
+    content; the page must flatten rather than ship partial."""
+    monkeypatch.setenv("IMAGE2EDITABLE_EMBED_FONTS", "0")
+    store, manifest, details, output = _assembly_hybrid_store(
+        tmp_path, ["warning_partial"]
+    )
+    reconstruction = (
+        store.root / "pages/page_001/reconstruction/pf-0123456789ab"
+    )
+    graph_path = reconstruction / "component-graph.json"
+    graph = json.loads(graph_path.read_text(encoding="utf-8"))
+    for node in graph["nodes"]:
+        if node["id"] == "parent_0002":
+            node["state"] = "inactive"
+    graph_path.write_text(
+        json.dumps(graph, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    state = store.read_json(
+        "pages/page_001/reconstruction/component_state.json"
+    )
+    state["fallback_graph_ref"] = _store_ref(store, graph_path)
+    store.write_json(
+        "pages/page_001/reconstruction/component_state.json", state
+    )
+    plan = route_c.build_hybrid_delivery(store, manifest)
+    assert plan["pages"][0]["delivery_mode"] == "flattened"
+
+
 def test_hybrid_warning_page_flattens_and_reports(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1213,6 +1412,7 @@ def test_hybrid_warning_page_flattens_and_reports(
     assert set(row) == {
         "page_id", "input_index", "delivery_mode", "quality_status",
         "stop_reason", "unresolved_violations", "handoff_ref",
+        "editable_component_ids", "degraded_component_ids",
     }
     assert row["delivery_mode"] == "flattened"
     assert row["quality_status"] == "preserved_with_warning"

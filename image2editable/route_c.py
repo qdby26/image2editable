@@ -273,15 +273,113 @@ def _warning_delivery_row(
     handoff_ref = _capture_artifact(
         store, route_dir / "fallback-request.json", request_bytes
     )
+    partial = _plan_partial_delivery(store, state, page_id)
     return {
         "page_id": page_id,
         "input_index": input_index,
-        "delivery_mode": "flattened",
+        "delivery_mode": "partial" if partial else "flattened",
         "quality_status": "preserved_with_warning",
         "stop_reason": state["stop_reason"],
         "unresolved_violations": unresolved,
+        "editable_component_ids": (
+            partial["editable_component_ids"] if partial else []
+        ),
+        "degraded_component_ids": (
+            partial["degraded_component_ids"] if partial else []
+        ),
         "handoff_ref": handoff_ref,
     }
+
+
+def _plan_partial_delivery(
+    store: RunStore, state: dict, page_id: str
+) -> dict | None:
+    """Decide whether a warning page can ship its surviving layers.
+
+    Partial delivery keeps every frozen component as an editable PNG
+    layer plus the failed components' extracted layers (flagged
+    degraded) on the reconstructed background with native text. It is
+    only possible when the run still carries bound fallback references
+    (graph + presentation manifest + reconstructed background) and every
+    active visual node is classified frozen or failed. Any missing or
+    invalid evidence collapses to the whole-page flattened fallback —
+    never the other way around.
+    """
+    # Local import: legacy provides the bound ref loader and the
+    # presentation-asset machinery; keeping it lazy avoids a cycle.
+    from image2editable.component_contracts import validate_component_graph
+    from image2editable.legacy import (
+        _active_visual_nodes,
+        _load_legacy_ref,
+        _legacy_ref_path,
+    )
+
+    try:
+        graph_ref = state.get("fallback_graph_ref")
+        input_refs = state.get("fallback_input_refs")
+        if not isinstance(graph_ref, dict) or not isinstance(
+            input_refs, dict
+        ):
+            return None
+        required = ("background", "presentation_manifest")
+        if any(not isinstance(input_refs.get(name), dict) for name in required):
+            return None
+        graph_path, graph_payload = _load_legacy_ref(store, graph_ref)
+        graph = json.loads(graph_payload.decode("utf-8"))
+        validate_component_graph(graph)
+        for name in required:
+            # Bound-load now so a hash mismatch is caught at plan time;
+            # _legacy_ref_path also proves the path stays under the root.
+            _legacy_ref_path(store, input_refs[name])
+            _load_legacy_ref(store, input_refs[name])
+        frozen = set(state.get("frozen") or {})
+        failed = (
+            set(state.get("failed_ids") or [])
+            | set(state.get("candidate_ids") or [])
+        )
+        # Collapsed failures render through their preserved parent node,
+        # so active fallback-graph nodes live in a different namespace
+        # than state["failed_ids"]. The terminal warning state clears
+        # state["fallback"]["parent_ids"], so active parents must be
+        # identified from the graph itself.
+        active_ids = set()
+        editable = []
+        for node in _active_visual_nodes(graph):
+            node_id = node["id"]
+            active_ids.add(node_id)
+            if node_id in frozen:
+                editable.append(node_id)
+            elif node_id in failed or node["kind"] == "parent":
+                continue
+            else:
+                return None
+        by_id = {node["id"]: node for node in graph["nodes"]}
+        for component_id in failed:
+            node = by_id.get(component_id)
+            if node is None:
+                return None
+            if component_id in active_ids:
+                continue
+            ancestor_id = node.get("parent_id")
+            while ancestor_id is not None and ancestor_id not in active_ids:
+                ancestor = by_id.get(ancestor_id)
+                if ancestor is None:
+                    break
+                ancestor_id = ancestor.get("parent_id")
+            if ancestor_id is None:
+                # A failed component that neither renders nor is
+                # carried by an active preserved ancestor is lost
+                # content — flatten the page instead.
+                return None
+        if not editable and not failed:
+            return None
+        return {
+            "graph_sha256": graph_ref["sha256"],
+            "editable_component_ids": sorted(editable),
+            "degraded_component_ids": sorted(failed),
+        }
+    except Exception:
+        return None
 
 
 def build_hybrid_delivery(store: RunStore, manifest: dict) -> dict:
@@ -317,11 +415,21 @@ def build_hybrid_delivery(store: RunStore, manifest: dict) -> dict:
                 store, manifest, item, page_id, input_index, state
             )
             degraded_pages.append(page_id)
-            warnings.append(
-                f"{page_id}: editable reconstruction exhausted; page is "
-                "delivered as a flattened source image and is queued for "
-                "Route A (awaiting_host)"
-            )
+            if row["delivery_mode"] == "partial":
+                warnings.append(
+                    f"{page_id}: editable reconstruction exhausted; page "
+                    "is delivered partially editable "
+                    f"({len(row['editable_component_ids'])} frozen "
+                    "components kept, "
+                    f"{len(row['degraded_component_ids'])} components "
+                    "degraded) and is queued for Route A (awaiting_host)"
+                )
+            else:
+                warnings.append(
+                    f"{page_id}: editable reconstruction exhausted; page "
+                    "is delivered as a flattened source image and is "
+                    "queued for Route A (awaiting_host)"
+                )
             pages.append(row)
         elif status == "ready_for_assembly":
             pages.append({
@@ -331,6 +439,8 @@ def build_hybrid_delivery(store: RunStore, manifest: dict) -> dict:
                 "quality_status": "ready_for_assembly",
                 "stop_reason": None,
                 "unresolved_violations": [],
+                "editable_component_ids": [],
+                "degraded_component_ids": [],
                 "handoff_ref": None,
             })
         else:
@@ -529,9 +639,9 @@ def publish_hybrid_reports(
         {
             **row,
             "status": (
-                "preserved_with_warning"
-                if row["delivery_mode"] == "flattened"
-                else "validated"
+                "validated"
+                if row["delivery_mode"] == "editable"
+                else "preserved_with_warning"
             ),
         }
         for row in plan["pages"]
@@ -578,6 +688,7 @@ def cleanup_hybrid_reports(store: RunStore, outputs: dict) -> None:
 _PAGE_RESULT_FIELDS = {
     "page_id", "input_index", "delivery_mode", "quality_status",
     "stop_reason", "unresolved_violations", "handoff_ref", "status",
+    "editable_component_ids", "degraded_component_ids",
 }
 
 
@@ -820,7 +931,7 @@ def validate_completed_hybrid_delivery(
             or delivery_checks.get("pptx_reopen") != "pass"
         ):
             raise RuntimeError(f"{page_id}: component delivery is invalid")
-        if mode == "flattened":
+        if mode in {"flattened", "partial"}:
             validate_component_repair_state(state)
             unresolved = row["unresolved_violations"]
             if (
@@ -838,12 +949,26 @@ def validate_completed_hybrid_delivery(
                 or not unresolved
                 or any(type(v) is not str for v in unresolved)
                 or delivery.get("status") != "preserved_with_warning"
-                or delivery.get("delivery_mode") != "flattened"
+                or delivery.get("delivery_mode") != mode
                 or delivery.get("handoff_ref") != row["handoff_ref"]
             ):
                 raise RuntimeError(
-                    f"{page_id}: flattened page state is invalid"
+                    f"{page_id}: degraded page state is invalid"
                 )
+            if mode == "partial":
+                if (
+                    row.get("degraded_component_ids")
+                    != delivery.get("degraded_component_ids")
+                    or row.get("editable_component_ids")
+                    != delivery.get("editable_component_ids")
+                    or not (
+                        row["degraded_component_ids"]
+                        or row["editable_component_ids"]
+                    )
+                ):
+                    raise RuntimeError(
+                        f"{page_id}: partial delivery record is invalid"
+                    )
             _validate_hybrid_handoff(
                 store, item, page_id, input_index, state, row
             )
