@@ -91,7 +91,14 @@ def test_underlay_metrics_cover_text_hole_and_visual_hole(underlay_engine):
     expected = underlay_engine._visual_metrics(
         layer["rgb"], source, layer["ownership_mask"], generated
     )
-    assert layer["metrics"] == expected
+    # Persisted metrics keep only the underlay contract fields;
+    # texture_deficit is a fill-selection diagnostic, not persisted.
+    contract = (
+        "boundary_color_mae",
+        "gradient_jump_p95",
+        "added_high_frequency_pixels",
+    )
+    assert layer["metrics"] == {k: expected[k] for k in contract}
     assert layer["metrics"]["gradient_jump_p95"] <= 12.0
 
 

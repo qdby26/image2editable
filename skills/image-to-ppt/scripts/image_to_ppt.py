@@ -4706,6 +4706,66 @@ def _restore_rotated_ocr_analysis(
     return restored_items, restored_mask
 
 
+def _ocr_cache_key(
+    source: Path, lang: str, style_reference_width: int | None
+) -> str:
+    payload = {
+        "schema_version": 1,
+        "source_sha256": hashlib.sha256(Path(source).read_bytes()).hexdigest(),
+        "lang": lang,
+        "style_reference_width": style_reference_width,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def _detect_text_cached(
+    source: Path,
+    *,
+    cache_dir: Path,
+    lang: str,
+    **ocr_kwargs,
+) -> tuple[list[dict], np.ndarray]:
+    """detect_text with a content-addressed disk cache.
+
+    A page that halts at the proposal-review gate re-enters
+    prepare_component_layers after the human answer; the second entry used to
+    pay a full-page OCR again. The cache key is the source bytes plus the
+    parameters that change the raw result, so a resumed run on an identical
+    source reuses the items/mask written before the halt. Entries are written
+    atomically; a corrupt entry is ignored and recomputed.
+    """
+    key = _ocr_cache_key(source, lang, ocr_kwargs.get("style_reference_width"))
+    items_path = Path(cache_dir) / f"{key}.items.json"
+    mask_path = Path(cache_dir) / f"{key}.mask.png"
+    try:
+        with Image.open(mask_path) as stored_mask:
+            mask = np.asarray(stored_mask.convert("L")).copy()
+        items = json.loads(items_path.read_text(encoding="utf-8"))
+        if not isinstance(items, list):
+            raise ValueError("cached OCR items are not a list")
+        return items, mask
+    except (OSError, ValueError, TypeError, Image.UnidentifiedImageError):
+        pass
+
+    items, mask = detect_text(str(source), lang=lang, **ocr_kwargs)
+    try:
+        cache_dir = Path(cache_dir)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        items_tmp = items_path.with_name(items_path.name + ".tmp")
+        mask_tmp = mask_path.with_name(mask_path.name + ".tmp")
+        items_tmp.write_text(
+            json.dumps(items, ensure_ascii=False), encoding="utf-8"
+        )
+        Image.fromarray(mask, mode="L").save(mask_tmp, format="PNG")
+        os.replace(items_tmp, items_path)
+        os.replace(mask_tmp, mask_path)
+    except OSError:
+        logger.warning("OCR result cache write failed", exc_info=True)
+    return items, mask
+
+
 def prepare_component_layers(
     image_path: str | Path,
     work_dir: str | Path,
@@ -4776,7 +4836,12 @@ def prepare_component_layers(
                         upright.close()
                 ocr_source = temporary_ocr_source
         if ocr_result is None:
-            text_items, text_mask = detect_text(ocr_source, lang=lang, **ocr_kwargs)
+            text_items, text_mask = _detect_text_cached(
+                ocr_source,
+                cache_dir=owned_work_dir / "ocr-cache",
+                lang=lang,
+                **ocr_kwargs,
+            )
         else:
             text_items, text_mask = ocr_result
         text_items, text_mask = _filter_probable_icon_text_analysis(
