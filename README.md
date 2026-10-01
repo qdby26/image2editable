@@ -104,6 +104,27 @@ image2editable/
 └── THIRD_PARTY_NOTICES.md     # 第三方依赖与许可证说明
 ```
 
+## 失败策略：图片转 PPTX 的保底交付
+
+默认 `reject` 保持不变：页面耗尽修复仍未通过质量门时，任务失败、不产出 PPTX。
+图片输入且输出 PPTX 时，可显式选择 `hybrid`：通过页保持可编辑，失败页以绑定源图作为整页图片交付。
+
+```bash
+image2editable convert collage.png --failure-policy hybrid
+```
+
+Python 接口同样支持 `runtime.convert(..., failure_policy="hybrid")` 和
+`runtime.prepare_job(..., failure_policy="hybrid")`，默认仍为 `"reject"`。
+每个版本都有交付报告，明确列出 `fully_editable`、`degraded_pages`、
+`needs_route_a` 和 `font_portability`；失败页保留带哈希的源图、质量报告和
+`fallback-request.json`。`awaiting_host` 只表示待宿主处理，管线不会自动调用 Route A，
+也不会把程序错误静默降级。
+
+宿主可后续使用 Route A 重建交接页，经结构和视觉验收后另存新交付版，保留原保底文件，
+并将替换结果绑定到源图和质量证据。这不是自动分流或通用主题/字体合并器。
+Windows 字体嵌入现在有阶段超时：失败时保留原 PPTX，报告 skipped，而非可移植成功。
+替换边界和超时配置见 [docs/route-c.md](docs/route-c.md)。
+
 ## 已知问题
 
 - **⚠️ 复杂页面建议人工复核。** 艺术字、密集表格、渐变和复杂插画可能无法逐像素还原；请在交付前检查文字、组件位置和页面布局。

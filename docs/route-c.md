@@ -70,6 +70,43 @@ so it survives pruning):
 `awaiting_host` means the page is queued for Route A handling; **Route A has
 not run** and no paid Route A call is made by this pipeline.
 
+## Host-driven Route A replacement
+
+A host can rebuild a handed-off page through the existing Route A workflow,
+then deliver a new deck replacing the flattened page after visual and
+structural acceptance. Use the hash-bound snapshot, not an unchecked current
+file. If input normalization re-encodes the PNG, retain the original hash
+and record both the normalized hash and pixel-equivalence evidence.
+
+This is an explicit host operation, not automatic behavior of `hybrid`.
+Keep the original draft, request, and quality evidence unchanged; publish
+the rebuilt deck and a separate resolution binding the request, source,
+quality report, accepted donor, and new output hashes. A rejected donor
+must leave the existing fallback intact.
+
+The existing `image2editable.pptx_shadow.patch_slide_background` helper can
+import native shapes/text and local image relationships into a screenshot
+picture's bounds. It is not a general slide merger: donor slide backgrounds,
+themes, embedded fonts, charts, notes, and animations are not imported.
+Check donor dependencies before use; an explicit native full-page background
+shape and explicit colors/typefaces avoid theme dependence for simple pages.
+Verify untouched pages and existing font/media parts after replacement.
+
+Generated assets may have minor detail/proportion differences, and fonts
+may remain unembedded. Report these separately from object editability.
+If the renderer cannot verify ownership of its COM instance, report rendering
+as unavailable rather than touching an unrelated Office/WPS application or
+claiming verified Microsoft PowerPoint output.
+
+## Bounded optional font embedding
+
+Windows font embedding uses a supervised worker. Activation defaults to
+90 seconds (`IMAGE2EDITABLE_FONT_ACTIVATION_TIMEOUT`); embedding defaults
+to 240 seconds (`IMAGE2EDITABLE_FONT_EMBED_TIMEOUT`). Both overrides must
+be positive finite values. A failed or timed-out embedding attempt keeps
+the original PPTX bytes and writes a skipped report, not a portability
+success. Cleanup is restricted to identity-verified worker-owned processes.
+
 ## Guarantees
 
 - Errors are never silently degraded: a page that cannot produce valid hybrid

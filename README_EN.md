@@ -116,6 +116,8 @@ runtime.prepare_job("collage.png", failure_policy="hybrid")
 
 Each variant gets a `<stem>.delivery-report.json` with `fully_editable` (`false` when any page was flattened), `degraded_pages`/`needs_route_a`, and `font_portability`. Every flattened page also keeps a bound Route A handoff under `pages/<id>/route-c/` (source + quality snapshots and `fallback-request.json` with `status: "awaiting_host"`). `awaiting_host` only queues the page — no Route A call is made — and errors are never silently degraded. See [docs/route-c.md](docs/route-c.md).
 
+The host can subsequently rebuild a handed-off page with Route A and publish a new deck after acceptance, preserving the original fallback and binding the replacement to its source/quality evidence. This is not automatic routing or a general theme/font merger. Windows font embedding is deadline-bounded; a timeout preserves the original PPTX and reports embedding as skipped, not portable. Replacement limits and timeout settings are documented in [docs/route-c.md](docs/route-c.md).
+
 ## Known limitations
 
 - **⚠️ Review complex pages manually.** Decorative text, dense tables, gradients, and complex illustrations may not be restored pixel for pixel. Check text, component positions, and layout before delivery.
