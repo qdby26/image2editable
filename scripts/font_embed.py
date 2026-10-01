@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import ctypes
 import json
 import logging
 import math
@@ -54,6 +53,10 @@ SUBSTITUTES = {
     "Calibri": "Carlito",
     "Cambria": "Caladea",
     "Courier New": "Cousine",
+    # SimSun ships as TTC — PowerPoint cannot embed multi-face
+    # collections. FangSong keeps the CJK serif genre, is a single
+    # TTF with editable-embedding fsType, and ships with Windows.
+    "SimSun": "FangSong",
 }
 _XML_FONT_PARTS = (
     "ppt/slides/",
@@ -141,17 +144,37 @@ def _powerpoint_exe_path() -> Path | None:
     return None
 
 
-def _powerpoint_running() -> bool:
-    import subprocess
-
+def _powerpoint_pids() -> set[int] | None:
+    """PIDs of every running POWERPNT.EXE; None when tasklist fails."""
     try:
         listing = subprocess.run(
-            ["tasklist", "/FI", "IMAGENAME eq POWERPNT.EXE", "/NH"],
+            [
+                "tasklist", "/FI", "IMAGENAME eq POWERPNT.EXE",
+                "/FO", "CSV", "/NH",
+            ],
             capture_output=True, text=True, timeout=15,
-        ).stdout
+        )
     except Exception:
-        return False
-    return "POWERPNT.EXE" in listing.upper()
+        return None
+    if listing.returncode != 0:
+        return None
+    pids: set[int] = set()
+    for line in listing.stdout.splitlines():
+        fields = [f.strip().strip('"') for f in line.split('","')]
+        if len(fields) < 2 or fields[0].upper() != "POWERPNT.EXE":
+            continue
+        try:
+            pids.add(int(fields[1]))
+        except ValueError:
+            return None
+    return pids
+
+
+def _powerpoint_running() -> bool:
+    pids = _powerpoint_pids()
+    # Fail closed: an unreadable process list cannot rule out a user
+    # session, so spawning a second instance must be refused.
+    return True if pids is None else bool(pids)
 
 
 def _is_real_powerpoint(application) -> bool:
@@ -231,26 +254,6 @@ def _write_json(path: Path, payload: dict) -> None:
     os.replace(tmp, path)
 
 
-def _app_process_id(application) -> int | None:
-    """PID owning a COM application's HWND (Office16 exposes Application.HWND)."""
-    try:
-        from ctypes import wintypes
-
-        func = ctypes.windll.user32.GetWindowThreadProcessId
-        func.argtypes = [
-            wintypes.HWND, ctypes.POINTER(wintypes.DWORD)
-        ]
-        func.restype = wintypes.DWORD
-        pid = wintypes.DWORD(0)
-        if not func(
-            wintypes.HWND(int(application.HWND)), ctypes.byref(pid)
-        ):
-            return None
-        return int(pid.value)
-    except Exception:
-        return None
-
-
 def _terminate_spawned(proc) -> None:
     """Bounded cleanup of a Popen handle we just created ourselves."""
     try:
@@ -291,14 +294,21 @@ def _publish_own(publish, proc, exe: Path) -> None:
 
 
 def _com_powerpoint():
-    """Return the activated PowerPoint object (real PP or hijacked WPS)."""
+    """Return the ROT-registered PowerPoint object, or None.
+
+    GetActiveObject only, never DispatchEx: WPS hijacks the PowerPoint
+    ProgID/CLSID under HKCU on this class of host, so registry-driven
+    activation could spawn foreign wpp.exe processes on every poll. The
+    ROT is query-only here — no new process is activated; the caller
+    filters the bound object by install path and owning pid before
+    touching it.
+    """
     import win32com.client
-    for progid in (_POWERPOINT_CLSID, "PowerPoint.Application"):
-        try:
-            return win32com.client.DispatchEx(progid)
-        except Exception:
-            continue
-    return None
+
+    try:
+        return win32com.client.GetActiveObject("PowerPoint.Application")
+    except Exception:
+        return None
 
 
 def _start_powerpoint(timeout_s: float = 90.0, publish=None):
@@ -317,14 +327,20 @@ def _start_powerpoint(timeout_s: float = 90.0, publish=None):
     ``publish`` (optional) receives ("own", record) for each spawned
     POWERPNT — pid/psutil creation_time/absolute exe/parent pid — and
     ("protect", pid) when a matched instance turns out to hold user
-    presentations and must be left alone. The activated application's
-    HWND-owning PID must equal the spawned proc's PID before we touch
-    it; a foreign application is never Quit'ed.
+    presentations and must be left alone. PowerPoint's Application
+    object exposes no HWND, so ownership is proven by process-set
+    identity instead: the bound object must report the spawned install
+    path AND the system-wide POWERPNT.EXE pid set must be exactly the
+    spawned pid. A foreign application is never Quit'ed.
     """
     exe = _powerpoint_exe_path()
     if exe is None or _powerpoint_running():
         return None, None
-    proc = subprocess.Popen([str(exe), "/automation"])
+    # /automation keeps UI suppressed; /safe disables add-ins — a loaded
+    # third-party add-in (e.g. AiPPT) destroys the ROT-bound Application
+    # object mid-Open, surfacing as RPC_E_DISCONNECTED after ~30s.
+    spawn_args = [str(exe), "/automation", "/safe"]
+    proc = subprocess.Popen(spawn_args)
     try:
         _publish_own(publish, proc, exe)
     except Exception:
@@ -341,14 +357,15 @@ def _start_powerpoint(timeout_s: float = 90.0, publish=None):
         except Exception as e:  # pragma: no cover - diagnostics
             err = repr(e)[:120]
         if app is not None and _is_real_powerpoint(app):
-            owner_pid = _app_process_id(app)
+            live_pids = _powerpoint_pids()
             if (
-                owner_pid is None
+                live_pids is None
                 or proc.poll() is not None
-                or owner_pid != proc.pid
+                or live_pids != {proc.pid}
             ):
-                # Not our spawned instance (or it already exited): never
-                # Quit or configure a foreign application; keep polling.
+                # Not our spawned instance (or it already exited, or a
+                # concurrent foreign POWERPNT.EXE appeared): never Quit
+                # or configure a foreign application; keep polling.
                 app = None
             else:
                 try:
@@ -363,7 +380,7 @@ def _start_powerpoint(timeout_s: float = 90.0, publish=None):
                     # protection-publish failure must propagate, not be
                     # swallowed into a returned foreign app.
                     if publish is not None:
-                        publish("protect", owner_pid)
+                        publish("protect", proc.pid)
                     proc = None
                     return None, None
                 return app, proc
@@ -377,7 +394,7 @@ def _start_powerpoint(timeout_s: float = 90.0, publish=None):
             # instance during COM hand-off); respawn once.
             if getattr(proc, "_respawned", False):
                 break
-            proc = subprocess.Popen([str(exe), "/automation"])
+            proc = subprocess.Popen(spawn_args)
             proc._respawned = True  # type: ignore[attr-defined]
             try:
                 _publish_own(publish, proc, exe)
@@ -631,45 +648,43 @@ def _embed_fonts_in_process(src: str | Path, dst: str | Path, *, publish=None) -
     # EmbedTrueTypeFonts property cannot be set and SaveAs ignores the
     # embed argument. The source itself is never saved (only SaveAs to
     # dst), so it is left untouched.
-    def embed_once(from_path: Path) -> list:
+    def embed_once(from_path: Path, out_path: Path) -> list:
+        # Deliberately never Close the presentation: closing the last
+        # file-based presentation revokes this automation instance's
+        # COM registration and kills the bound object. Cleanup is left
+        # to Quit()/process termination after all rounds finish.
         presentation = application.Presentations.Open(
             str(from_path),
             ReadOnly=False,
             Untitled=False,
             WithWindow=False,
         )
+        # presentation.Fonts does not yield items via iteration; index
+        # it. WPS's typeinfo-backed dispatch rejects Fonts.Count via
+        # InvokeTypes, so wrap it as a dumb (name-only) dispatch. The
+        # listing is diagnostic only — embedding itself is done by
+        # SaveAs below, so a host that refuses Fonts enumeration must
+        # not abort the embed.
+        com_fonts = []
         try:
-            # presentation.Fonts does not yield items via iteration; index
-            # it. WPS's typeinfo-backed dispatch rejects Fonts.Count via
-            # InvokeTypes, so wrap it as a dumb (name-only) dispatch. The
-            # listing is diagnostic only — embedding itself is done by
-            # SaveAs below, so a host that refuses Fonts enumeration must
-            # not abort the embed.
-            com_fonts = []
-            try:
-                fonts = _dumb_dispatch(presentation.Fonts)
-                for index in range(1, fonts.Count + 1):
-                    font = _dumb_dispatch(fonts(index))
-                    com_fonts.append(
-                        {
-                            "name": str(font.Name),
-                            "embeddable": bool(font.Embeddable),
-                            "embedded": bool(font.Embedded),
-                        }
-                    )
-            except Exception as error:
-                _LOGGER.warning(
-                    "presentation Fonts listing failed: %s", error
+            fonts = _dumb_dispatch(presentation.Fonts)
+            for index in range(1, fonts.Count + 1):
+                font = _dumb_dispatch(fonts(index))
+                com_fonts.append(
+                    {
+                        "name": str(font.Name),
+                        "embeddable": bool(font.Embeddable),
+                        "embedded": bool(font.Embedded),
+                    }
                 )
-            presentation.SaveAs(
-                str(dst_path), _PP_SAVE_AS_OPENXML, _MSO_TRUE
+        except Exception as error:
+            _LOGGER.warning(
+                "presentation Fonts listing failed: %s", error
             )
-            return com_fonts
-        finally:
-            try:
-                presentation.Close()
-            except Exception:
-                pass
+        presentation.SaveAs(
+            str(out_path), _PP_SAVE_AS_OPENXML, _MSO_TRUE
+        )
+        return com_fonts
 
     def mark(phase: str, attempt: int) -> None:
         if publish is not None:
@@ -688,10 +703,11 @@ def _embed_fonts_in_process(src: str | Path, dst: str | Path, *, publish=None) -
             done = threading.Event()
             stalled = threading.Event()
             try:
-                # Always start a dedicated instance and always quit it:
-                # attaching to an already-running presentation app via
-                # GetActiveObject risks touching user sessions and
-                # produces inconsistent dispatch state.
+                # Always start a dedicated instance and always quit it.
+                # The ROT binding inside _start_powerpoint is only
+                # accepted when the system POWERPNT.EXE pid set is
+                # exactly the spawned pid, so a concurrent user session
+                # cannot be mistaken for ours.
                 mark("activation", attempt + 1)
                 application, proc = _start_powerpoint(publish=publish)
                 if application is None:
@@ -724,11 +740,19 @@ def _embed_fonts_in_process(src: str | Path, dst: str | Path, *, publish=None) -
                 except Exception:
                     app_info = {}
 
-                com_fonts = embed_once(src_path)
-                dst_usage = collect_font_usage(dst_path)
+                # Opened presentations are kept open until Quit: closing
+                # the last file-based presentation makes this invisible
+                # instance revoke its COM registration, so each pass
+                # writes a distinct temp path and the winner is moved to
+                # dst only after the app released its file locks.
+                pass1 = dst_path.with_suffix(".embed-pass1.pptx")
+                pass2 = dst_path.with_suffix(".embed-pass2.pptx")
+                com_fonts = embed_once(src_path, pass1)
+                dst_usage = collect_font_usage(pass1)
                 substitutions = _resolve_substitutions(
                     dst_usage["not_embedded"]
                 )
+                final_pass = pass1
                 if substitutions:
                     # Rewrite a copy of the untouched source (never the
                     # first-pass output, whose embeddedFontLst entries
@@ -737,14 +761,32 @@ def _embed_fonts_in_process(src: str | Path, dst: str | Path, *, publish=None) -
                     try:
                         shutil.copyfile(src_path, staging)
                         _rewrite_typefaces(staging, substitutions)
-                        com_fonts = embed_once(staging)
+                        com_fonts = embed_once(staging, pass2)
                     finally:
                         staging.unlink(missing_ok=True)
-                    dst_usage = collect_font_usage(dst_path)
+                    final_pass = pass2
+                try:
+                    application.Quit()
+                except Exception:
+                    pass
+                application = None
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=10)
+                except Exception:
+                    pass
+                proc = None
+                os.replace(final_pass, dst_path)
+                for stray in (pass1, pass2):
+                    stray.unlink(missing_ok=True)
+                dst_usage = collect_font_usage(dst_path)
                 break
-            except Exception:
+            except Exception as error:
                 crashed = proc is not None and proc.poll() is not None
-                if attempt == 0 and (stalled.is_set() or crashed):
+                transient_com = type(error).__name__ == "com_error"
+                if attempt == 0 and (
+                    stalled.is_set() or crashed or transient_com
+                ):
                     _LOGGER.warning(
                         "PowerPoint embed %s; retrying with a fresh "
                         "instance",

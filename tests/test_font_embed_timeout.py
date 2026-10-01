@@ -379,8 +379,8 @@ def test_start_powerpoint_rejects_foreign_app(
         font_embed, "_powerpoint_exe_path", lambda: Path(sys.executable)
     )
     monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: FakeProc())
-    # The COM app's owning thread belongs to a different process.
-    monkeypatch.setattr(font_embed, "_app_process_id", lambda a: 9999)
+    # A different POWERPNT.EXE owns the ROT entry, not our spawned proc.
+    monkeypatch.setattr(font_embed, "_powerpoint_pids", lambda: {9999})
     monkeypatch.setattr(psutil, "Process", lambda pid: type(
         "P", (), {"create_time": lambda self: 1.0}
     )())
@@ -416,7 +416,7 @@ def test_start_powerpoint_protects_user_session(
         font_embed, "_powerpoint_exe_path", lambda: Path(sys.executable)
     )
     monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: proc)
-    monkeypatch.setattr(font_embed, "_app_process_id", lambda a: 43211)
+    monkeypatch.setattr(font_embed, "_powerpoint_pids", lambda: {43211})
     monkeypatch.setattr(psutil, "Process", lambda pid: type(
         "P", (), {"create_time": lambda self: 1.0}
     )())
@@ -453,7 +453,7 @@ def test_start_powerpoint_returns_matched_empty_app(
         font_embed, "_powerpoint_exe_path", lambda: Path(sys.executable)
     )
     monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: proc)
-    monkeypatch.setattr(font_embed, "_app_process_id", lambda a: 43212)
+    monkeypatch.setattr(font_embed, "_powerpoint_pids", lambda: {43212})
     monkeypatch.setattr(psutil, "Process", lambda pid: type(
         "P", (), {"create_time": lambda self: 1.0}
     )())
@@ -612,7 +612,7 @@ def test_start_powerpoint_protect_publish_failure_propagates(
         font_embed, "_powerpoint_exe_path", lambda: Path(sys.executable)
     )
     monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: proc)
-    monkeypatch.setattr(font_embed, "_app_process_id", lambda a: 43221)
+    monkeypatch.setattr(font_embed, "_powerpoint_pids", lambda: {43221})
     monkeypatch.setattr(psutil, "Process", lambda pid: type(
         "P", (), {"create_time": lambda self: 1.0}
     )())
@@ -653,7 +653,7 @@ def test_start_powerpoint_unreadable_count_fails_closed(
         font_embed, "_powerpoint_exe_path", lambda: Path(sys.executable)
     )
     monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: proc)
-    monkeypatch.setattr(font_embed, "_app_process_id", lambda a: 43222)
+    monkeypatch.setattr(font_embed, "_powerpoint_pids", lambda: {43222})
     monkeypatch.setattr(psutil, "Process", lambda pid: type(
         "P", (), {"create_time": lambda self: 1.0}
     )())
@@ -716,26 +716,114 @@ def test_fresh_import_with_invalid_embed_env_succeeds() -> None:
     )
 
 
-def test_app_process_id_uses_typed_hwnd_call(
+def test_powerpoint_pids_parses_tasklist_csv(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import ctypes
-    from ctypes import wintypes
+    csv_out = (
+        '"POWERPNT.EXE","99284","Console","1","123,456 K"\r\n'
+        '"POWERPNT.EXE","4321","Console","1","98,765 K"\r\n'
+    )
 
-    seen: dict = {}
-
-    def fake(hwnd, pid_ptr):
-        seen["hwnd"] = hwnd
-        pid_ptr._obj.value = 4321
-        return 7
+    class FakeCompleted:
+        returncode = 0
+        stdout = csv_out
 
     monkeypatch.setattr(
-        ctypes.windll.user32, "GetWindowThreadProcessId", fake
+        font_embed.subprocess, "run", lambda *a, **k: FakeCompleted()
     )
-    app = type("A", (), {"HWND": 0x1_0000_00FF})()  # >32-bit handle
-    assert font_embed._app_process_id(app) == 4321
-    assert isinstance(seen["hwnd"], wintypes.HWND)
-    assert seen["hwnd"].value == 0x1_0000_00FF
+    assert font_embed._powerpoint_pids() == {99284, 4321}
+
+
+def test_powerpoint_pids_empty_when_none_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeCompleted:
+        returncode = 0
+        stdout = (
+            "INFO: No tasks are running which match "
+            "the specified criteria.\r\n"
+        )
+
+    monkeypatch.setattr(
+        font_embed.subprocess, "run", lambda *a, **k: FakeCompleted()
+    )
+    assert font_embed._powerpoint_pids() == set()
+
+
+def test_com_powerpoint_never_dispatch_ex(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import win32com.client
+
+    sentinel = object()
+    monkeypatch.setattr(
+        win32com.client, "GetActiveObject", lambda *a, **k: sentinel
+    )
+
+    def forbidden(*a, **k):
+        raise AssertionError(
+            "DispatchEx activates via the hijacked registry entry and "
+            "spawns foreign WPS processes"
+        )
+
+    monkeypatch.setattr(win32com.client, "DispatchEx", forbidden)
+    assert font_embed._com_powerpoint() is sentinel
+
+
+def test_com_powerpoint_returns_none_when_rot_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import win32com.client
+
+    def raise_com(*a, **k):
+        raise Exception("no ROT entry")
+
+    monkeypatch.setattr(
+        win32com.client, "GetActiveObject", raise_com
+    )
+    monkeypatch.setattr(
+        win32com.client,
+        "DispatchEx",
+        lambda *a, **k: pytest.fail("DispatchEx must not be used"),
+    )
+    assert font_embed._com_powerpoint() is None
+
+
+def test_start_powerpoint_rejects_concurrent_foreign_instance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A second POWERPNT.EXE appearing mid-poll makes the ROT binding
+    # ambiguous: the accepted app could be the foreign session.
+    proc = _fake_proc(43230)
+
+    class FakePresentations:
+        Count = 0
+
+    class FakeApp:
+        Path = str(Path(sys.executable).parent)
+        Presentations = FakePresentations()
+        quit_called = False
+
+        def Quit(self):
+            self.quit_called = True
+
+    app = FakeApp()
+    monkeypatch.setattr(font_embed, "_com_powerpoint", lambda: app)
+    monkeypatch.setattr(font_embed, "_is_real_powerpoint", lambda a: True)
+    monkeypatch.setattr(font_embed, "_powerpoint_running", lambda: False)
+    monkeypatch.setattr(
+        font_embed, "_powerpoint_exe_path", lambda: Path(sys.executable)
+    )
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: proc)
+    monkeypatch.setattr(
+        font_embed, "_powerpoint_pids", lambda: {43230, 55555}
+    )
+    monkeypatch.setattr(psutil, "Process", lambda pid: type(
+        "P", (), {"create_time": lambda self: 1.0}
+    )())
+    result, got_proc = font_embed._start_powerpoint(timeout_s=0.5)
+    assert result is None and got_proc is None
+    assert app.quit_called is False
 
 
 _CHILD_WORKER_PREFIX = (
