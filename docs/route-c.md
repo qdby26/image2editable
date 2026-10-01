@@ -79,18 +79,37 @@ file. If input normalization re-encodes the PNG, retain the original hash
 and record both the normalized hash and pixel-equivalence evidence.
 
 This is an explicit host operation, not automatic behavior of `hybrid`.
-Keep the original draft, request, and quality evidence unchanged; publish
-the rebuilt deck and a separate resolution binding the request, source,
-quality report, accepted donor, and new output hashes. A rejected donor
-must leave the existing fallback intact.
+`image2editable.route_c_resolve` implements it end to end:
 
-The existing `image2editable.pptx_shadow.patch_slide_background` helper can
-import native shapes/text and local image relationships into a screenshot
-picture's bounds. It is not a general slide merger: donor slide backgrounds,
-themes, embedded fonts, charts, notes, and animations are not imported.
-Check donor dependencies before use; an explicit native full-page background
-shape and explicit colors/typefaces avoid theme dependence for simple pages.
-Verify untouched pages and existing font/media parts after replacement.
+```bash
+python -m image2editable.route_c_resolve \
+  pages/page_001/route-c/fallback-request.json \
+  --draft c3-hybrid_16x9.pptx \
+  --donor route-a-page.pptx \
+  --out mixed.pptx \
+  --text-contract source-text-contract.json \
+  --resolution resolution.json
+```
+
+The resolver loads the request, requires `target_route: "A"` and
+`status: "awaiting_host"`, and re-verifies the bound `source_ref`/
+`quality_ref` hashes under the run root. The donor must contain exactly
+one slide with at least one shape, only `sp`/`pic` elements (charts,
+tables, connectors and groups are rejected), fully explicit colors and
+typefaces (theme lookups and gradients are rejected), internal image
+relationships only, and no external links or embedded fonts. An optional
+text contract JSON pins each native run's text, bold/italic flags and
+`srgbClr`. The flattened page is located by `input_index` and must hold
+exactly one picture; the donor shapes replace it via
+`patch_slide_background`. Every other draft part must survive
+byte-identical, the output must not exist, the draft is never modified,
+and the emitted resolution JSON binds request/draft/donor/output hashes.
+A rejected donor or failed verification removes only the new output.
+
+`patch_slide_background` is not a general slide merger: donor slide
+backgrounds, themes, embedded fonts, charts, notes, and animations are
+not imported. An explicit native full-page background shape and explicit
+colors/typefaces avoid theme dependence for simple pages.
 
 Generated assets may have minor detail/proportion differences, and fonts
 may remain unembedded. Report these separately from object editability.

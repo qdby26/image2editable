@@ -4,6 +4,7 @@
 
 ## [Unreleased]
 
+- 新增 Route C 页级回填接口 `image2editable.route_c_resolve`：校验 `awaiting_host` 交接请求及其绑定的源图／质量报告哈希，按输入页序定位整页保底图片，把已验收的 Route A 单页 donor（仅原生形状／显式样式／本地图片关系，拒绝图表、组、外链、嵌入字体）替换进新副本，验证其余部件逐字节保留并输出 resolution 审计 JSON，不改动原稿、不覆盖已有产物、不自动调用生图。
 - 基准语料统一至 `benchmarks/corpus/` 与 `benchmarks/release/`；Skill 通过部分克隆和文件清单仅获取运行所需源码，跳过基准、测试、演示图片和开发发布工具。
 
 - 仅安装转换 Skill 时也自动准备项目 Runtime、依赖、OCR 和模型；Windows 新安装优先 D 盘及其他非 C 本地磁盘，macOS/Linux 优先其他已挂载本地磁盘，统一下载缓存和临时目录并复用已有环境。
