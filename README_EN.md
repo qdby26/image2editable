@@ -101,6 +101,21 @@ image2editable/
 └── THIRD_PARTY_NOTICES.md     # Third-party dependency and license notices
 ```
 
+## Failure policy: flattened fallback for image → PPTX
+
+By default a page that cannot pass the editable-reconstruction quality gates fails the run (`reject`). For image input producing PPTX output you can opt into `hybrid`, which still delivers a deck: each unrecoverable page is flattened to a full-page picture of its source, while passing pages stay fully editable.
+
+```bash
+image2editable convert collage.png --failure-policy hybrid   # images → PPTX only
+```
+
+```python
+runtime.convert("collage.png", failure_policy="hybrid")   # default "reject"
+runtime.prepare_job("collage.png", failure_policy="hybrid")
+```
+
+Each variant gets a `<stem>.delivery-report.json` with `fully_editable` (`false` when any page was flattened), `degraded_pages`/`needs_route_a`, and `font_portability`. Every flattened page also keeps a bound Route A handoff under `pages/<id>/route-c/` (source + quality snapshots and `fallback-request.json` with `status: "awaiting_host"`). `awaiting_host` only queues the page — no Route A call is made — and errors are never silently degraded. See [docs/route-c.md](docs/route-c.md).
+
 ## Known limitations
 
 - **⚠️ Review complex pages manually.** Decorative text, dense tables, gradients, and complex illustrations may not be restored pixel for pixel. Check text, component positions, and layout before delivery.

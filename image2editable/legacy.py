@@ -53,6 +53,7 @@ from image2editable.component_repair import (
     _write_exclusive,
 )
 from image2editable.inputs import sha256_file
+from image2editable import route_c
 from image2editable.proposal_review_runtime import (
     load_proposal_review_state,
     make_proposal_gate,
@@ -4337,13 +4338,23 @@ def _native_pdf_slide_data(
 
 
 class _PublishedLegacyOutputs(dict[str, Any]):
-    def __init__(self, outputs: dict[str, Any], records: list[tuple]) -> None:
+    def __init__(
+        self,
+        outputs: dict[str, Any],
+        records: list[tuple],
+        *,
+        delivery_summary: dict | None = None,
+        report_records: list[tuple] | None = None,
+    ) -> None:
         super().__init__(outputs)
         self.records = records
+        self.delivery_summary = delivery_summary
+        self.report_records = report_records or []
 
 
 def assemble_legacy_results(store: RunStore) -> dict[str, Any]:
     manifest = store.read_json("job_manifest.json")
+    failure_policy = route_c.manifest_failure_policy(manifest)
     page_ids = manifest["pages"]
     output_format = manifest.get("output_format", "pptx")
     output_path = manifest["options"]["output_path"]
@@ -4374,10 +4385,21 @@ def assemble_legacy_results(store: RunStore) -> dict[str, Any]:
             f"pages/{page_id}/reconstruction/component_state.json"
         )["status"] == "preserved_with_warning"
     ]
+    hybrid_plan = (
+        route_c.build_hybrid_delivery(store, manifest)
+        if failure_policy == "hybrid"
+        else None
+    )
+    hybrid_rows = (
+        {row["page_id"]: row for row in hybrid_plan["pages"]}
+        if hybrid_plan is not None
+        else {}
+    )
     if (
         warning_pages
         and output_format == "pptx"
         and manifest["input"]["type"] in {"images", "pdf"}
+        and hybrid_plan is None
     ):
         raise RuntimeError(
             "editable reconstruction incomplete; no PPTX was created for "
@@ -4412,7 +4434,12 @@ def assemble_legacy_results(store: RunStore) -> dict[str, Any]:
                 reconstruction / "initial" / "prepared_page.json"
             )
             if state["status"] == "preserved_with_warning":
-                source = _source_path(store, page_id)
+                if hybrid_plan is not None:
+                    source = route_c.load_hybrid_source(
+                        store, hybrid_rows[page_id]["handoff_ref"]
+                    )
+                else:
+                    source = _source_path(store, page_id)
                 slides.append({
                     **prepared,
                     "background_path": str(source),
@@ -4421,6 +4448,8 @@ def assemble_legacy_results(store: RunStore) -> dict[str, Any]:
                     "original_image_path": str(source),
                     "components": [],
                     "text_items": [],
+                    "visual_elements": [],
+                    "background_rgb": None,
                 })
                 page_records.append((page_id, state, None, None))
                 continue
@@ -4546,9 +4575,26 @@ def assemble_legacy_results(store: RunStore) -> dict[str, Any]:
             published_records,
             output_format=output_format,
             native_quality=native_quality,
+            page_metadata=(
+                {
+                    row["page_id"]: {
+                        "delivery_mode": row["delivery_mode"],
+                        "handoff_ref": row["handoff_ref"],
+                    }
+                    for row in hybrid_plan["pages"]
+                }
+                if hybrid_plan is not None
+                else None
+            ),
         )
         for record in published_records:
             _verify_legacy_output_record(record)
+        delivery_summary = None
+        report_records = []
+        if hybrid_plan is not None:
+            delivery_summary, report_records = route_c.publish_hybrid_reports(
+                store, hybrid_plan, published, published_records
+            )
         _clear_legacy_staging_records(store)
     except Exception as error:
         cleanup_error = None
@@ -4556,6 +4602,17 @@ def assemble_legacy_results(store: RunStore) -> dict[str, Any]:
             _remove_legacy_outputs(list(reversed(published_records)))
         except Exception as caught:
             cleanup_error = caught
+        if hybrid_plan is not None and not getattr(
+            error, "_route_c_reports_compensated", False
+        ):
+            # publish_hybrid_reports already compensated (or attempted to)
+            # before propagating; only failures raised elsewhere need the
+            # registry-driven cleanup here.
+            try:
+                route_c.cleanup_hybrid_reports(store, published)
+            except Exception as caught:
+                if cleanup_error is None:
+                    cleanup_error = caught
         if cleanup_error is None:
             _clear_legacy_output_records(store)
             try:
@@ -4588,7 +4645,12 @@ def assemble_legacy_results(store: RunStore) -> dict[str, Any]:
                     staging.unlink()
         _cleanup_legacy_assembly_assets(assembly_asset_dirs)
 
-    return _PublishedLegacyOutputs(published, published_records)
+    return _PublishedLegacyOutputs(
+        published,
+        published_records,
+        delivery_summary=delivery_summary,
+        report_records=report_records,
+    )
 
 
 def _cleanup_native_pdf_sources(
@@ -4884,6 +4946,7 @@ def _record_legacy_delivery(
     *,
     output_format: str = "pptx",
     native_quality: dict | None = None,
+    page_metadata: dict[str, dict] | None = None,
 ) -> None:
     hashes = {str(path): digest for path, _, digest in output_records}
     output_refs = {
@@ -4907,6 +4970,8 @@ def _record_legacy_delivery(
             )
         if route_result_ref is not None:
             delivery["route_result"] = route_result_ref
+        if page_metadata and page_id in page_metadata:
+            delivery.update(page_metadata[page_id])
         if native_quality and page_id in native_quality:
             relative = f"pages/{page_id}/reconstruction/native-quality.json"
             store.write_json(relative, {

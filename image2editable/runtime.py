@@ -63,6 +63,12 @@ from image2editable.resources import (
     apply_resource_policy,
     validate_resource_policy,
 )
+from image2editable.route_c import (
+    cleanup_hybrid_reports,
+    manifest_failure_policy,
+    validate_completed_hybrid_delivery,
+    validate_failure_policy,
+)
 from image2editable.store import RunStore
 from scripts.performance_trace import PerformanceTrace, _validate_event, _validate_field
 
@@ -700,12 +706,16 @@ def prepare_job(
     agent_provider: str = "host",
     output_format: str = "pptx",
     pipeline_mode: str = "strict",
+    failure_policy: str = "reject",
 ) -> Path:
     input_type, paths = classify_inputs(inputs)
     if output_format not in {"pptx", "psd"}:
         raise ValueError(f"Unsupported output_format: {output_format}")
     if output_format == "psd" and input_type != "images":
         raise ValueError("PSD output only supports image input")
+    failure_policy = validate_failure_policy(
+        failure_policy, input_type=input_type, output_format=output_format
+    )
     prepare = {
         "images": prepare_image_job,
         "pdf": prepare_pdf_job,
@@ -722,6 +732,8 @@ def prepare_job(
     }
     if input_type == "images" and output_format != "pptx":
         prepare_kwargs["output_format"] = output_format
+    if input_type == "images" and failure_policy != "reject":
+        prepare_kwargs["failure_policy"] = failure_policy
     return prepare(
         source,
         **prepare_kwargs,
@@ -891,6 +903,10 @@ def _advance_legacy_pages(
     completed = {
         PageStatus.VALIDATED.value,
     }
+    if manifest_failure_policy(manifest) == "hybrid":
+        # A durable warning is terminal for hybrid delivery; resume
+        # assembly without reopening bounded repair or rerunning models.
+        completed.add(PageStatus.PRESERVED_WITH_WARNING.value)
     visual_page_ids = [
         page_id for page_id in page_ids
         if _native_pdf_analysis(store, page_id) is None
@@ -1118,6 +1134,10 @@ def _manifest_input(
     if input_type not in {"images", "pdf", "pptx"}:
         raise RuntimeError(f"Unsupported input type: {input_type}")
     _manifest_agent_provider(manifest)
+    try:
+        manifest_failure_policy(manifest)
+    except ValueError as error:
+        raise RuntimeError("Run manifest failure_policy is invalid") from error
     return manifest, input_type
 
 
@@ -2095,6 +2115,7 @@ def _run_job(
             )
         for record in output_records:
             _verify_legacy_output_record(record)
+        validate_completed_hybrid_delivery(store, manifest, summary)
         return summary
     if state["status"] != RunStatus.PREPARED.value:
         raise RuntimeError(
@@ -2466,6 +2487,14 @@ def _run_job(
                 getattr(assembled_outputs, "records", [])
             )
             outputs = dict(assembled_outputs)
+            delivery_summary = getattr(
+                assembled_outputs, "delivery_summary", None
+            )
+            hybrid_delivery = manifest_failure_policy(manifest) == "hybrid"
+            if hybrid_delivery and not isinstance(delivery_summary, dict):
+                raise RuntimeError(
+                    "Hybrid delivery metadata is missing from assembly"
+                )
             persisted_records = _legacy_assembly_records(
                 store, outputs, returned_records
             )
@@ -2473,16 +2502,31 @@ def _run_job(
             legacy_output_records = persisted_records
             for record in legacy_output_records:
                 _verify_legacy_output_record(record)
-            for page_id in page_ids:
-                store.write_json(
-                    Path("pages") / page_id / "page_result.json",
-                    {
-                        "schema_version": SCHEMA_VERSION,
-                        "page_id": page_id,
-                        "status": PageStatus.VALIDATED.value,
-                        "outputs": outputs,
-                    },
-                )
+            if hybrid_delivery:
+                delivery_rows = {
+                    row["page_id"]: row
+                    for row in delivery_summary["page_results"]
+                }
+                for page_id in page_ids:
+                    store.write_json(
+                        Path("pages") / page_id / "page_result.json",
+                        {
+                            "schema_version": SCHEMA_VERSION,
+                            **delivery_rows[page_id],
+                            "outputs": outputs,
+                        },
+                    )
+            else:
+                for page_id in page_ids:
+                    store.write_json(
+                        Path("pages") / page_id / "page_result.json",
+                        {
+                            "schema_version": SCHEMA_VERSION,
+                            "page_id": page_id,
+                            "status": PageStatus.VALIDATED.value,
+                            "outputs": outputs,
+                        },
+                    )
             store.transition_run(RunStatus.FINALIZING)
             summary = {
                 "schema_version": SCHEMA_VERSION,
@@ -2493,6 +2537,15 @@ def _run_job(
                 "resource_policy": resource_policy,
                 "quality_gate_version": COMPONENT_QUALITY_GATE_VERSION,
             }
+            if hybrid_delivery:
+                summary.update({
+                    key: delivery_summary[key]
+                    for key in (
+                        "failure_policy", "fully_editable",
+                        "degraded_pages", "needs_route_a", "warnings",
+                        "delivery_reports", "page_results",
+                    )
+                })
         performance = _performance_summary(
             store,
             page_ids,
@@ -2603,6 +2656,18 @@ def _run_job(
                 if existing_staging:
                     _remove_legacy_outputs(list(reversed(existing_staging)))
                 _clear_legacy_staging_records(store)
+            except Exception as caught:
+                legacy_compensation_failed = True
+                retry_blocked = True
+                if compensation_error is None:
+                    compensation_error = caught
+        if input_type != "pptx":
+            try:
+                if manifest_failure_policy(manifest) == "hybrid":
+                    cleanup_hybrid_reports(
+                        store,
+                        _expected_legacy_outputs(store, manifest),
+                    )
             except Exception as caught:
                 legacy_compensation_failed = True
                 retry_blocked = True
@@ -2885,6 +2950,10 @@ def recover_job(run_dir: str | Path) -> dict[str, Any]:
                 _clear_legacy_output_records(store)
             if staging_records:
                 _clear_legacy_staging_records(store)
+            if manifest_failure_policy(manifest) == "hybrid":
+                # Only sidecars registered as expected output siblings are
+                # removed; foreign or conflicting documents are untouched.
+                cleanup_hybrid_reports(store, expected_outputs)
 
         for directory in cleanup:
             _safe_rmtree(*directory)
@@ -3245,6 +3314,7 @@ def convert(
     agent_provider: str = "host",
     output_format: str = "pptx",
     pipeline_mode: str = "strict",
+    failure_policy: str = "reject",
 ) -> dict[str, Any]:
     prepare_kwargs: dict[str, Any] = {
         "run_dir": run_dir,
@@ -3257,5 +3327,7 @@ def convert(
         prepare_kwargs["pipeline_mode"] = pipeline_mode
     if output_format != "pptx":
         prepare_kwargs["output_format"] = output_format
+    if failure_policy != "reject":
+        prepare_kwargs["failure_policy"] = failure_policy
     prepared = prepare_job(inputs, **prepare_kwargs)
     return run_job(prepared)

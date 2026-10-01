@@ -50,6 +50,16 @@ def _add_image_options(parser: argparse.ArgumentParser) -> None:
         default="strict",
         help="选择质量基线 strict 或确定性快速路由 fast",
     )
+    parser.add_argument(
+        "--failure-policy",
+        choices=("reject", "hybrid"),
+        default="reject",
+        help=(
+            "Delivery policy on quality exhaustion: reject (default) or "
+            "hybrid, which delivers flattened failed pages plus Route A "
+            "handoff requests; images -> PPTX only"
+        ),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -242,6 +252,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 lang=args.lang,
                 agent_provider=args.agent_provider,
                 **({"pipeline_mode": args.pipeline_mode} if args.pipeline_mode != "strict" else {}),
+                **({"failure_policy": args.failure_policy} if args.failure_policy != "reject" else {}),
                 **format_kwargs,
             )
         _print_json(summary)
@@ -262,6 +273,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 lang=args.lang,
                 agent_provider=args.agent_provider,
                 **({"pipeline_mode": args.pipeline_mode} if args.pipeline_mode != "strict" else {}),
+                **({"failure_policy": args.failure_policy} if args.failure_policy != "reject" else {}),
                 **format_kwargs,
             )
         _print_json({"run_dir": str(Path(run_dir).resolve()), "status": "prepared"})

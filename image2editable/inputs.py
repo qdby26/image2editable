@@ -11,6 +11,7 @@ from typing import Iterable, Literal, Sequence
 from image2editable.component_contracts import validate_agent_provider
 from image2editable.contracts import SCHEMA_VERSION, RunStatus
 from image2editable.resources import safe_default_policy
+from image2editable.route_c import validate_failure_policy
 from image2editable.store import RunStore
 from scripts.psd_assemble import preflight_psd_runtime
 
@@ -177,10 +178,14 @@ def prepare_image_job(
     agent_provider: str = "host",
     output_format: str = "pptx",
     pipeline_mode: str = "strict",
+    failure_policy: str = "reject",
 ) -> Path:
     agent_provider = validate_agent_provider(agent_provider)
     output_format = validate_output_format(output_format)
     pipeline_mode = validate_pipeline_mode(pipeline_mode)
+    failure_policy = validate_failure_policy(
+        failure_policy, input_type="images", output_format=output_format
+    )
     if slide_size not in {"original", "16:9", "both"}:
         raise ValueError(f"Unsupported slide_size: {slide_size}")
 
@@ -241,6 +246,7 @@ def prepare_image_job(
                 ),
                 "resource_policy": safe_default_policy(),
                 **({"pipeline_mode": pipeline_mode} if pipeline_mode != "strict" else {}),
+                **({"failure_policy": failure_policy} if failure_policy != "reject" else {}),
             },
             "pages": page_ids,
         }

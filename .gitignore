@@ -66,6 +66,7 @@ Thumbs.db
 # README assets tracked in the repository
 !docs/
 docs/*
+!docs/route-c.md
 !docs/images/
 docs/images/*
 !docs/images/*.png
