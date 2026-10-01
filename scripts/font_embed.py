@@ -2,12 +2,18 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import logging
+import math
 import os
 import shutil
 import struct
+import subprocess
 import sys
+import tempfile
+import threading
+import time
 import zipfile
 from pathlib import Path
 from xml.etree import ElementTree
@@ -20,9 +26,15 @@ _MSO_TRUE = -1
 # an add-in/macro event handler on the dedicated automation instance.
 _MSO_AUTOMATION_SECURITY_FORCE_DISABLE = 3
 _PP_ALERTS_NONE = 1
-_EMBED_WATCHDOG_S = float(
-    os.environ.get("IMAGE2EDITABLE_FONT_EMBED_TIMEOUT", "240")
-)
+_EMBED_TIMEOUT_ENV = "IMAGE2EDITABLE_FONT_EMBED_TIMEOUT"
+_ACTIVATION_TIMEOUT_ENV = "IMAGE2EDITABLE_FONT_ACTIVATION_TIMEOUT"
+# Default in-worker embed watchdog; the env override is validated at call
+# time (import must never fail on a bad value).
+_EMBED_WATCHDOG_S = 240.0
+# The blocking Open/SaveAs section inside the worker is additionally bounded
+# by the supervisor; this in-worker watchdog is retained for the attempt-2
+# retry semantics.
+_CLEANUP_TIMEOUT_S = 15.0
 # Microsoft PowerPoint's fixed Application CLSID. DispatchEx by CLSID
 # bypasses WPS Office hijacking the "PowerPoint.Application" ProgID —
 # WPS registers itself under that ProgID but the CLSID still points at
@@ -149,6 +161,135 @@ def _is_real_powerpoint(application) -> bool:
         return False
 
 
+def _timeout_env(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    try:
+        value = float(raw) if raw is not None else float(default)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"{name} must be a positive finite seconds value"
+        ) from None
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be a positive finite seconds value")
+    return value
+
+
+class _WorkerStatus:
+    """Worker-side phase/ownership publisher (atomic temp+replace writes)."""
+
+    def __init__(self, path: str | Path) -> None:
+        self._path = Path(path)
+        self._state: dict = {
+            "phase": None, "attempt": 0, "owned": [], "protected": [],
+        }
+
+    def _flush(self) -> None:
+        tmp = self._path.with_name(self._path.name + ".tmp")
+        error: OSError | None = None
+        for _ in range(10):
+            try:
+                tmp.write_text(
+                    json.dumps(self._state), encoding="utf-8"
+                )
+                os.replace(tmp, self._path)
+                return
+            except OSError as exc:
+                # Parent may hold the file open for a read on Windows.
+                error = exc
+                time.sleep(0.02)
+        raise error
+
+    def snapshot(self) -> dict:
+        """Latest in-memory state — carried in the result document so the
+        parent can prefer it over a status file whose last flush failed."""
+        return {
+            "phase": self._state["phase"],
+            "attempt": self._state["attempt"],
+            "owned": [dict(r) for r in self._state["owned"]],
+            "protected": list(self._state["protected"]),
+        }
+
+    def publish(self, kind: str, payload) -> None:
+        if kind == "phase":
+            self._state["phase"] = payload["phase"]
+            self._state["attempt"] = payload["attempt"]
+        elif kind == "own":
+            self._state["owned"].append(payload)
+        elif kind == "protect":
+            self._state["protected"].append(payload)
+            self._state["owned"] = [
+                record
+                for record in self._state["owned"]
+                if record.get("pid") != payload
+            ]
+        self._flush()
+
+
+def _write_json(path: Path, payload: dict) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(payload), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _app_process_id(application) -> int | None:
+    """PID owning a COM application's HWND (Office16 exposes Application.HWND)."""
+    try:
+        from ctypes import wintypes
+
+        func = ctypes.windll.user32.GetWindowThreadProcessId
+        func.argtypes = [
+            wintypes.HWND, ctypes.POINTER(wintypes.DWORD)
+        ]
+        func.restype = wintypes.DWORD
+        pid = wintypes.DWORD(0)
+        if not func(
+            wintypes.HWND(int(application.HWND)), ctypes.byref(pid)
+        ):
+            return None
+        return int(pid.value)
+    except Exception:
+        return None
+
+
+def _terminate_spawned(proc) -> None:
+    """Bounded cleanup of a Popen handle we just created ourselves."""
+    try:
+        if proc.poll() is not None:
+            return
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _publish_own(publish, proc, exe: Path) -> None:
+    """Immediately publish a spawned POWERPNT's verified identity.
+
+    Fails closed: a missing creation_time or a failing publisher raises —
+    the caller terminates the just-spawned process and propagates.
+    """
+    if publish is None or proc is None:
+        return
+    import psutil
+
+    creation_time = psutil.Process(proc.pid).create_time()
+    publish(
+        "own",
+        {
+            "pid": proc.pid,
+            "creation_time": creation_time,
+            "exe": str(exe.resolve()),
+            "parent_pid": os.getpid(),
+        },
+    )
+
+
 def _com_powerpoint():
     """Return the activated PowerPoint object (real PP or hijacked WPS)."""
     import win32com.client
@@ -160,7 +301,7 @@ def _com_powerpoint():
     return None
 
 
-def _start_powerpoint(timeout_s: float = 90.0):
+def _start_powerpoint(timeout_s: float = 90.0, publish=None):
     """Return ``(app, proc)`` for a dedicated real-PowerPoint instance.
 
     Returns ``(None, None)`` when unavailable: no POWERPNT.EXE, real
@@ -172,14 +313,24 @@ def _start_powerpoint(timeout_s: float = 90.0):
     poll. WPS may answer while PowerPoint is still starting — that is
     not fatal, keep polling until the deadline. The caller must already
     have called pythoncom.CoInitialize().
-    """
-    import subprocess
-    import time
 
+    ``publish`` (optional) receives ("own", record) for each spawned
+    POWERPNT — pid/psutil creation_time/absolute exe/parent pid — and
+    ("protect", pid) when a matched instance turns out to hold user
+    presentations and must be left alone. The activated application's
+    HWND-owning PID must equal the spawned proc's PID before we touch
+    it; a foreign application is never Quit'ed.
+    """
     exe = _powerpoint_exe_path()
     if exe is None or _powerpoint_running():
         return None, None
     proc = subprocess.Popen([str(exe), "/automation"])
+    try:
+        _publish_own(publish, proc, exe)
+    except Exception:
+        # Never proceed with an unrecorded spawned process.
+        _terminate_spawned(proc)
+        raise
     deadline = time.monotonic() + timeout_s
     diag = []
     while time.monotonic() < deadline:
@@ -190,14 +341,32 @@ def _start_powerpoint(timeout_s: float = 90.0):
         except Exception as e:  # pragma: no cover - diagnostics
             err = repr(e)[:120]
         if app is not None and _is_real_powerpoint(app):
-            try:
-                if app.Presentations.Count > 0:
-                    # A user session appeared between our checks; leave it.
+            owner_pid = _app_process_id(app)
+            if (
+                owner_pid is None
+                or proc.poll() is not None
+                or owner_pid != proc.pid
+            ):
+                # Not our spawned instance (or it already exited): never
+                # Quit or configure a foreign application; keep polling.
+                app = None
+            else:
+                try:
+                    count = app.Presentations.Count
+                except Exception:
+                    # Cannot verify the instance is empty: fail closed.
+                    count = -1
+                if count != 0:
+                    # Either a user session appeared inside our instance
+                    # or the count is unreadable. Protect the matched PID
+                    # from owned cleanup and never return the app. A
+                    # protection-publish failure must propagate, not be
+                    # swallowed into a returned foreign app.
+                    if publish is not None:
+                        publish("protect", owner_pid)
                     proc = None
                     return None, None
-            except Exception:
-                pass
-            return app, proc
+                return app, proc
         # WPS answered (or activation failed) while real PP still starts.
         diag.append(
             f"{time.monotonic() - (deadline - timeout_s):.1f}s "
@@ -210,6 +379,11 @@ def _start_powerpoint(timeout_s: float = 90.0):
                 break
             proc = subprocess.Popen([str(exe), "/automation"])
             proc._respawned = True  # type: ignore[attr-defined]
+            try:
+                _publish_own(publish, proc, exe)
+            except Exception:
+                _terminate_spawned(proc)
+                raise
         time.sleep(0.5)
     _LOGGER.warning(
         "PowerPoint did not become attachable within %.0fs; trace: %s",
@@ -222,7 +396,7 @@ def _start_powerpoint(timeout_s: float = 90.0):
     return None, None
 
 
-def _embed_watchdog(proc, done, stalled) -> None:
+def _embed_watchdog(proc, done, stalled, timeout_s=None) -> None:
     """Kill the spawned POWERPNT.EXE if the embed section overruns.
 
     Presentations.Open/SaveAs are synchronous COM calls; an add-in event
@@ -232,7 +406,8 @@ def _embed_watchdog(proc, done, stalled) -> None:
     """
     if proc is None:
         return
-    if done.wait(_EMBED_WATCHDOG_S):
+    budget = _EMBED_WATCHDOG_S if timeout_s is None else timeout_s
+    if done.wait(budget):
         return
     stalled.set()
     try:
@@ -424,7 +599,8 @@ def _resolve_substitutions(missing: list[str]) -> dict[str, str]:
     return mapping
 
 
-def embed_fonts(src: str | Path, dst: str | Path) -> dict:
+def _embed_fonts_in_process(src: str | Path, dst: str | Path, *, publish=None) -> dict:
+    """Blocking COM embed — runs inside the supervised worker subprocess."""
     if sys.platform != "win32":
         raise RuntimeError("font embedding requires Windows with PowerPoint")
     try:
@@ -447,6 +623,9 @@ def embed_fonts(src: str | Path, dst: str | Path) -> dict:
     dst_path = Path(dst).resolve()
     dst_path.parent.mkdir(parents=True, exist_ok=True)
     src_usage = collect_font_usage(src_path)
+    # Call-time validation: the env override must never crash module
+    # import, and an invalid value is rejected before any COM work.
+    watchdog_s = _timeout_env(_EMBED_TIMEOUT_ENV, _EMBED_WATCHDOG_S)
 
     # A writable open is required: with ReadOnly=True the
     # EmbedTrueTypeFonts property cannot be set and SaveAs ignores the
@@ -492,14 +671,19 @@ def embed_fonts(src: str | Path, dst: str | Path) -> dict:
             except Exception:
                 pass
 
-    import threading
+    def mark(phase: str, attempt: int) -> None:
+        if publish is not None:
+            publish("phase", {"phase": phase, "attempt": attempt})
 
+    mark("activation", 1)  # before CoInitialize / first COM activation
     pythoncom.CoInitialize()
     com_fonts: list = []
     substitutions: dict[str, str] = {}
     app_info = {}
+    last_attempt = 1
     try:
         for attempt in range(2):
+            last_attempt = attempt + 1
             application = proc = None
             done = threading.Event()
             stalled = threading.Event()
@@ -508,13 +692,15 @@ def embed_fonts(src: str | Path, dst: str | Path) -> dict:
                 # attaching to an already-running presentation app via
                 # GetActiveObject risks touching user sessions and
                 # produces inconsistent dispatch state.
-                application, proc = _start_powerpoint()
+                mark("activation", attempt + 1)
+                application, proc = _start_powerpoint(publish=publish)
                 if application is None:
                     raise RuntimeError(
                         "real Microsoft PowerPoint unavailable: not "
                         "installed, already running as a user session, "
                         "or hijacked by WPS"
                     )
+                mark("embedding", attempt + 1)  # before any app setter/COM call
                 for attr, value in (
                     ("AutomationSecurity",
                      _MSO_AUTOMATION_SECURITY_FORCE_DISABLE),
@@ -526,7 +712,7 @@ def embed_fonts(src: str | Path, dst: str | Path) -> dict:
                         pass
                 threading.Thread(
                     target=_embed_watchdog,
-                    args=(proc, done, stalled),
+                    args=(proc, done, stalled, watchdog_s),
                     daemon=True,
                 ).start()
                 try:
@@ -567,6 +753,7 @@ def embed_fonts(src: str | Path, dst: str | Path) -> dict:
                     continue
                 raise
             finally:
+                mark("cleanup", attempt + 1)  # before blocking Quit/terminate
                 done.set()
                 if application is not None:
                     try:
@@ -579,6 +766,7 @@ def embed_fonts(src: str | Path, dst: str | Path) -> dict:
                     except Exception:
                         pass
     finally:
+        mark("cleanup", last_attempt)  # before CoUninitialize
         pythoncom.CoUninitialize()
 
     from pptx import Presentation
@@ -593,6 +781,284 @@ def embed_fonts(src: str | Path, dst: str | Path) -> dict:
         "app": app_info,
         "portable": not dst_usage["not_embedded"],
     }
+
+
+def _embed_worker_command(
+    src: Path, dst: Path, status_path: Path, result_path: Path
+) -> list[str]:
+    """Command launching this same file as the supervised embed worker."""
+    return [
+        sys.executable, "-u", str(Path(__file__).resolve()),
+        "--worker", str(src), str(dst),
+        "--status-path", str(status_path),
+        "--result-path", str(result_path),
+    ]
+
+
+def _read_worker_status(status_path: Path) -> dict | None:
+    try:
+        payload = json.loads(status_path.read_bytes())
+    except (OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _kill_owned_process(record: dict, protected: set[int], worker_pid: int) -> None:
+    """Kill a worker-owned POWERPNT only when its live identity matches."""
+    pid = record.get("pid")
+    creation = record.get("creation_time")
+    exe = record.get("exe")
+    parent = record.get("parent_pid")
+    if (
+        type(pid) is not int
+        or type(creation) not in (int, float)
+        or not isinstance(exe, str)
+        or type(parent) is not int
+        or parent != worker_pid
+        or pid in protected
+    ):
+        return
+    import psutil
+
+    try:
+        process = psutil.Process(pid)
+        if (
+            process.ppid() != worker_pid
+            or process.create_time() != creation
+            or Path(process.exe()).resolve() != Path(exe).resolve()
+        ):
+            return
+    except (psutil.Error, OSError):
+        return
+    try:
+        process.kill()
+        process.wait(timeout=2)
+    except (psutil.Error, OSError):
+        pass
+
+
+def _final_worker_state(status_path: Path, result_path: Path) -> dict | None:
+    """Best-known worker state: last status file overlaid with the result
+    document's in-memory ``worker_state`` (whose final status flush may
+    have failed). Never raises."""
+    try:
+        status = _read_worker_status(status_path)
+    except Exception:
+        status = None
+    try:
+        payload = json.loads(result_path.read_bytes())
+    except Exception:
+        payload = None
+    if isinstance(payload, dict) and isinstance(
+        payload.get("worker_state"), dict
+    ):
+        status = {**(status or {}), **payload["worker_state"]}
+    return status
+
+
+def _cleanup_worker(worker, status: dict | None) -> None:
+    """Kill only verified owned POWERPNTs, then the worker itself."""
+    owned: list = []
+    protected: set[int] = set()
+    if isinstance(status, dict):
+        raw_owned = status.get("owned")
+        if isinstance(raw_owned, list):
+            owned = [r for r in raw_owned if isinstance(r, dict)]
+        raw_protected = status.get("protected")
+        if isinstance(raw_protected, list):
+            protected = {p for p in raw_protected if type(p) is int}
+    for record in owned:
+        try:
+            _kill_owned_process(record, protected, worker.pid)
+        except Exception:
+            pass
+    try:
+        if worker.poll() is None:
+            worker.kill()
+            worker.wait(timeout=2)
+    except Exception:
+        pass
+
+
+def _supervise_embed_worker(
+    worker,
+    status_path: Path,
+    result_path: Path,
+    *,
+    activation_timeout: float,
+    embed_timeout: float,
+    cleanup_timeout: float,
+) -> dict:
+    """Bound worker phases; drain pipes; return the validated result."""
+    budgets = {
+        "activation": activation_timeout,
+        "embedding": embed_timeout,
+        "cleanup": cleanup_timeout,
+    }
+    started = time.monotonic()
+    overall_deadline = started + 2 * (
+        activation_timeout + embed_timeout + cleanup_timeout
+    ) + 15.0
+    # Startup before the first status is charged to the attempt-1
+    # activation budget — a late first status never renews it.
+    phase_key: tuple = (1, "activation")
+    phase_deadline = started + activation_timeout
+    phase_name = "activation"
+    stdout_parts: list[str] = []
+    stderr_parts: list[str] = []
+    status = None
+    while True:
+        try:
+            out, err = worker.communicate(timeout=0.2)
+            stdout_parts.append(out or "")
+            stderr_parts.append(err or "")
+            break
+        except subprocess.TimeoutExpired:
+            pass
+        now = time.monotonic()
+        latest = _read_worker_status(status_path)
+        if latest is not None:
+            status = latest
+            new_key = (status.get("attempt"), status.get("phase"))
+            # Ownership-only updates carry the same key and never extend
+            # the current phase deadline; only genuine worker attempts
+            # (1/2) and known phases may open a new budget.
+            if (
+                type(new_key[0]) is int
+                and new_key[0] in (1, 2)
+                and isinstance(new_key[1], str)
+                and new_key[1] in budgets
+                and new_key != phase_key
+            ):
+                phase_key = new_key
+                phase_name = new_key[1]
+                phase_deadline = now + budgets[new_key[1]]
+        if now >= phase_deadline:
+            _cleanup_worker(worker, status)
+            raise RuntimeError(
+                f"font embed worker {phase_name} phase timed out"
+            )
+        if now >= overall_deadline:
+            _cleanup_worker(worker, status)
+            raise RuntimeError(
+                "font embed worker exceeded the overall time limit"
+            )
+    # Process exited: re-read the final status file overlaid with the
+    # result document's worker_state (its last status flush may have
+    # failed). Owned processes are cleaned on every outcome — success,
+    # crash, malformed or missing IPC.
+    status = _final_worker_state(status_path, result_path) or status
+    payload = None
+    try:
+        payload = json.loads(result_path.read_bytes())
+    except (OSError, ValueError):
+        pass
+    _cleanup_worker(worker, status)
+    if not isinstance(payload, dict) or type(payload.get("ok")) is not bool:
+        raise RuntimeError(
+            f"font embed worker exited without a valid result "
+            f"(code {worker.returncode})"
+        )
+    if payload["ok"] is not True:
+        error = payload.get("error")
+        raise RuntimeError(
+            str(error)
+            if isinstance(error, str) and error
+            else f"font embed worker failed (code {worker.returncode})"
+        )
+    if worker.returncode != 0:
+        raise RuntimeError(
+            f"font embed worker reported success but exited with code "
+            f"{worker.returncode}"
+        )
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        raise RuntimeError("font embed worker result payload is invalid")
+    return result
+
+
+def embed_fonts(src: str | Path, dst: str | Path) -> dict:
+    """Supervised embedding: the blocking COM section runs in a same-file
+    worker subprocess so activation/setters/Open/SaveAs/Quit are all
+    deadline-bounded and only verified owned POWERPNTs are cleaned up."""
+    if sys.platform != "win32":
+        raise RuntimeError("font embedding requires Windows with PowerPoint")
+    try:
+        import pythoncom  # noqa: F401
+        import win32com.client  # noqa: F401
+    except ImportError as error:
+        raise RuntimeError(
+            "font embedding requires pywin32 and PowerPoint"
+        ) from error
+
+    # Fail fast before touching the filesystem: no usable server means the
+    # call cannot succeed regardless of the inputs.
+    if _powerpoint_exe_path() is None or _powerpoint_running():
+        raise RuntimeError(
+            "real Microsoft PowerPoint unavailable: not installed or "
+            "already running as a user session"
+        )
+
+    activation_timeout = _timeout_env(_ACTIVATION_TIMEOUT_ENV, 90.0)
+    embed_timeout = _timeout_env(_EMBED_TIMEOUT_ENV, _EMBED_WATCHDOG_S)
+    cleanup_timeout = _CLEANUP_TIMEOUT_S
+
+    src_path = Path(src).resolve()
+    dst_path = Path(dst).resolve()
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="font-embed-") as tmp:
+        status_path = Path(tmp) / "status.json"
+        result_path = Path(tmp) / "result.json"
+        worker = subprocess.Popen(
+            _embed_worker_command(src_path, dst_path, status_path, result_path),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        try:
+            return _supervise_embed_worker(
+                worker,
+                status_path,
+                result_path,
+                activation_timeout=activation_timeout,
+                embed_timeout=embed_timeout,
+                cleanup_timeout=cleanup_timeout,
+            )
+        finally:
+            # Every exit path — success, timeout, crash, malformed IPC or
+            # an unexpected supervision error — cleans verified owned
+            # children from the best-known state, then the worker itself.
+            _cleanup_worker(
+                worker, _final_worker_state(status_path, result_path)
+            )
+
+
+def _run_embed_worker(src: str, dst: str, status_path: str, result_path: str) -> int:
+    """Internal worker entry: run the COM embed, publish status/result."""
+    status = _WorkerStatus(status_path)
+    try:
+        result = _embed_fonts_in_process(src, dst, publish=status.publish)
+    except BaseException as error:
+        _write_json(
+            Path(result_path),
+            {
+                "ok": False,
+                "error": f"{type(error).__name__}: {error}",
+                "worker_state": status.snapshot(),
+            },
+        )
+        return 1
+    _write_json(
+        Path(result_path),
+        {
+            "ok": True,
+            "result": result,
+            "worker_state": status.snapshot(),
+        },
+    )
+    return 0
 
 
 def embed_fonts_enabled() -> bool:
@@ -662,6 +1128,21 @@ def embed_pptx_in_place(
 
 
 def main() -> None:
+    argv = sys.argv[1:]
+    if argv and argv[0] == "--worker":
+        # Internal same-file worker mode; not a public CLI surface.
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--worker", action="store_true")
+        parser.add_argument("src")
+        parser.add_argument("dst")
+        parser.add_argument("--status-path", required=True)
+        parser.add_argument("--result-path", required=True)
+        args = parser.parse_args(argv)
+        raise SystemExit(
+            _run_embed_worker(
+                args.src, args.dst, args.status_path, args.result_path
+            )
+        )
     parser = argparse.ArgumentParser(
         description="Embed used fonts into a PPTX via PowerPoint."
     )
