@@ -38,6 +38,7 @@ def test_patch_slide_background_transplants_reconstruction_only(tmp_path):
 
     assert source.read_bytes() == source_before
     assert result == {
+        "removal_mode": "shape",
         "source_shape_id": "background",
         "slide_part": "ppt/slides/slide1.xml",
         "imported_shapes": 3,

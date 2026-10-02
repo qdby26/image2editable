@@ -3,28 +3,38 @@
 Consumes a durable ``fallback-request.json`` (status ``awaiting_host``)
 written by the hybrid-delivery path plus an already accepted Route A
 single-slide donor deck, and splices the donor shapes into a copy of the
-hybrid draft in place of the flattened full-page snapshot. The draft is
-never modified; the output must not already exist. Validation binds the
-request, referenced source/quality evidence hashes, the donor structure
-contract and the produced deck — no paid generation is invoked here.
+hybrid draft. Flattened pages (a single snapshot picture) keep only that
+picture replaced in place; partial pages have their whole shape tree
+replaced by the donor rebuild. A regenerated background image can also
+be swapped into a partial page on its own while component layers and
+native texts stay byte-identical. The draft is never modified; the
+output must not already exist. Validation binds the request, referenced
+source/quality evidence hashes, the donor structure contract and the
+produced deck — no paid generation is invoked here.
 """
 from __future__ import annotations
 
 import hashlib
 import io
 import json
+import os
 import posixpath
+import tempfile
 import zipfile
 from pathlib import Path
 
 from lxml import etree
 
-from image2editable.pptx_shadow import patch_slide_background
+from image2editable.pptx_shadow import (
+    patch_slide_background,
+    replace_slide_content,
+)
 
 P = "http://schemas.openxmlformats.org/presentationml/2006/main"
 A = "http://schemas.openxmlformats.org/drawingml/2006/main"
 R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 PR = "http://schemas.openxmlformats.org/package/2006/relationships"
+CT = "http://schemas.openxmlformats.org/package/2006/content-types"
 NS = {"p": P, "a": A, "r": R}
 
 _IMAGE_REL = (
@@ -136,11 +146,23 @@ def _assert_explicit_styles(slide: etree._Element) -> None:
         tag = etree.QName(el).localname
         if tag in (
             "schemeClr", "sysClr", "prstClr", "hslClr",
-            "fontRef", "gradFill",
+            "fontRef",
         ):
             raise DonorError(
                 f"donor uses non-explicit style element: {tag}"
             )
+        if tag == "gradFill":
+            bad = [
+                etree.QName(item).localname
+                for item in el.iter()
+                if etree.QName(item).localname
+                in ("schemeClr", "sysClr", "prstClr", "hslClr", "scrgbClr")
+            ]
+            if bad:
+                raise DonorError(
+                    "donor gradient uses non-explicit stops: "
+                    f"{sorted(set(bad))}"
+                )
         if tag in ("latin", "ea", "cs"):
             typeface = el.get("typeface")
             if not typeface or typeface.startswith("+"):
@@ -345,6 +367,32 @@ def _slide_part_at_index(pptx_path: str | Path, input_index: int) -> str:
         return _resolve_target("ppt/presentation.xml", rel.get("Target", ""))
 
 
+def _draft_page_kind(pptx_path: str | Path, slide_part: str) -> str:
+    """Classify the draft page: ``flattened`` (a single snapshot picture
+    and nothing else) or ``replace`` (a partial/editable page whose
+    whole content the donor rebuild supersedes)."""
+    with zipfile.ZipFile(pptx_path) as archive:
+        if slide_part not in archive.namelist():
+            raise HandoffError(f"draft slide part is missing: {slide_part}")
+        slide = etree.fromstring(archive.read(slide_part))
+    shape_tags = {
+        f"{{{P}}}sp", f"{{{P}}}grpSp", f"{{{P}}}graphicFrame",
+        f"{{{P}}}cxnSp", f"{{{P}}}pic", f"{{{P}}}contentPart",
+    }
+    shapes = [
+        el for el in slide.iter() if el.tag in shape_tags
+    ]
+    if (
+        len(shapes) == 1
+        and shapes[0].tag == f"{{{P}}}pic"
+        and slide.find(f"{{{P}}}cSld/{{{P}}}bg") is None
+    ):
+        return "flattened"
+    if not shapes:
+        raise HandoffError("draft page has neither a snapshot nor shapes")
+    return "replace"
+
+
 def _flattened_picture_id(pptx_path: str | Path, slide_part: str) -> str:
     """cNvPr id of the single full-page snapshot picture."""
     with zipfile.ZipFile(pptx_path) as archive:
@@ -361,6 +409,64 @@ def _flattened_picture_id(pptx_path: str | Path, slide_part: str) -> str:
     if c_nv_pr is None or not c_nv_pr.get("id"):
         raise HandoffError("flattened picture has no cNvPr id")
     return c_nv_pr.get("id")
+
+
+def _background_picture_ref(
+    pptx_path: str | Path, slide_part: str
+) -> tuple[etree._Element, str, str]:
+    """Locate the full-page background picture on a partial slide and
+    return (rels root, relationship id, media part name)."""
+    with zipfile.ZipFile(pptx_path) as archive:
+        names = set(archive.namelist())
+        if slide_part not in names:
+            raise HandoffError(f"draft slide part is missing: {slide_part}")
+        slide = etree.fromstring(archive.read(slide_part))
+        rels_part = _rels_part(slide_part)
+        rels = etree.fromstring(archive.read(rels_part))
+        presentation = etree.fromstring(archive.read("ppt/presentation.xml"))
+    size = presentation.find(f"{{{P}}}sldSz")
+    if size is None:
+        raise HandoffError("draft slide size is missing")
+    slide_w, slide_h = int(size.get("cx")), int(size.get("cy"))
+    tree = slide.find(f"{{{P}}}cSld/{{{P}}}spTree")
+    candidates = []
+    if tree is not None:
+        for pic in tree.findall(f"{{{P}}}pic"):
+            descr = (
+                pic.find(f".//{{{P}}}cNvPr").get("descr", "")
+                if pic.find(f".//{{{P}}}cNvPr") is not None
+                else ""
+            )
+            if "background" not in descr.lower():
+                continue
+            off = pic.find(f".//{{{A}}}xfrm/{{{A}}}off")
+            ext = pic.find(f".//{{{A}}}xfrm/{{{A}}}ext")
+            if off is None or ext is None:
+                continue
+            if (
+                int(off.get("x")) == 0
+                and int(off.get("y")) == 0
+                and int(ext.get("cx")) == slide_w
+                and int(ext.get("cy")) == slide_h
+            ):
+                candidates.append(pic)
+    if len(candidates) != 1:
+        raise HandoffError(
+            "partial page must carry exactly one full-page background "
+            f"picture, found {len(candidates)}"
+        )
+    blip = candidates[0].find(f".//{{{A}}}blip")
+    rid = blip.get(f"{{{R}}}embed") if blip is not None else None
+    rel = next(
+        (
+            r for r in rels.findall(f"{{{PR}}}Relationship")
+            if r.get("Id") == rid
+        ),
+        None,
+    )
+    if rid is None or rel is None or rel.get("Type") != _IMAGE_REL:
+        raise HandoffError("background picture image relationship missing")
+    return rels, rid, _resolve_target(slide_part, rel.get("Target", ""))
 
 
 def assert_draft_preserves(
@@ -416,12 +522,18 @@ def resolve_fallback_page(
         else None
     )
     slide_part = _slide_part_at_index(draft_pptx, request["input_index"])
-    picture_id = _flattened_picture_id(draft_pptx, slide_part)
-
-    patch = patch_slide_background(
-        draft_pptx, donor_pptx, output,
-        slide_part=slide_part, source_shape_id=picture_id,
-    )
+    page_kind = _draft_page_kind(draft_pptx, slide_part)
+    if page_kind == "flattened":
+        picture_id = _flattened_picture_id(draft_pptx, slide_part)
+        patch = patch_slide_background(
+            draft_pptx, donor_pptx, output,
+            slide_part=slide_part, source_shape_id=picture_id,
+        )
+    else:
+        picture_id = None
+        patch = replace_slide_content(
+            draft_pptx, donor_pptx, output, slide_part=slide_part,
+        )
     try:
         preservation = assert_draft_preserves(
             draft_pptx, output,
@@ -454,6 +566,7 @@ def resolve_fallback_page(
         "page_id": request["page_id"],
         "input_index": request["input_index"],
         "slide_part": slide_part,
+        "resolution_mode": page_kind,
         "replaced_picture_id": picture_id,
         "donor_summary": donor_summary,
         "text_contract": contract_summary,
@@ -474,6 +587,180 @@ def resolve_fallback_page(
     return resolution
 
 
+_IMAGE_MAGIC = (
+    (b"\x89PNG\r\n\x1a\n", "png"),
+    (b"\xff\xd8\xff", "jpg"),
+)
+
+
+def _sniff_image_extension(path: Path) -> str:
+    if not path.is_file() or path.stat().st_size > _MAX_ARTIFACT_BYTES:
+        raise HandoffError(f"background image is missing: {path}")
+    head = path.read_bytes()[:16]
+    for magic, extension in _IMAGE_MAGIC:
+        if head.startswith(magic):
+            return extension
+    raise HandoffError(
+        f"background image must be a PNG or JPEG file: {path}"
+    )
+
+
+def resolve_partial_background(
+    request_path: str | Path,
+    draft_pptx: str | Path,
+    background_image: str | Path,
+    output_pptx: str | Path,
+    *,
+    resolution_path: str | Path | None = None,
+) -> dict:
+    """Swap only the reconstructed background of a partial draft page.
+
+    Used when the host regenerates the page background (e.g. via image
+    generation) while the delivered component layers and native texts
+    stay untouched. The request page must be a partial page (more than
+    one picture); flattened pages must go through
+    :func:`resolve_fallback_page`. The slide XML itself is left
+    byte-identical — only the background picture's image relationship is
+    repointed to the newly added media part.
+    """
+    output = Path(output_pptx)
+    if output.exists() or output.is_symlink():
+        raise FileExistsError(output)
+    request = load_handoff_request(request_path)
+    image_path = Path(background_image).resolve()
+    extension = _sniff_image_extension(image_path)
+    slide_part = _slide_part_at_index(draft_pptx, request["input_index"])
+    if _draft_page_kind(draft_pptx, slide_part) != "replace":
+        raise HandoffError(
+            "background-only resolution requires a partial draft page; "
+            "flattened pages need a full donor rebuild"
+        )
+    rels, rid, old_media_part = _background_picture_ref(
+        draft_pptx, slide_part
+    )
+    rels_part = _rels_part(slide_part)
+
+    draft = Path(draft_pptx).resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(draft) as archive:
+        names = set(archive.namelist())
+        number = 1
+        while True:
+            new_media_part = (
+                f"ppt/media/bg_resolve_{number}.{extension}"
+            )
+            if new_media_part not in names:
+                break
+            number += 1
+        for rel in rels.findall(f"{{{PR}}}Relationship"):
+            if rel.get("Id") == rid:
+                rel.set(
+                    "Target",
+                    posixpath.relpath(
+                        new_media_part, posixpath.dirname(slide_part)
+                    ),
+                )
+        content_types = etree.fromstring(
+            archive.read("[Content_Types].xml")
+        )
+        defaults = {
+            item.get("Extension", "").lower()
+            for item in content_types.findall(f"{{{CT}}}Default")
+        }
+        replacements = {rels_part: _serialize(rels)}
+        if extension not in defaults:
+            default = etree.SubElement(
+                content_types, f"{{{CT}}}Default"
+            )
+            default.set("Extension", extension)
+            default.set(
+                "ContentType",
+                "image/png" if extension == "png" else "image/jpeg",
+            )
+            replacements["[Content_Types].xml"] = _serialize(
+                content_types
+            )
+        image_payload = image_path.read_bytes()
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{output.stem}-", suffix=".pptx", dir=output.parent
+        )
+        os.close(descriptor)
+        temporary_path = Path(temporary_name)
+        try:
+            with zipfile.ZipFile(temporary_path, "w") as destination:
+                for info in archive.infolist():
+                    destination.writestr(
+                        info,
+                        replacements.get(
+                            info.filename, archive.read(info.filename)
+                        ),
+                    )
+                destination.writestr(new_media_part, image_payload)
+            os.link(temporary_path, output)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+    try:
+        preservation = assert_draft_preserves(
+            draft, output,
+            allowed_diff={rels_part, "[Content_Types].xml"},
+        )
+    except Exception:
+        output.unlink(missing_ok=True)
+        raise
+    resolution = {
+        "schema_version": 1,
+        "status": "resolved",
+        "resolution_kind": "background",
+        "request_ref": {
+            "path": str(request["request_path"]),
+            "sha256": _sha256(request["request_path"]),
+        },
+        "draft_ref": {
+            "path": str(draft),
+            "sha256": _sha256(draft),
+        },
+        "background_image_ref": {
+            "path": str(image_path),
+            "sha256": _sha256(image_path),
+        },
+        "output_ref": {
+            "path": str(output.resolve()),
+            "sha256": _sha256(output),
+        },
+        "page_id": request["page_id"],
+        "input_index": request["input_index"],
+        "slide_part": slide_part,
+        "replaced_media_part": old_media_part,
+        "new_media_part": new_media_part,
+        "preservation": preservation,
+        "note": (
+            "request stays awaiting_host — a full donor rebuild may "
+            "still be applied afterwards via resolve_fallback_page"
+        ),
+    }
+    if resolution_path is not None:
+        target = Path(resolution_path)
+        if target.exists():
+            raise FileExistsError(target)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(
+            resolution, ensure_ascii=False, indent=2, sort_keys=True
+        ) + "\n"
+        tmp = target.with_name(target.name + ".tmp")
+        tmp.write_text(payload, encoding="utf-8")
+        tmp.replace(target)
+    return resolution
+
+
+def _serialize(element: etree._Element) -> bytes:
+    return etree.tostring(
+        element,
+        encoding="UTF-8",
+        xml_declaration=True,
+        standalone=True,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     import argparse
 
@@ -487,7 +774,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("request", help="path to fallback-request.json")
     parser.add_argument("--draft", required=True, help="hybrid draft pptx")
-    parser.add_argument("--donor", required=True, help="accepted route-A pptx")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument(
+        "--donor", help="accepted route-A single-slide donor pptx"
+    )
+    source.add_argument(
+        "--background",
+        help="regenerated background PNG/JPEG for a partial page",
+    )
     parser.add_argument("--out", required=True, help="new mixed pptx path")
     parser.add_argument(
         "--text-contract",
@@ -498,11 +792,19 @@ def main(argv: list[str] | None = None) -> int:
         "--resolution", default=None, help="resolution JSON output path"
     )
     args = parser.parse_args(argv)
-    resolution = resolve_fallback_page(
-        args.request, args.draft, args.donor, args.out,
-        text_contract_path=args.text_contract,
-        resolution_path=args.resolution,
-    )
+    if args.background:
+        if args.text_contract:
+            parser.error("--text-contract only applies with --donor")
+        resolution = resolve_partial_background(
+            args.request, args.draft, args.background, args.out,
+            resolution_path=args.resolution,
+        )
+    else:
+        resolution = resolve_fallback_page(
+            args.request, args.draft, args.donor, args.out,
+            text_contract_path=args.text_contract,
+            resolution_path=args.resolution,
+        )
     print(json.dumps(
         {
             "status": resolution["status"],

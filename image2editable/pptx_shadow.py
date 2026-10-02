@@ -36,6 +36,46 @@ def patch_slide_background(
     source_shape_id: str = "background",
 ) -> dict:
     """Replace one screenshot background with donor reconstruction shapes."""
+    return _patch_with_donor(
+        source_pptx,
+        donor_pptx,
+        output_pptx,
+        slide_part=slide_part,
+        removal_mode=("shape", source_shape_id),
+    )
+
+
+def replace_slide_content(
+    source_pptx: str | Path,
+    donor_pptx: str | Path,
+    output_pptx: str | Path,
+    *,
+    slide_part: str,
+) -> dict:
+    """Replace every shape on one slide with donor reconstruction shapes.
+
+    Unlike :func:`patch_slide_background`, which swaps a single snapshot
+    object, this clears the whole shape tree (and any picture background)
+    so a partially assembled slide can be replaced wholesale by an
+    accepted full-page donor rebuild.
+    """
+    return _patch_with_donor(
+        source_pptx,
+        donor_pptx,
+        output_pptx,
+        slide_part=slide_part,
+        removal_mode=("all", None),
+    )
+
+
+def _patch_with_donor(
+    source_pptx: str | Path,
+    donor_pptx: str | Path,
+    output_pptx: str | Path,
+    *,
+    slide_part: str,
+    removal_mode: tuple[str, str | None],
+) -> dict:
     source = Path(source_pptx).resolve()
     donor = Path(donor_pptx).resolve()
     output = Path(output_pptx).resolve()
@@ -60,7 +100,7 @@ def patch_slide_background(
                 donor_archive,
                 normalized_slide_part,
                 donor_slide_part,
-                source_shape_id,
+                removal_mode,
             )
             descriptor, temporary_name = tempfile.mkstemp(
                 prefix=f".{output.stem}-",
@@ -92,7 +132,7 @@ def _build_replacements(
     donor: zipfile.ZipFile,
     source_slide_part: str,
     donor_slide_part: str,
-    source_shape_id: str,
+    removal_mode: tuple[str, str | None],
 ) -> tuple[dict[str, bytes], list[tuple[str, zipfile.ZipInfo, bytes]], dict]:
     source_names = set(source.namelist())
     if source_slide_part not in source_names:
@@ -111,13 +151,32 @@ def _build_replacements(
     )
     if common is None or source_tree is None:
         raise ValueError("target slide has no shape tree")
-    source_object, insertion_index, target_bounds = _source_screenshot_object(
-        source_slide,
-        common,
-        source_tree,
-        source_shape_id,
-    )
-    source_relationships = _referenced_relationship_ids(source_object)
+    mode, source_shape_id = removal_mode
+    if mode == "all":
+        insertion_index = _shape_insertion_index(source_tree)
+        target_bounds = None
+        removed: list[etree._Element] = []
+        background = common.find(f"{{{P}}}bg")
+        if background is not None:
+            common.remove(background)
+            removed.append(background)
+        for child in list(source_tree):
+            if child.tag in SHAPE_TAGS:
+                source_tree.remove(child)
+                removed.append(child)
+        if not removed:
+            raise ValueError("target slide has no shapes to replace")
+        source_relationships = _referenced_relationship_ids(removed)
+    else:
+        source_object, insertion_index, target_bounds = (
+            _source_screenshot_object(
+                source_slide,
+                common,
+                source_tree,
+                source_shape_id,
+            )
+        )
+        source_relationships = _referenced_relationship_ids(source_object)
     remaining_relationships = _referenced_relationship_ids(source_slide)
     for relationship_id in source_relationships - remaining_relationships:
         relationship = _relationship_by_id(source_rels, relationship_id)
@@ -145,7 +204,7 @@ def _build_replacements(
     _assign_shape_ids(
         source_slide,
         donor_shapes,
-        reserved_ids={source_shape_id},
+        reserved_ids={source_shape_id} if source_shape_id else set(),
     )
 
     occupied_parts = set(source_names)
@@ -236,6 +295,7 @@ def _build_replacements(
         replacements,
         media,
         {
+            "removal_mode": mode,
             "source_shape_id": source_shape_id,
             "slide_part": source_slide_part,
             "imported_shapes": len(donor_shapes),

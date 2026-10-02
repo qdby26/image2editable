@@ -115,20 +115,50 @@ The resolver loads the request, requires `target_route: "A"` and
 `quality_ref` hashes under the run root. The donor must contain exactly
 one slide with at least one shape, only `sp`/`pic` elements (charts,
 tables, connectors and groups are rejected), fully explicit colors and
-typefaces (theme lookups and gradients are rejected), internal image
+typefaces (theme lookups are rejected; gradients are accepted only when
+every gradient stop is an explicit `srgbClr`), internal image
 relationships only, and no external links or embedded fonts. An optional
 text contract JSON pins each native run's text, bold/italic flags and
-`srgbClr`. The flattened page is located by `input_index` and must hold
-exactly one picture; the donor shapes replace it via
-`patch_slide_background`. Every other draft part must survive
+`srgbClr`. The target page is located by `input_index` and its shape
+profile selects the resolution mode: a page holding exactly one
+picture and nothing else is a `flattened` snapshot and the donor
+shapes replace that picture via `patch_slide_background`; any other
+page — including a `partial` page — has its whole shape tree replaced
+by the donor rebuild via `replace_slide_content` (recorded as
+`resolution_mode: "replace"`). Every other draft part must survive
 byte-identical, the output must not exist, the draft is never modified,
 and the emitted resolution JSON binds request/draft/donor/output hashes.
 A rejected donor or failed verification removes only the new output.
 
-`patch_slide_background` is not a general slide merger: donor slide
-backgrounds, themes, embedded fonts, charts, notes, and animations are
-not imported. An explicit native full-page background shape and explicit
-colors/typefaces avoid theme dependence for simple pages.
+`patch_slide_background`/`replace_slide_content` are not general slide
+mergers: donor slide backgrounds, themes, embedded fonts, charts, notes,
+and animations are not imported. An explicit native full-page
+background shape and explicit colors/typefaces avoid theme dependence
+for simple pages.
+
+### Background-only replacement on partial pages
+
+When a partial page's component layers and native texts are acceptable
+but the reconstructed background carries residual artifacts (banding,
+speckle where layers were stripped), a host can regenerate just the
+background — for example via image generation — and swap it in without
+touching the rest of the page:
+
+```bash
+python -m image2editable.route_c_resolve \
+  pages/page_002/route-c/fallback-request.json \
+  --draft hybrid.pptx \
+  --background regenerated-bg.png \
+  --out mixed.pptx \
+  --resolution resolution.json
+```
+
+`resolve_partial_background` requires the request page to be a partial
+page (flattened pages need a full donor rebuild). The new image is added
+as a fresh media part and the full-page background picture's image
+relationship is repointed to it — the slide XML and every other part
+stay byte-identical. The fallback request remains `awaiting_host`: a
+full donor rebuild may still be applied afterwards.
 
 Generated assets may have minor detail/proportion differences, and fonts
 may remain unembedded. Report these separately from object editability.

@@ -2878,6 +2878,70 @@ def _component_request_inputs(store, request_path: Path, request: dict) -> dict:
     return inputs
 
 
+def _host_plan_history(
+    reconstruction: Path, page_id: str, repair_round: int
+) -> list[dict]:
+    """Summarize earlier recorded host plans for this page so the agent
+    can see which actions were already tried on the same evidence and
+    what the outcome was. Later rounds otherwise receive byte-identical
+    inputs, which invites the same normalized plan again."""
+    prefix = f"host-component-plan-{page_id}-"
+    run_root = reconstruction.parent.parent.parent
+    by_round: dict[int, Path] = {}
+    for candidate in run_root.glob(f"{prefix}*.json"):
+        if not candidate.is_file():
+            continue
+        stem = candidate.name[len(prefix):-len(".json")]
+        round_token = stem.split("-", 1)[0]
+        if not round_token.isdigit():
+            continue
+        round_number = int(round_token)
+        if not 1 <= round_number < repair_round:
+            continue
+        existing = by_round.get(round_number)
+        if existing is None or (
+            candidate.stat().st_mtime > existing.stat().st_mtime
+        ):
+            by_round[round_number] = candidate
+    outcomes: dict[int, tuple[list[str], list[str]]] = {}
+    try:
+        state = json.loads(
+            (reconstruction / COMPONENT_STATE_NAME).read_text(
+                encoding="utf-8"
+            )
+        )
+        for entry in state.get("round_history", []):
+            outcomes[entry["round"]] = (
+                entry.get("failed_ids") or [],
+                entry.get("frozen_ids") or [],
+            )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, AttributeError):
+        pass
+    history = []
+    for round_number in sorted(by_round):
+        try:
+            document = json.loads(by_round[round_number].read_bytes())
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        actions = [
+            {"action": action["action"],
+             "object_ids": sorted(action["object_ids"])}
+            for action in document.get("actions", [])
+            if isinstance(action, dict)
+            and type(action.get("action")) is str
+            and isinstance(action.get("object_ids"), list)
+            and all(type(object_id) is str for object_id in action["object_ids"])
+        ]
+        failed_ids, frozen_ids = outcomes.get(round_number, ([], []))
+        history.append({
+            "repair_round": round_number,
+            "actions": actions,
+            "failed_ids": sorted(failed_ids),
+            "frozen_ids": sorted(frozen_ids),
+        })
+    return history
+
+
 def _normalized_plan_sha256(plan: dict) -> str:
     planned_ids = {
         component_id
@@ -3939,6 +4003,9 @@ def _build_component_agent_request_locked(
             ),
             "evidence": records,
             "review_evidence": review_evidence,
+            "plan_history": _host_plan_history(
+                reconstruction, page_id, repair_round
+            ),
         }
         validate_component_agent_request(request)
         request_bytes = json.dumps(

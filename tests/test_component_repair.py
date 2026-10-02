@@ -7888,3 +7888,84 @@ def test_marker_write_detects_agent_directory_replacement(
         build_component_agent_request(page_session, repair_round=1)
 
     assert replaced is True
+
+
+def test_round_request_carries_prior_plan_history(page_session: dict, tmp_path: Path) -> None:
+    first = build_component_agent_request(page_session, repair_round=1)
+    assert json.loads(first.read_bytes())["plan_history"] == []
+
+    plan = {
+        "schema_version": 1,
+        "kind": "component_plan",
+        "page_id": "page_001",
+        "provider": "host",
+        "repair_round": 1,
+        "request_sha256": "ab" * 32,
+        "actions": [
+            {
+                "action": "shrink",
+                "object_ids": ["candidate_b"],
+                "parameters": {"margin_ratio": 0.05},
+                "confidence": 0.8,
+                "evidence": [],
+            }
+        ],
+    }
+    (tmp_path / "host-component-plan-page_001-01-aa11bb22.json").write_text(
+        json.dumps(plan), encoding="utf-8"
+    )
+    reconstruction = Path(page_session["reconstruction_dir"])
+    (reconstruction / "component_state.json").write_text(
+        json.dumps(
+            {
+                "round_history": [
+                    {
+                        "round": 1,
+                        "plan_sha256": "0" * 64,
+                        "normalized_plan_sha256": "1" * 64,
+                        "execution_sha256": "2" * 64,
+                        "quality_sha256": "3" * 64,
+                        "failed_ids": ["candidate_b"],
+                        "frozen_ids": ["frozen_a"],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    second = build_component_agent_request(page_session, repair_round=2)
+    request = json.loads(second.read_bytes())
+    assert request["plan_history"] == [
+        {
+            "repair_round": 1,
+            "actions": [
+                {"action": "shrink", "object_ids": ["candidate_b"]}
+            ],
+            "failed_ids": ["candidate_b"],
+            "frozen_ids": ["frozen_a"],
+        }
+    ]
+
+
+def test_plan_history_validation_rejects_malformed_entry(
+    page_session: dict,
+) -> None:
+    from image2editable.component_contracts import (
+        validate_component_agent_request,
+    )
+
+    first = build_component_agent_request(page_session, repair_round=1)
+    request = json.loads(first.read_bytes())
+    request["plan_history"] = [
+        {
+            "repair_round": 1,
+            "actions": [{"action": "shrink", "object_ids": ["candidate_b"]}],
+            "failed_ids": ["candidate_b"],
+            "frozen_ids": [],
+        }
+    ]
+    with pytest.raises(ValueError, match="plan_history round"):
+        validate_component_agent_request(request)
+    request["plan_history"][0]["repair_round"] = 0
+    with pytest.raises(ValueError, match="plan_history"):
+        validate_component_agent_request(request)

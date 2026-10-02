@@ -650,7 +650,10 @@ def _validate_action_graph_roles(action: str, object_ids: list[str], graph: dict
 
 
 def validate_component_agent_request(request: object) -> dict:
-    if not isinstance(request, dict) or set(request) != _COMPONENT_AGENT_REQUEST_FIELDS:
+    if (
+        not isinstance(request, dict)
+        or set(request) - {"plan_history"} != _COMPONENT_AGENT_REQUEST_FIELDS
+    ):
         raise ValueError("component agent request fields are invalid")
     if type(request["schema_version"]) is not int or request["schema_version"] != 1:
         raise ValueError("component agent request schema_version is invalid")
@@ -728,6 +731,60 @@ def validate_component_agent_request(request: object) -> dict:
         }
         if not required <= set(review_evidence):
             raise ValueError("component agent request review_evidence is incomplete")
+    history = request.get("plan_history")
+    if history is not None:
+        if not isinstance(history, list):
+            raise ValueError("component agent request plan_history is invalid")
+        for entry in history:
+            if not isinstance(entry, dict) or set(entry) != {
+                "repair_round", "actions", "failed_ids", "frozen_ids",
+            }:
+                raise ValueError(
+                    "component agent request plan_history entry is invalid"
+                )
+            if (
+                type(entry["repair_round"]) is not int
+                or not 1 <= entry["repair_round"] < request["repair_round"]
+            ):
+                raise ValueError(
+                    "component agent request plan_history round is invalid"
+                )
+            if (
+                not isinstance(entry["actions"], list)
+                or any(
+                    not isinstance(action, dict)
+                    or set(action) != {"action", "object_ids"}
+                    or type(action["action"]) is not str
+                    or not action["action"]
+                    or not isinstance(action["object_ids"], list)
+                    or any(
+                        type(object_id) is not str or not object_id
+                        for object_id in action["object_ids"]
+                    )
+                    for action in entry["actions"]
+                )
+            ):
+                raise ValueError(
+                    "component agent request plan_history actions are invalid"
+                )
+            for field in ("failed_ids", "frozen_ids"):
+                if (
+                    not isinstance(entry[field], list)
+                    or any(
+                        type(value) is not str or not value
+                        for value in entry[field]
+                    )
+                    or entry[field] != sorted(set(entry[field]))
+                ):
+                    raise ValueError(
+                        "component agent request plan_history "
+                        f"{field} are invalid"
+                    )
+        rounds = [entry["repair_round"] for entry in history]
+        if rounds != sorted(set(rounds)):
+            raise ValueError(
+                "component agent request plan_history rounds are invalid"
+            )
     return request
 
 
