@@ -659,12 +659,21 @@ def _write_partial_warning_page(
     left[:, :8] = 255
     right = np.zeros((9, 16), dtype=np.uint8)
     right[:, 8:] = 255
+    text_left = np.zeros((9, 16), dtype=np.uint8)
+    text_left[2:6, 0:8] = 255
+    text_right = np.zeros((9, 16), dtype=np.uint8)
+    text_right[2:6, 9:15] = 255
+    text_dup = np.zeros((9, 16), dtype=np.uint8)
+    text_dup[2:6, 0:6] = 255
     mask_paths = {}
     for name, array in (
         ("component_0001", left),
         ("component_0002", right),
         ("parent_0001", left),
         ("parent_0002", right),
+        ("text_0001", text_left),
+        ("text_0002", text_right),
+        ("text_0003", text_dup),
     ):
         mask_path = masks / f"{name}.png"
         Image.fromarray(array).save(mask_path)
@@ -698,8 +707,13 @@ def _write_partial_warning_page(
                 "component_0002", "child", "parent_0002", "inactive",
                 [8, 0, 16, 9], 1,
             ),
+            _node("text_0001", "text", None, "frozen", [0, 2, 8, 6], 0),
+            _node("text_0002", "text", None, "pending", [9, 2, 15, 6], 1),
+            _node("text_0003", "text", None, "frozen", [0, 2, 6, 6], 0),
         ]
     }
+    graph["nodes"][1]["text_ids"] = ["text_0001", "text_0003"]
+    graph["nodes"][2]["text_ids"] = ["text_0002"]
     graph_path = pf_dir / "component-graph.json"
     graph_path.write_text(json.dumps(graph), encoding="utf-8")
     background = pf_dir / "background.png"
@@ -1127,7 +1141,9 @@ def test_load_hybrid_source_rejects_bad_ref(tmp_path: Path) -> None:
 # --- unit 3b: hybrid assembly + delivery reports ---------------------------
 
 
-def _prepared_page_fixture(store: RunStore, page_id: str) -> None:
+def _prepared_page_fixture(
+    store: RunStore, page_id: str, text_items: list | None = None
+) -> None:
     initial = store.root / "pages" / page_id / "reconstruction" / "initial"
     initial.mkdir(parents=True)
     prepared_source = initial / "source.png"
@@ -1162,7 +1178,7 @@ def _prepared_page_fixture(store: RunStore, page_id: str) -> None:
         "_resource_isolation": False,
         "_initial_diagnostics": [],
         "components": [],
-        "text_items": [{
+        "text_items": text_items if text_items is not None else [{
             "box": [0, 2, 8, 4],
             "text": "editable",
             "font_size": 10.0,
@@ -1248,6 +1264,7 @@ def _assembly_hybrid_store(
     page_kinds: list[str],
     *,
     slide_size: str = "16:9",
+    prepared_text_items: dict[str, list] | None = None,
 ) -> tuple[RunStore, dict, list[dict], Path]:
     store, manifest, details = _hybrid_store(tmp_path, page_kinds)
     output = tmp_path / "hybrid.pptx"
@@ -1256,7 +1273,11 @@ def _assembly_hybrid_store(
     store.write_json("job_manifest.json", manifest)
     for index, kind in enumerate(page_kinds, start=1):
         page_id = f"page_{index:03d}"
-        _prepared_page_fixture(store, page_id)
+        _prepared_page_fixture(
+            store,
+            page_id,
+            text_items=(prepared_text_items or {}).get(page_id),
+        )
         if kind == "ready":
             _write_accepted_page(store, page_id)
     return store, manifest, details, output
@@ -1267,7 +1288,46 @@ def test_hybrid_partial_delivery_keeps_layers_and_text(
 ) -> None:
     monkeypatch.setenv("IMAGE2EDITABLE_EMBED_FONTS", "0")
     store, manifest, details, output = _assembly_hybrid_store(
-        tmp_path, ["warning_partial"]
+        tmp_path,
+        ["warning_partial"],
+        # A second OCR item inside the degraded region must stay baked
+        # into the parent layer rather than double-print as native text.
+        prepared_text_items={
+            "page_001": [
+                {
+                    "box": [0, 2, 8, 4],
+                    "text": "editable",
+                    "font_size": 10.0,
+                    "color": "#000000",
+                    "bold": False,
+                    "font": "Arial",
+                    "align": 1,
+                    "confidence": 1.0,
+                },
+                {
+                    "box": [9, 2, 5, 4],
+                    "text": "baked",
+                    "font_size": 10.0,
+                    "color": "#000000",
+                    "bold": False,
+                    "font": "Arial",
+                    "align": 1,
+                    "confidence": 1.0,
+                },
+                # Truncated OCR duplicate of "editable": frozen-backed
+                # but almost fully contained in the longer item.
+                {
+                    "box": [0, 2, 5, 4],
+                    "text": "editab",
+                    "font_size": 10.0,
+                    "color": "#000000",
+                    "bold": False,
+                    "font": "Arial",
+                    "align": 1,
+                    "confidence": 1.0,
+                },
+            ]
+        },
     )
     plan = route_c.build_hybrid_delivery(store, manifest)
     row = plan["pages"][0]
@@ -1289,7 +1349,7 @@ def test_hybrid_partial_delivery_keeps_layers_and_text(
     ]
     # 2 component layers (frozen + degraded) plus background picture.
     assert len(pictures) == 3
-    assert len(texts) == 1
+    assert [shape.text_frame.text for shape in texts] == ["editable"]
     report = json.loads(
         output.with_suffix(".delivery-report.json").read_text(
             encoding="utf-8"

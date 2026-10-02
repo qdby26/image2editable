@@ -65,6 +65,9 @@ Per output variant (`<stem>_<variant>.pptx`), a sibling
 Partial delivery caveat: failed components ship through their fallback
 layers — collapsed children are re-presented by the preserved parent
 layer, which carries the source pixels for the whole collapsed region.
+Native text is emitted only for text nodes frozen by the gate; text
+that stayed baked into a fallback layer is not duplicated on top, so a
+degraded caption keeps its source pixels instead of being editable.
 The residual defect the gate rejected (typically a thin edge halo) is
 still present, and moving a degraded component can reveal it.
 `editable_component_ids` names frozen component layers;

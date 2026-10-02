@@ -5426,6 +5426,65 @@ def _hybrid_partial_slide_data(
     degraded_ids = {
         node["id"] for node in active_nodes if node["id"] not in frozen_ids
     }
+    # Only frozen text nodes had their pixels lifted out of the shipped
+    # layers; emitting any other OCR item natively would double-print it
+    # over its baked-in copy inside a degraded layer. prepared text items
+    # resolve to graph text ids via _component_text_records (the same
+    # normalization the reconstruction used).
+    frozen_text_ids = {
+        node["id"] for node in graph["nodes"]
+        if node["kind"] == "text" and node["state"] == "frozen"
+    }
+
+    def _native_text_items() -> list:
+        items = prepared.get("text_items", [])
+        try:
+            records = _component_text_records(items, page_size)
+        except ValueError:
+            return []
+        emitted = [
+            record["raw"] for record in records
+            if record["normalized"]["id"] in frozen_text_ids
+        ]
+        # Warning pages skip the repair loop's text review, so an OCR
+        # duplicate (a truncated near-copy of a longer item) can reach
+        # the deck as a second overlapping box. Drop the shorter of two
+        # heavily overlapping emitted items.
+        def _is_truncated_duplicate(item_index: int) -> bool:
+            box = emitted[item_index].get("box")
+            if not isinstance(box, list) or len(box) != 4:
+                return False
+            area = box[2] * box[3]
+            if area <= 0:
+                return False
+            text = str(emitted[item_index].get("text") or "")
+            for other_index, other in enumerate(emitted):
+                if other_index == item_index:
+                    continue
+                other_box = other.get("box")
+                if not isinstance(other_box, list) or len(other_box) != 4:
+                    continue
+                overlap = max(
+                    0.0, min(box[0] + box[2], other_box[0] + other_box[2])
+                    - max(box[0], other_box[0])
+                ) * max(
+                    0.0, min(box[1] + box[3], other_box[1] + other_box[3])
+                    - max(box[1], other_box[1])
+                )
+                if overlap / area < 0.55:
+                    continue
+                other_text = str(other.get("text") or "")
+                if len(other_text) > len(text) or (
+                    len(other_text) == len(text)
+                    and other_index < item_index
+                ):
+                    return True
+            return False
+
+        return [
+            item for index, item in enumerate(emitted)
+            if not _is_truncated_duplicate(index)
+        ]
     source_payload = source.read_bytes()
     background_path, _ = _load_legacy_ref(
         store, input_refs["background"]
@@ -5499,7 +5558,7 @@ def _hybrid_partial_slide_data(
         ]
         return {
             **prepared,
-            "text_items": prepared.get("text_items", []),
+            "text_items": _native_text_items(),
             "background_path": str(background_path),
             "background_original_path": str(background_path),
             "background_widescreen_path": str(background_path),

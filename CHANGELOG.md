@@ -4,7 +4,7 @@
 
 ## [Unreleased]
 
-- `failure_policy="hybrid"` 的保底页升级为**组件级软降级**：质量修复耗尽的页若仍持有绑定的 fallback 资产（组件图、呈现层、重建背景），交付为部分可编辑页——冻结组件保留可编辑图层＋原生文字，失败组件经 fallback 图的保留 parent 层原样放回并在报告中标记 degraded；资产缺失或组件内容已整体丢弃时才退回整页压平。降级页仍生成 Route A 交接请求，报告新增 `editable_component_ids`/`degraded_component_ids` 字段。
+- `failure_policy="hybrid"` 的保底页升级为**组件级软降级**：质量修复耗尽的页若仍持有绑定的 fallback 资产（组件图、呈现层、重建背景），交付为部分可编辑页——冻结组件保留可编辑图层＋原生文字，失败组件经 fallback 图的保留 parent 层原样放回并在报告中标记 degraded；资产缺失或组件内容已整体丢弃时才退回整页压平。原生文字仅发射质量门冻结的文本节点，烤进降级层的文字不再叠印。降级页仍生成 Route A 交接请求，报告新增 `editable_component_ids`/`degraded_component_ids` 字段。
 - 新增 Route C 页级回填接口 `image2editable.route_c_resolve`：校验 `awaiting_host` 交接请求及其绑定的源图／质量报告哈希，按输入页序定位整页保底图片，把已验收的 Route A 单页 donor（仅原生形状／显式样式／本地图片关系，拒绝图表、组、外链、嵌入字体）替换进新副本，验证其余部件逐字节保留并输出 resolution 审计 JSON，不改动原稿、不覆盖已有产物、不自动调用生图。
 - 基准语料统一至 `benchmarks/corpus/` 与 `benchmarks/release/`；Skill 通过部分克隆和文件清单仅获取运行所需源码，跳过基准、测试、演示图片和开发发布工具。
 
