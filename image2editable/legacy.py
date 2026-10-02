@@ -799,20 +799,7 @@ def _record_deterministic_fast_plan(
         object_id for object_id in request["candidate_ids"]
         if object_id not in absorbed_ids
     ]
-    actions = [
-        {
-            "action": "discard" if object_id in absorbed_ids else "accept",
-            "object_ids": [object_id],
-            "parameters": (
-                {"preserve_mask": True}
-                if strict_escalation and object_id not in absorbed_ids
-                else {}
-            ),
-            "confidence": 1.0,
-            "evidence": ["deterministic page route"],
-        }
-        for object_id in request["candidate_ids"]
-    ]
+    residual_ids: set[str] = set()
     quality_ref = request.get("evidence", {}).get("quality-report.json")
     if request["repair_round"] > 1 and quality_ref is not None:
         from image2editable.component_repair import _page_residual_owner_ids
@@ -828,11 +815,49 @@ def _record_deterministic_fast_plan(
                 store, quality=previous_quality, graph=repair_graph,
                 graph_root=request_path.parent,
             )
-            actions.extend({
-                "action": "absorb_residual", "object_ids": [object_id],
-                "parameters": {}, "confidence": 1.0,
-                "evidence": ["signed residual adjacent to component"],
-            } for object_id in sorted(residual_ids))
+    # After two rounds of the default accept/rebuild vocabulary, surviving
+    # candidates get a one-shot edge erosion instead of repeating the same
+    # normalized plan forever (residual owners keep their absorb path).
+    escalate = request["repair_round"] >= 3
+    text_candidate_ids = {
+        node["id"] for node in graph["nodes"]
+        if node.get("id") in request["candidate_ids"]
+        and node.get("kind") == "text"
+    }
+    actions = []
+    for object_id in request["candidate_ids"]:
+        absorbed = object_id in absorbed_ids
+        shrink = (
+            escalate
+            and not absorbed
+            and object_id not in residual_ids
+            and object_id not in text_candidate_ids
+        )
+        actions.append({
+            "action": (
+                "discard" if absorbed else "shrink" if shrink else "accept"
+            ),
+            "object_ids": [object_id],
+            "parameters": (
+                {"margin_ratio": 0.005}
+                if shrink
+                else {"preserve_mask": True}
+                if strict_escalation and not absorbed
+                else {}
+            ),
+            "confidence": 1.0,
+            "evidence": [
+                "deterministic page route"
+                if not shrink
+                else "deterministic edge escalation after stalled rounds"
+            ],
+        })
+    if residual_ids:
+        actions.extend({
+            "action": "absorb_residual", "object_ids": [object_id],
+            "parameters": {}, "confidence": 1.0,
+            "evidence": ["signed residual adjacent to component"],
+        } for object_id in sorted(residual_ids))
     if active_candidate_ids:
         actions.append({
             "action": "rebuild_background",

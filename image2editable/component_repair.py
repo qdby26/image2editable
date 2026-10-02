@@ -2885,24 +2885,28 @@ def _host_plan_history(
     can see which actions were already tried on the same evidence and
     what the outcome was. Later rounds otherwise receive byte-identical
     inputs, which invites the same normalized plan again."""
-    prefix = f"host-component-plan-{page_id}-"
     run_root = reconstruction.parent.parent.parent
     by_round: dict[int, Path] = {}
-    for candidate in run_root.glob(f"{prefix}*.json"):
-        if not candidate.is_file():
-            continue
-        stem = candidate.name[len(prefix):-len(".json")]
-        round_token = stem.split("-", 1)[0]
-        if not round_token.isdigit():
-            continue
-        round_number = int(round_token)
-        if not 1 <= round_number < repair_round:
-            continue
-        existing = by_round.get(round_number)
-        if existing is None or (
-            candidate.stat().st_mtime > existing.stat().st_mtime
-        ):
-            by_round[round_number] = candidate
+    sources = (
+        (run_root, f"host-component-plan-{page_id}-"),
+        (reconstruction, f"deterministic-component-plan-{page_id}-"),
+    )
+    for base, prefix in sources:
+        for candidate in base.glob(f"{prefix}*.json"):
+            if not candidate.is_file():
+                continue
+            stem = candidate.name[len(prefix):-len(".json")]
+            round_token = stem.split("-", 1)[0]
+            if not round_token.isdigit():
+                continue
+            round_number = int(round_token)
+            if not 1 <= round_number < repair_round:
+                continue
+            existing = by_round.get(round_number)
+            if existing is None or (
+                candidate.stat().st_mtime > existing.stat().st_mtime
+            ):
+                by_round[round_number] = candidate
     outcomes: dict[int, tuple[list[str], list[str]]] = {}
     try:
         state = json.loads(

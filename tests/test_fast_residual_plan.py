@@ -81,3 +81,69 @@ def test_fast_plan_repairs_signed_residual_instead_of_only_accepting(tmp_path, m
 
     repairs = [action for action in captured["actions"] if action["action"] == "absorb_residual"]
     assert [action["object_ids"] for action in repairs] == [["visual"]]
+
+
+def test_fast_plan_escalates_stalled_candidates_to_shrink(tmp_path, monkeypatch):
+    """From round 3 the deterministic planner erodes still-pending visual
+    candidates' edges instead of re-emitting the identical accept plan."""
+    reconstruction = tmp_path / "pages/page_001/reconstruction"
+    reconstruction.mkdir(parents=True)
+    mask = np.zeros((30, 40), dtype=np.uint8)
+    mask[8:22, 10:25] = 255
+    mask_path = reconstruction / "visual.png"
+    Image.fromarray(mask).save(mask_path)
+
+    def ref(path):
+        return {
+            "path": path.relative_to(tmp_path).as_posix(),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+
+    graph = {"nodes": [
+        {"id": "visual", "kind": "parent", "state": "pending",
+         "bbox": [10, 8, 25, 22], "z_index": 0, "mask": mask_path.name,
+         "mask_sha256": ref(mask_path)["sha256"], "text_ids": [],
+         "parent_id": None},
+        {"id": "caption", "kind": "text", "state": "pending",
+         "bbox": [10, 8, 25, 22], "z_index": 1, "mask": mask_path.name,
+         "mask_sha256": ref(mask_path)["sha256"], "text_ids": ["t1"],
+         "parent_id": None},
+    ]}
+    monkeypatch.setattr(legacy, "advance_component_repair", lambda *a, **kw: {})
+    monkeypatch.setattr(component_repair, "load_component_agent_graph", lambda path: graph)
+    monkeypatch.setattr(host_agent, "_request_sha256", lambda request: "a" * 64)
+    monkeypatch.setattr(host_agent, "_record_plan_reference", lambda *a, **kw: None)
+    captured = {}
+    monkeypatch.setattr(
+        component_contracts, "validate_component_plan",
+        lambda plan, **kw: captured.update(plan),
+    )
+
+    def plan_actions(repair_round):
+        request = {
+            "repair_round": repair_round,
+            "candidate_ids": ["caption", "visual"],
+            "evidence": {},
+        }
+        monkeypatch.setattr(
+            component_repair, "load_component_agent_request",
+            lambda path: request,
+        )
+        captured.clear()
+        legacy._record_deterministic_fast_plan(
+            RunStore(tmp_path), "page_001", reconstruction / "request.json",
+            reconstruction, _lease=object(),
+        )
+        return {a["action"]: a for a in captured["actions"]}
+
+    round2 = plan_actions(2)
+    assert set(round2) == {"accept", "rebuild_background"}
+
+    round3 = plan_actions(3)
+    # The still-pending visual candidate gets a one-shot edge erosion;
+    # the text candidate keeps the default accept.
+    shrink = [a for a in captured["actions"] if a["action"] == "shrink"]
+    assert [a["object_ids"] for a in shrink] == [["visual"]]
+    assert shrink[0]["parameters"] == {"margin_ratio": 0.005}
+    accept = [a for a in captured["actions"] if a["action"] == "accept"]
+    assert [a["object_ids"] for a in accept] == [["caption"]]

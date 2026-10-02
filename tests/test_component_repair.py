@@ -7911,10 +7911,26 @@ def test_round_request_carries_prior_plan_history(page_session: dict, tmp_path: 
             }
         ],
     }
-    (tmp_path / "host-component-plan-page_001-01-aa11bb22.json").write_text(
+    # Deterministic fast-mode plans live inside the reconstruction dir;
+    # interactive host plans live at the run root — both are harvested.
+    reconstruction = Path(page_session["reconstruction_dir"])
+    (reconstruction / "deterministic-component-plan-page_001-01-aa11bb22.json").write_text(
         json.dumps(plan), encoding="utf-8"
     )
-    reconstruction = Path(page_session["reconstruction_dir"])
+    host_plan = dict(plan)
+    host_plan["repair_round"] = 2
+    host_plan["actions"] = [
+        {
+            "action": "expand",
+            "object_ids": ["candidate_b"],
+            "parameters": {"margin_ratio": 0.02},
+            "confidence": 0.9,
+            "evidence": [],
+        }
+    ]
+    (tmp_path / "host-component-plan-page_001-02-cafebabe.json").write_text(
+        json.dumps(host_plan), encoding="utf-8"
+    )
     (reconstruction / "component_state.json").write_text(
         json.dumps(
             {
@@ -7927,14 +7943,23 @@ def test_round_request_carries_prior_plan_history(page_session: dict, tmp_path: 
                         "quality_sha256": "3" * 64,
                         "failed_ids": ["candidate_b"],
                         "frozen_ids": ["frozen_a"],
-                    }
+                    },
+                    {
+                        "round": 2,
+                        "plan_sha256": "4" * 64,
+                        "normalized_plan_sha256": "5" * 64,
+                        "execution_sha256": "6" * 64,
+                        "quality_sha256": "7" * 64,
+                        "failed_ids": [],
+                        "frozen_ids": ["candidate_b", "frozen_a"],
+                    },
                 ]
             }
         ),
         encoding="utf-8",
     )
-    second = build_component_agent_request(page_session, repair_round=2)
-    request = json.loads(second.read_bytes())
+    third = build_component_agent_request(page_session, repair_round=3)
+    request = json.loads(third.read_bytes())
     assert request["plan_history"] == [
         {
             "repair_round": 1,
@@ -7943,7 +7968,15 @@ def test_round_request_carries_prior_plan_history(page_session: dict, tmp_path: 
             ],
             "failed_ids": ["candidate_b"],
             "frozen_ids": ["frozen_a"],
-        }
+        },
+        {
+            "repair_round": 2,
+            "actions": [
+                {"action": "expand", "object_ids": ["candidate_b"]}
+            ],
+            "failed_ids": [],
+            "frozen_ids": ["candidate_b", "frozen_a"],
+        },
     ]
 
 

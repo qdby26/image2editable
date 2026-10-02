@@ -6,7 +6,8 @@
 
 - `failure_policy="hybrid"` 的保底页升级为**组件级软降级**：质量修复耗尽的页若仍持有绑定的 fallback 资产（组件图、呈现层、重建背景），交付为部分可编辑页——冻结组件保留可编辑图层＋原生文字，失败组件经 fallback 图的保留 parent 层原样放回并在报告中标记 degraded；资产缺失或组件内容已整体丢弃时才退回整页压平。原生文字仅发射质量门冻结的文本节点，烤进降级层的文字不再叠印。降级页仍生成 Route A 交接请求，报告新增 `editable_component_ids`/`degraded_component_ids` 字段。
 - 新增 Route C 页级回填接口 `image2editable.route_c_resolve`：校验 `awaiting_host` 交接请求及其绑定的源图／质量报告哈希，按输入页序定位目标页并自动分流——恰一张整页图的保底页原地替换该图片，partial 等其余页经 `replace_slide_content` 整页替换为已验收的 Route A 单页 donor（仅原生形状／显式样式／本地图片关系，拒绝图表、组、外链、嵌入字体；渐变色仅当全部停点为显式 srgbClr 时放行），验证其余部件逐字节保留并输出 resolution 审计 JSON，不改动原稿、不覆盖已有产物、不自动调用生图。另支持 `--background` 对 partial 页单独替换背景图（新增 media 部件并重指关系，slide XML 与其余部件逐字节不变），请求仍保持 `awaiting_host`。
-- 组件修复请求新增 `plan_history` 字段：每轮请求回采前几轮已记录的宿主方案（动作＋对象＋执行后失败/冻结清单），让宿主 Agent 看到已尝试动作及其结果，避免在相同证据上重复相同归一化方案而触发 `repeated_plan` 停机。
+- 组件修复请求新增 `plan_history` 字段：每轮请求回采前几轮已记录的方案（宿主方案与 fast 模式确定性方案均纳入；含动作＋对象＋执行后失败/冻结清单），让修复方看到已尝试动作及其结果，避免在相同证据上重复相同归一化方案而触发 `repeated_plan` 停机。
+- Fast 模式确定性修复计划增加轮次升级：第 3 轮起，仍未收敛的候选组件改发 `shrink` 边缘侵蚀（margin_ratio 0.005）替代重复 `accept`，配合同轮 `rebuild_background` 回收释放像素——专治 `duplicate_pixels`/`alpha_halo` 这类边缘违规导致的确定性死锁；residual owner 继续走 `accept`+`absorb_residual`，文本节点不受影响。
 - 基准语料统一至 `benchmarks/corpus/` 与 `benchmarks/release/`；Skill 通过部分克隆和文件清单仅获取运行所需源码，跳过基准、测试、演示图片和开发发布工具。
 
 - 仅安装转换 Skill 时也自动准备项目 Runtime、依赖、OCR 和模型；Windows 新安装优先 D 盘及其他非 C 本地磁盘，macOS/Linux 优先其他已挂载本地磁盘，统一下载缓存和临时目录并复用已有环境。
