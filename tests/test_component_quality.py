@@ -3425,3 +3425,88 @@ def test_extended_bright_page_element_is_not_alpha_residue() -> None:
         page_checks={"protected_native_overlap": "pass"}, _page_context=context,
     )
     assert report["metrics"]["exterior_alpha_pixels"] == 0
+
+
+def _shadow_claim_case(defect: str = "duplicate_shadow") -> dict:
+    case = _synthetic_quality_case(defect=defect)
+    # The mask used by the gate fixture already contains the shadow band;
+    # the claim probes the pre-repair support, which does not.
+    support = np.zeros(case["component_mask"].shape, dtype=bool)
+    support[12:36, 16:48] = True
+    case["support"] = support
+    case["calibration"] = calibrate_page(case["source"], case["text_mask"])
+    case["foreign"] = np.zeros(support.shape, dtype=bool)
+    return case
+
+
+def test_exterior_shadow_claim_returns_confined_mass() -> None:
+    case = _shadow_claim_case()
+    claim = component_quality.exterior_shadow_claim(
+        case["support"], case["source"], case["background"],
+        case["foreign"], case["calibration"],
+    )
+    assert np.any(claim)
+    assert not np.any(claim & case["support"])
+    # The whole 4-px shadow band is claimable, not only the 1-px ring.
+    assert np.all(claim[36:40, 18:46])
+
+
+def test_exterior_shadow_claim_never_takes_foreign_pixels() -> None:
+    case = _shadow_claim_case()
+    case["foreign"][37:39, 20:44] = True
+    claim = component_quality.exterior_shadow_claim(
+        case["support"], case["source"], case["background"],
+        case["foreign"], case["calibration"],
+    )
+    assert not np.any(claim & case["foreign"])
+    assert np.any(claim)
+
+
+def test_exterior_shadow_claim_rejects_ambiguous_adjacency() -> None:
+    case = _shadow_claim_case()
+    # A second component mask directly beside the band makes every seed
+    # pixel ambiguous (its adjacency ring overlaps the band).
+    case["foreign"][37:39, 18:46] = True
+    claim = component_quality.exterior_shadow_claim(
+        case["support"], case["source"], case["background"],
+        case["foreign"], case["calibration"],
+    )
+    assert not np.any(claim)
+
+
+def test_exterior_shadow_claim_ignores_unconfined_marks() -> None:
+    case = _shadow_claim_case()
+    # A dark stripe continuing far past the component's vicinity is an
+    # independent page element, not its shadow.  Keep it disconnected
+    # from the shadow band so confinement can tell them apart.
+    case["source"][10:, 52:54] = 55
+    case["background"][10:, 52:54] = 55
+    claim = component_quality.exterior_shadow_claim(
+        case["support"], case["source"], case["background"],
+        case["foreign"], case["calibration"],
+    )
+    assert np.all(claim[36:40, 18:46])
+    assert not np.any(claim[:, 52:54])
+
+
+def test_exterior_shadow_claim_ignores_repaired_background() -> None:
+    case = _shadow_claim_case()
+    # Background no longer carries the shadow -> nothing to steal back.
+    case["background"][36:40, 18:46] = 96
+    claim = component_quality.exterior_shadow_claim(
+        case["support"], case["source"], case["background"],
+        case["foreign"], case["calibration"],
+    )
+    assert not np.any(claim)
+
+
+def test_exterior_shadow_claim_ignores_bright_residue() -> None:
+    # Symmetric guard: bright halo residue is not a shadow.
+    case = _shadow_claim_case()
+    case["source"][36:40, 18:46] = 220
+    case["background"][36:40, 18:46] = 220
+    claim = component_quality.exterior_shadow_claim(
+        case["support"], case["source"], case["background"],
+        case["foreign"], case["calibration"],
+    )
+    assert not np.any(claim)

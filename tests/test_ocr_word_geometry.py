@@ -6,9 +6,16 @@ from types import SimpleNamespace
 
 import numpy as np
 from PIL import Image
+import importlib.util
+
 import pytest
 
 from scripts import ocr_worker, text_detect
+
+requires_paddlex = pytest.mark.skipif(
+    importlib.util.find_spec("paddlex") is None,
+    reason="paddlex is only installed in the runtime environment",
+)
 
 
 POLY = [[10, 10], [210, 10], [210, 50], [10, 50]]
@@ -34,6 +41,7 @@ def test_direct_ocr_requests_and_normalizes_words(monkeypatch):
 
 
 @pytest.mark.parametrize("mode", ["split", "batch", "resident"])
+@requires_paddlex
 def test_worker_words_survive_each_execution_mode(tmp_path, monkeypatch, mode):
     source = tmp_path / "source.png"
     Image.new("RGB", (240, 60), "white").save(source)
@@ -162,6 +170,7 @@ def test_positioned_styles_are_not_destroyed_by_plain_ocr_merge(styled_side):
     assert text_detect._merge_adjacent_text_items([left, right]) == [left, right]
 
 
+@requires_paddlex
 def test_worker_rejects_cross_group_column_reordering():
     result = {"rec_text": ("AB", [20, [["A"], ["B"]], [[15], [2]], ["en&num", "en&num"]]), "rec_score": 0.99}
     assert "words" not in ocr_worker._recognition_item(result, POLY)
@@ -172,6 +181,7 @@ def test_word_boxes_clip_only_small_rounding_overflow():
     assert result == [{"text": "A", "box": [0, 0, 1, 1]}]
 
 
+@requires_paddlex
 def test_worker_uses_same_minimum_rectangle_as_cropper():
     from paddlex.inference.pipelines.components import CropByPolys
 
@@ -192,6 +202,7 @@ def test_direct_rejects_regions_in_reversed_reading_order():
     assert text_detect._words_from_polys("AB", ["A", "B"], regions, [10, 10, 300, 40]) == []
 
 
+@requires_paddlex
 def test_vertical_worker_word_positions_follow_rotated_crop():
     result = {"rec_text": ("AB", [20, [["A"], ["B"]], [[2], [15]], ["en&num", "en&num"]]), "rec_score": .99}
     words = ocr_worker._recognition_item(result, [[10, 10], [50, 10], [50, 210], [10, 210]])["words"]

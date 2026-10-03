@@ -884,6 +884,84 @@ def component_metrics(
     }
 
 
+def exterior_shadow_claim(
+    support: np.ndarray,
+    source_rgb: np.ndarray,
+    background_rgb: np.ndarray,
+    foreign_mask: np.ndarray,
+    calibration: PageCalibration,
+    *,
+    active_foreign_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    """Pixels of this component's own soft shadow sitting outside its mask.
+
+    Mirrors the ``duplicate_shadow`` gate evidence: an exterior band is the
+    component's shadow when the background still matches the source there,
+    the pixels are darker than the local baseline, the dark mass is confined
+    to the component's vicinity, and nothing else owns the pixels.  Unlike
+    the gate (which counts the 1-px band only), this returns the whole
+    confined mass so a degraded layer can claim its shadow outright.
+    ``foreign_mask`` must cover every other node's mask (visual and text,
+    any state); those pixels are never claimed.  ``active_foreign_mask``
+    restricts ambiguity to still-active competitors: the adjacency ring of
+    a discarded node must not veto a claim, though its pixels stay foreign.
+    """
+    hard_tolerance = 3.0
+    support = np.asarray(support, dtype=bool)
+    foreign = np.asarray(foreign_mask, dtype=bool)
+    active_foreign = (
+        foreign if active_foreign_mask is None
+        else np.asarray(active_foreign_mask, dtype=bool)
+    )
+    radius = calibration.edge_width_px
+    far_radius = max(4, radius * 4)
+    far_kernel = np.ones((2 * far_radius + 1, 2 * far_radius + 1), dtype=np.uint8)
+    far = (cv2.dilate(support.astype(np.uint8), far_kernel) > 0) & ~support
+    baseline_pixels = np.asarray(background_rgb)[far]
+    if baseline_pixels.size == 0:
+        baseline_pixels = np.asarray(background_rgb).reshape(-1, 3)
+    baseline = np.median(baseline_pixels.astype(np.float32), axis=0)
+    baseline_luma = float(cv2.cvtColor(
+        np.asarray([[baseline]], dtype=np.uint8), cv2.COLOR_RGB2GRAY
+    )[0, 0])
+    source_luma = cv2.cvtColor(
+        np.asarray(source_rgb, dtype=np.uint8), cv2.COLOR_RGB2GRAY
+    ).astype(np.float32)
+    unchanged = (
+        np.max(
+            np.abs(
+                np.asarray(source_rgb, dtype=np.int16)
+                - np.asarray(background_rgb, dtype=np.int16)
+            ),
+            axis=2,
+        )
+        <= hard_tolerance
+    )
+    darker = source_luma < baseline_luma - 6.0
+    adjacent = cv2.dilate(support.astype(np.uint8), np.ones((3, 3), dtype=np.uint8)) > 0
+    adjacent &= ~support
+    # A band pixel also touching another component's adjacency ring has
+    # ambiguous ownership (the gate files it as orphan residual, not this
+    # component's shadow); never start a claim from it.
+    foreign_halo = cv2.dilate(
+        active_foreign.astype(np.uint8), np.ones((3, 3), dtype=np.uint8)
+    ) > 0
+    seeds = adjacent & unchanged & darker & ~foreign & ~foreign_halo
+    if not np.any(seeds):
+        return np.zeros(support.shape, dtype=bool)
+    signature = unchanged & darker & ~support & ~foreign
+    count, labels = cv2.connectedComponents(signature.astype(np.uint8), 8)
+    claim = np.zeros(support.shape, dtype=bool)
+    for value in np.unique(labels[seeds]):
+        if value == 0:
+            continue
+        mass = labels == value
+        if np.any(mass & ~far):
+            continue
+        claim |= mass
+    return claim
+
+
 def evaluate_component(
     source: np.ndarray,
     background: np.ndarray,

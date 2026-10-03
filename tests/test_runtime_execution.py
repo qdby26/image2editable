@@ -13082,3 +13082,200 @@ def test_convert_accepts_one_path_directly(
 
     assert summary["status"] == "completed"
     assert summary["pages"] == 1
+
+
+def test_parent_fallback_claims_confined_exterior_shadow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A degraded parent's own soft shadow is claimed into its mask."""
+    import numpy as np
+
+    run_dir = tmp_path / "run"
+    page_dir = run_dir / "pages/page_001"
+    graph_dir = page_dir / "reconstruction/execution-05"
+    (graph_dir / "masks").mkdir(parents=True)
+    store = RunStore(run_dir)
+
+    shape = (48, 64)
+    source_pixels = np.full((*shape, 3), 96, dtype=np.uint8)
+    support = np.zeros(shape, dtype=bool)
+    support[12:36, 16:48] = True
+    source_pixels[support] = 186
+    shadow = np.zeros(shape, dtype=bool)
+    shadow[36:40, 18:46] = True
+    source_pixels[shadow] = 55
+    source = page_dir / "source.png"
+    Image.fromarray(source_pixels).save(source)
+    background = graph_dir / "background.png"
+    Image.fromarray(source_pixels).save(background)
+
+    def reference(path: Path) -> dict[str, str]:
+        return {
+            "path": path.relative_to(run_dir).as_posix(),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+
+    store.write_json("pages/page_001/page_request.json", {
+        "schema_version": 1,
+        "source": "pages/page_001/source.png",
+        "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+    })
+    mask = graph_dir / "masks/parent_0001.png"
+    Image.fromarray(np.where(support, 255, 0).astype(np.uint8)).save(mask)
+    graph_path = graph_dir / "component-graph.json"
+    graph_path.write_text(json.dumps({"nodes": [{
+        "id": "parent_0001", "kind": "parent", "parent_id": None,
+        "mask": "masks/parent_0001.png",
+        "mask_sha256": hashlib.sha256(mask.read_bytes()).hexdigest(),
+        "bbox": [16, 12, 48, 36], "state": "pending_gate",
+        "z_index": 0, "text_ids": [],
+    }, {
+        # The discarded child shares the parent's silhouette; its pixels
+        # remain background content (containment) but its adjacency ring
+        # must not veto the parent's shadow claim.
+        "id": "component_0001", "kind": "parent", "parent_id": None,
+        "mask": "masks/parent_0001.png",
+        "mask_sha256": hashlib.sha256(mask.read_bytes()).hexdigest(),
+        "bbox": [16, 12, 48, 36], "state": "inactive",
+        "z_index": 0, "text_ids": [],
+    }]}), encoding="utf-8")
+    quality = graph_dir / "quality-report.json"
+    quality.write_text(json.dumps({"input_refs": {
+        "background": reference(background),
+    }}), encoding="utf-8")
+    store.write_json(
+        "pages/page_001/reconstruction/component_state.json",
+        {
+            "repair_round": 5,
+            "graph_ref": reference(graph_path),
+            "current_round": {"quality_ref": reference(quality)},
+            "fallback": {"parent_ids": ["parent_0001"]},
+            "failed_ids": ["component_0001", "parent_0001"],
+            "parent_assets": {"parent_0001": reference(mask)},
+            "frozen": {},
+        },
+    )
+
+    def execute(pixels, graph, actions, **kwargs):
+        output_dir = kwargs["output_dir"]
+        (output_dir / "masks").mkdir(parents=True)
+        shutil.copy2(mask, output_dir / "masks/parent_0001.png")
+        return copy.deepcopy(graph)
+
+    captured = {}
+    monkeypatch.setattr(legacy, "execute_component_action_round", execute)
+    monkeypatch.setattr(legacy, "_ensure_component_disk_reserve", lambda *a, **k: None)
+    monkeypatch.setattr(
+        legacy, "_quality_assets",
+        lambda *a, **k: captured.update(k) or {},
+    )
+    monkeypatch.setattr(
+        legacy, "record_parent_fallback_execution", lambda *a, **k: None
+    )
+
+    legacy._execute_legacy_parent_fallback(store, "page_001", object())
+
+    output_dir = next(
+        (page_dir / "reconstruction").glob("pf-*/component-graph.json")
+    ).parent
+    grown = np.asarray(
+        Image.open(output_dir / "masks/parent_0001.png").convert("L")
+    ) > 0
+    assert np.all(grown[shadow])
+    rebuilt = output_dir / "background-rebuilt.png"
+    assert rebuilt.is_file()
+    rebuilt_pixels = np.asarray(Image.open(rebuilt).convert("RGB"))
+    assert not np.any(rebuilt_pixels[shadow] == 55)
+    assert captured.get("background_rebuilt") is True
+
+
+def test_parent_fallback_without_shadow_leaves_background(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No confined shadow -> no claim, no rebuilt background."""
+    import numpy as np
+
+    run_dir = tmp_path / "run"
+    page_dir = run_dir / "pages/page_001"
+    graph_dir = page_dir / "reconstruction/execution-05"
+    (graph_dir / "masks").mkdir(parents=True)
+    store = RunStore(run_dir)
+
+    shape = (48, 64)
+    source_pixels = np.full((*shape, 3), 96, dtype=np.uint8)
+    support = np.zeros(shape, dtype=bool)
+    support[12:36, 16:48] = True
+    source_pixels[support] = 186
+    source = page_dir / "source.png"
+    Image.fromarray(source_pixels).save(source)
+    background = graph_dir / "background.png"
+    Image.fromarray(source_pixels).save(background)
+
+    def reference(path: Path) -> dict[str, str]:
+        return {
+            "path": path.relative_to(run_dir).as_posix(),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+
+    store.write_json("pages/page_001/page_request.json", {
+        "schema_version": 1,
+        "source": "pages/page_001/source.png",
+        "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+    })
+    mask = graph_dir / "masks/parent_0001.png"
+    Image.fromarray(np.where(support, 255, 0).astype(np.uint8)).save(mask)
+    graph_path = graph_dir / "component-graph.json"
+    graph_path.write_text(json.dumps({"nodes": [{
+        "id": "parent_0001", "kind": "parent", "parent_id": None,
+        "mask": "masks/parent_0001.png",
+        "mask_sha256": hashlib.sha256(mask.read_bytes()).hexdigest(),
+        "bbox": [16, 12, 48, 36], "state": "pending_gate",
+        "z_index": 0, "text_ids": [],
+    }]}), encoding="utf-8")
+    quality = graph_dir / "quality-report.json"
+    quality.write_text(json.dumps({"input_refs": {
+        "background": reference(background),
+    }}), encoding="utf-8")
+    store.write_json(
+        "pages/page_001/reconstruction/component_state.json",
+        {
+            "repair_round": 5,
+            "graph_ref": reference(graph_path),
+            "current_round": {"quality_ref": reference(quality)},
+            "fallback": {"parent_ids": ["parent_0001"]},
+            "failed_ids": ["parent_0001"],
+            "parent_assets": {"parent_0001": reference(mask)},
+            "frozen": {},
+        },
+    )
+
+    def execute(pixels, graph, actions, **kwargs):
+        output_dir = kwargs["output_dir"]
+        (output_dir / "masks").mkdir(parents=True)
+        shutil.copy2(mask, output_dir / "masks/parent_0001.png")
+        return copy.deepcopy(graph)
+
+    captured = {}
+    monkeypatch.setattr(legacy, "execute_component_action_round", execute)
+    monkeypatch.setattr(legacy, "_ensure_component_disk_reserve", lambda *a, **k: None)
+    monkeypatch.setattr(
+        legacy, "_quality_assets",
+        lambda *a, **k: captured.update(k) or {},
+    )
+    monkeypatch.setattr(
+        legacy, "record_parent_fallback_execution", lambda *a, **k: None
+    )
+
+    legacy._execute_legacy_parent_fallback(store, "page_001", object())
+
+    output_dir = next(
+        (page_dir / "reconstruction").glob("pf-*/component-graph.json")
+    ).parent
+    grown = np.asarray(
+        Image.open(output_dir / "masks/parent_0001.png").convert("L")
+    ) > 0
+    assert not np.any(grown & ~support)
+    assert not (output_dir / "background-rebuilt.png").exists()
+    assert captured.get("background_rebuilt") is not True

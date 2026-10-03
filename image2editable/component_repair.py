@@ -1173,6 +1173,7 @@ def record_next_component_request(
 
 def record_parent_fallback_execution(
     store, page_id: str, *, graph_path: str | Path, quality_input_refs: dict,
+    shadow_claims: dict[str, dict] | None = None,
     _lease: ExecutionLease | None = None,
 ) -> dict:
     if _lease is not None:
@@ -1243,7 +1244,6 @@ def record_parent_fallback_execution(
             if (
                 parent is None or parent["kind"] != "parent"
                 or parent["state"] != "pending_gate"
-                or parent["mask_sha256"] != initial_ref["sha256"]
             ):
                 raise ValueError("parent fallback did not preserve intact parent")
             initial_mask = _load_state_artifact(store.root, initial_ref)
@@ -1253,8 +1253,26 @@ def record_parent_fallback_execution(
             output_ref, output_mask = _artifact_reference(
                 store.root, output_mask_path, "parent fallback mask"
             )
-            if output_ref["sha256"] != initial_ref["sha256"] or output_mask != initial_mask:
-                raise ValueError("parent fallback mask is not the intact parent asset")
+            claim_ref = (shadow_claims or {}).get(parent_id)
+            if claim_ref is None:
+                if (
+                    parent["mask_sha256"] != initial_ref["sha256"]
+                    or output_ref["sha256"] != initial_ref["sha256"]
+                    or output_mask != initial_mask
+                ):
+                    raise ValueError("parent fallback mask is not the intact parent asset")
+            else:
+                # A recorded shadow claim extends the restored mask only
+                # outward: grown == initial | claim with claim disjoint.
+                if parent["mask_sha256"] != output_ref["sha256"]:
+                    raise ValueError("parent fallback mask is not the intact parent asset")
+                claim_mask = _load_state_artifact(
+                    store.root, claim_ref, max_bytes=GRAPH_JSON_LIMIT * 8
+                )
+                if not _mask_is_disjoint_extension(
+                    initial_mask, claim_mask, output_mask
+                ):
+                    raise ValueError("parent fallback shadow claim is not a disjoint extension")
             if any(
                 node["parent_id"] == parent_id and node["state"] != "inactive"
                 for node in graph["nodes"]
@@ -2811,6 +2829,28 @@ def _commit_preserved_warning(store, state: dict, page_id: str) -> dict:
         f"pages/{page_id}/reconstruction/{COMPONENT_STATE_NAME}", updated
     )
     return {"status": "preserved_with_warning", "page_id": page_id}
+
+
+def _mask_is_disjoint_extension(
+    initial_payload: bytes, claim_payload: bytes, output_payload: bytes
+) -> bool:
+    """Grown mask must equal ``initial | claim`` with claim disjoint."""
+    import io
+
+    import numpy as np
+    from PIL import Image
+
+    def _mask(payload: bytes) -> np.ndarray:
+        return np.asarray(Image.open(io.BytesIO(payload)).convert("L")) > 0
+
+    initial = _mask(initial_payload)
+    claim = _mask(claim_payload)
+    output = _mask(output_payload)
+    if initial.shape != claim.shape or initial.shape != output.shape:
+        return False
+    if np.any(claim & initial) or not np.any(claim):
+        return False
+    return np.array_equal(output, initial | claim)
 
 
 def _load_state_artifact(

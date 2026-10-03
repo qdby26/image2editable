@@ -4249,13 +4249,21 @@ def _execute_legacy_parent_fallback(
         input_dir=graph_path.parent, output_dir=output_dir,
     )
     parent_ids = set(state["fallback"]["parent_ids"])
+    masks_by_id = {}
+    for node in next_graph["nodes"]:
+        mask_file = output_dir / Path(node["mask"])
+        if mask_file.is_file():
+            with Image.open(mask_file) as image:
+                masks_by_id[node["id"]] = np.asarray(image.convert("L")) > 0
     for node in next_graph["nodes"]:
         if node["id"] in parent_ids:
             initial_mask = _state_artifact(store, state["parent_assets"][node["id"]])
             restored_mask = output_dir / Path(node["mask"])
             shutil.copyfile(initial_mask, restored_mask)
             with Image.open(restored_mask) as image:
-                bbox = image.convert("L").getbbox()
+                restored = image.convert("L")
+                bbox = restored.getbbox()
+                masks_by_id[node["id"]] = np.asarray(restored) > 0
             if bbox is None:
                 raise ValueError("initial parent fallback mask is empty")
             left, top, right, bottom = bbox
@@ -4313,13 +4321,111 @@ def _execute_legacy_parent_fallback(
             store, trusted_refs["presentation_manifest"]
         )
         quality_options["frozen_component_ids"] = frozen_ids
+    # A restored parent mask is the pre-repair silhouette: it excludes the
+    # component's own soft shadow, which stays baked into the background
+    # and is then reported as duplicate_shadow forever.  Claim the confined
+    # unowned shadow mass into the parent mask and erase it from the
+    # background so the degraded layer carries its shadow outright.
+    background_path = None
+    shadow_claims: dict[str, dict] = {}
+    if isinstance(trusted_refs.get("background"), dict):
+        background_path, _ = _load_legacy_ref(store, trusted_refs["background"])
+    if background_path is not None:
+        import cv2
+
+        from image2editable.component_quality import (
+            calibrate_page,
+            exterior_shadow_claim,
+        )
+
+        with Image.open(background_path) as image:
+            background_pixels = np.asarray(image.convert("RGB")).copy()
+        if background_pixels.shape == pixels.shape:
+            calibration = calibrate_page(
+                pixels, np.zeros(pixels.shape[:2], dtype=np.uint8)
+            )
+            claimed_shadow = np.zeros(pixels.shape[:2], dtype=bool)
+            rewritten = False
+            for node in next_graph["nodes"]:
+                if node["id"] not in parent_ids or node["id"] not in masks_by_id:
+                    continue
+                support = masks_by_id[node["id"]]
+                foreign = np.zeros(support.shape, dtype=bool)
+                active_foreign = np.zeros(support.shape, dtype=bool)
+                for other in next_graph["nodes"]:
+                    other_id = other["id"]
+                    if other_id == node["id"] or other_id not in masks_by_id:
+                        continue
+                    foreign |= masks_by_id[other_id]
+                    if other.get("state") in {
+                        "pending", "pending_gate", "frozen",
+                    }:
+                        active_foreign |= masks_by_id[other_id]
+                claim = exterior_shadow_claim(
+                    support, pixels, background_pixels, foreign, calibration,
+                    active_foreign_mask=active_foreign,
+                )
+                if not np.any(claim):
+                    continue
+                claim_path = output_dir / "masks" / f"{node['id']}-shadow-claim.png"
+                claim_path.parent.mkdir(parents=True, exist_ok=True)
+                Image.fromarray(
+                    np.where(claim, 255, 0).astype(np.uint8)
+                ).save(claim_path)
+                shadow_claims[node["id"]] = {
+                    "path": claim_path.relative_to(store.root).as_posix(),
+                    "sha256": sha256_file(claim_path),
+                }
+                support |= claim
+                claimed_shadow |= claim
+                masks_by_id[node["id"]] = support
+                restored_mask = output_dir / Path(node["mask"])
+                Image.fromarray(
+                    np.where(support, 255, 0).astype(np.uint8)
+                ).save(restored_mask)
+                node["mask_sha256"] = sha256_file(restored_mask)
+                rows, columns = np.where(support)
+                node["bbox"] = [
+                    int(columns.min()), int(rows.min()),
+                    int(columns.max()) + 1, int(rows.max()) + 1,
+                ]
+                rewritten = True
+            if np.any(claimed_shadow):
+                rebuilt = background_pixels.copy()
+                rows, columns = np.where(claimed_shadow)
+                pad = 8
+                top = max(0, rows.min() - pad)
+                bottom = min(rebuilt.shape[0], rows.max() + 1 + pad)
+                left = max(0, columns.min() - pad)
+                right = min(rebuilt.shape[1], columns.max() + 1 + pad)
+                rebuilt[top:bottom, left:right] = cv2.inpaint(
+                    rebuilt[top:bottom, left:right],
+                    np.where(claimed_shadow[top:bottom, left:right], 255, 0)
+                    .astype(np.uint8),
+                    3,
+                    cv2.INPAINT_TELEA,
+                )
+                Image.fromarray(rebuilt).save(
+                    output_dir / "background-rebuilt.png"
+                )
+                quality_options["background_rebuilt"] = True
+            if rewritten:
+                output_graph.write_text(
+                    json.dumps(
+                        next_graph, ensure_ascii=False, indent=2, sort_keys=True
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
     refs = _quality_assets(
         store, page_id, next_graph, output_dir, output_dir,
         **quality_options,
     )
     record_parent_fallback_execution(
         store, page_id, graph_path=output_graph,
-        quality_input_refs=refs, _lease=lease,
+        quality_input_refs=refs,
+        shadow_claims=shadow_claims or None,
+        _lease=lease,
     )
 
 
@@ -5571,6 +5677,30 @@ def _hybrid_partial_slide_data(
         node["id"] for node in graph["nodes"]
         if node["kind"] == "text" and node["state"] == "frozen"
     }
+    # Emission gate: an OCR false positive that reached "frozen" (a stray
+    # glyph like "m", or a low-confidence read) must not ship as a native
+    # box.  Skipped items stay baked inside the degraded layer — the same
+    # treatment pending text gets — so nothing is lost visually.
+    emitted_text_ids = set()
+
+    def _emittable_native_text(record: dict) -> bool:
+        text = str(record["normalized"].get("text") or "").strip()
+        raw = record.get("raw")
+        confidence = raw.get("confidence") if isinstance(raw, dict) else None
+        if (
+            isinstance(confidence, (int, float))
+            and not isinstance(confidence, bool)
+            and confidence < 0.6
+        ):
+            return False
+        if len(text) == 1 and text.isascii() and (
+            confidence is None
+            or not isinstance(confidence, (int, float))
+            or isinstance(confidence, bool)
+            or confidence < 0.9
+        ):
+            return False
+        return True
 
     def _native_text_items() -> list:
         items = prepared.get("text_items", [])
@@ -5580,7 +5710,7 @@ def _hybrid_partial_slide_data(
             return []
         emitted = [
             record["raw"] for record in records
-            if record["normalized"]["id"] in frozen_text_ids
+            if record["normalized"]["id"] in emitted_text_ids
         ]
         # Warning pages skip the repair loop's text review, so an OCR
         # duplicate (a truncated near-copy of a longer item) can reach
@@ -5633,12 +5763,25 @@ def _hybrid_partial_slide_data(
         page_size = image.size
     # Frozen text is emitted as native boxes; keep its pixels out of
     # degraded layers so they cannot double-print underneath. Pending
-    # text stays baked into the layer or it would vanish entirely.
+    # text stays baked into the layer or it would vanish entirely. The
+    # emission gate decides which frozen ids qualify; items it rejects
+    # keep their pixels like pending text, so nothing can vanish.
+    try:
+        emitted_text_ids = {
+            record["normalized"]["id"]
+            for record in _component_text_records(
+                prepared.get("text_items", []), page_size
+            )
+            if record["normalized"]["id"] in frozen_text_ids
+            and _emittable_native_text(record)
+        }
+    except ValueError:
+        emitted_text_ids = set()
     frozen_text_alpha = np.zeros((page_size[1], page_size[0]), dtype=bool)
     for node in graph["nodes"]:
         if (
             node.get("kind") == "text"
-            and node.get("state") == "frozen"
+            and node.get("id") in emitted_text_ids
             and type(node.get("mask")) is str
         ):
             mask_rel = node["mask"]

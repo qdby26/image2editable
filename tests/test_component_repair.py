@@ -8002,3 +8002,103 @@ def test_plan_history_validation_rejects_malformed_entry(
     request["plan_history"][0]["repair_round"] = 0
     with pytest.raises(ValueError, match="plan_history"):
         validate_component_agent_request(request)
+
+
+
+def _png_bytes(mask) -> bytes:
+    import io
+
+    import numpy as np
+
+    buffer = io.BytesIO()
+    Image.fromarray(
+        np.where(mask, 255, 0).astype(np.uint8)
+    ).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def test_shadow_claim_disjoint_extension_validation() -> None:
+    import numpy as np
+
+    initial = np.zeros((6, 6), dtype=bool)
+    initial[1:4, 1:4] = True
+    claim = np.zeros((6, 6), dtype=bool)
+    claim[4:5, 1:4] = True
+    grown = initial | claim
+
+    assert component_repair._mask_is_disjoint_extension(
+        _png_bytes(initial), _png_bytes(claim), _png_bytes(grown)
+    )
+    # Claim overlapping the initial silhouette is not an extension.
+    overlap = claim.copy()
+    overlap[3, 2] = True
+    assert not component_repair._mask_is_disjoint_extension(
+        _png_bytes(initial), _png_bytes(overlap), _png_bytes(grown)
+    )
+    # Output that is not exactly initial|claim is rejected.
+    wrong = grown.copy()
+    wrong[5, 5] = True
+    assert not component_repair._mask_is_disjoint_extension(
+        _png_bytes(initial), _png_bytes(claim), _png_bytes(wrong)
+    )
+    # Empty claims are rejected (a no-op extension is not a claim).
+    empty = np.zeros((6, 6), dtype=bool)
+    assert not component_repair._mask_is_disjoint_extension(
+        _png_bytes(initial), _png_bytes(empty), _png_bytes(initial)
+    )
+
+
+def test_parent_fallback_rejects_grown_mask_without_claim(
+    page_session: dict,
+) -> None:
+    """A fallback parent mask differing from the initial asset is only
+    legal when a recorded disjoint shadow claim explains the growth."""
+    import numpy as np
+
+    store, graph_path, quality_input_refs = _fallback_execution_case(
+        page_session
+    )
+    mask_path = graph_path.parent / "masks/candidate_b.png"
+    grown = np.asarray(Image.open(mask_path).convert("L")) > 0
+    grown[0, 0] = not grown[0, 0]
+    Image.fromarray(np.where(grown, 255, 0).astype(np.uint8)).save(mask_path)
+    graph = json.loads(graph_path.read_text(encoding="utf-8"))
+    for node in graph["nodes"]:
+        if node["id"] == "candidate_b":
+            node["mask_sha256"] = hashlib.sha256(
+                mask_path.read_bytes()
+            ).hexdigest()
+    graph_path.write_text(json.dumps(graph), encoding="utf-8")
+    # Keep the presentation manifest's embedded graph hash in sync so the
+    # failure reaches the intact-parent check rather than the ref binding.
+    manifest_ref = quality_input_refs["presentation_manifest"]
+    manifest_path = store.root / manifest_ref["path"]
+    manifest_doc = json.loads(manifest_path.read_text(encoding="utf-8"))
+    graph_sha = hashlib.sha256(graph_path.read_bytes()).hexdigest()
+    manifest_doc["graph_sha256"] = graph_sha
+    def _rewrite_graph_sha(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if (
+                    isinstance(item, dict)
+                    and set(item) >= {"path", "sha256"}
+                    and isinstance(item.get("path"), str)
+                    and item["path"].endswith("component-graph.json")
+                ):
+                    item["sha256"] = graph_sha
+                else:
+                    _rewrite_graph_sha(item)
+        elif isinstance(value, list):
+            for item in value:
+                _rewrite_graph_sha(item)
+    _rewrite_graph_sha(manifest_doc)
+    manifest_path.write_text(json.dumps(manifest_doc), encoding="utf-8")
+    manifest_ref["sha256"] = hashlib.sha256(
+        manifest_path.read_bytes()
+    ).hexdigest()
+
+    with pytest.raises(ValueError, match="intact parent"):
+        record_parent_fallback_execution(
+            store, "page_001", graph_path=graph_path,
+            quality_input_refs=quality_input_refs,
+        )

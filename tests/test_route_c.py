@@ -1375,7 +1375,31 @@ def test_hybrid_partial_delivery_repaints_degraded_from_source(
 
     monkeypatch.setenv("IMAGE2EDITABLE_EMBED_FONTS", "0")
     store, manifest, details, output = _assembly_hybrid_store(
-        tmp_path, ["warning_partial"]
+        tmp_path, ["warning_partial"],
+        # text_0004 is a frozen node inside the degraded region; give it
+        # a prepared record so it may emit and be punched out.
+        prepared_text_items={"page_001": [
+            {
+                "box": [0, 2, 8, 4], "text": "editable", "font_size": 10.0,
+                "color": "#000000", "bold": False, "font": "Arial",
+                "align": 1, "confidence": 1.0,
+            },
+            {
+                "box": [9, 2, 5, 4], "text": "baked", "font_size": 10.0,
+                "color": "#000000", "bold": False, "font": "Arial",
+                "align": 1, "confidence": 1.0,
+            },
+            {
+                "box": [0, 2, 5, 4], "text": "editab", "font_size": 10.0,
+                "color": "#000000", "bold": False, "font": "Arial",
+                "align": 1, "confidence": 1.0,
+            },
+            {
+                "box": [9, 6, 6, 2], "text": "bottom", "font_size": 8.0,
+                "color": "#000000", "bold": False, "font": "Arial",
+                "align": 1, "confidence": 1.0,
+            },
+        ]},
     )
     state = store.read_json(
         "pages/page_001/reconstruction/component_state.json"
@@ -2518,3 +2542,74 @@ def test_completed_reentry_rejects_bool_request_schema(
 
     with pytest.raises((RuntimeError, ValueError)):
         runtime.run_job(store.root) 
+
+
+@pytest.mark.parametrize(
+    ("junk_text", "junk_confidence", "emitted"),
+    [
+        ("m", 0.4, False),   # single ascii + low confidence
+        ("xy", 0.4, False),  # low confidence alone
+        ("m", 0.95, True),   # confident single glyph stays native
+    ],
+)
+def test_hybrid_partial_delivery_gates_frozen_text_emission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    junk_text: str,
+    junk_confidence: float,
+    emitted: bool,
+) -> None:
+    """An OCR false positive that reached "frozen" must not ship as a
+    native box; skipped items keep their pixels baked like pending text."""
+    import io
+    import numpy as np
+
+    monkeypatch.setenv("IMAGE2EDITABLE_EMBED_FONTS", "0")
+    items = [{
+        "box": [0, 2, 8, 4], "text": "editable", "font_size": 10.0,
+        "color": "#000000", "bold": False, "font": "Arial",
+        "align": 1, "confidence": 1.0,
+    }, {
+        "box": [9, 2, 5, 4], "text": "baked", "font_size": 10.0,
+        "color": "#000000", "bold": False, "font": "Arial",
+        "align": 1, "confidence": 1.0,
+    }, {
+        "box": [0, 2, 5, 4], "text": "editab", "font_size": 10.0,
+        "color": "#000000", "bold": False, "font": "Arial",
+        "align": 1, "confidence": 1.0,
+    }, {
+        # text_0004: frozen node sitting inside the degraded region.
+        "box": [9, 6, 6, 2], "text": junk_text, "font_size": 8.0,
+        "color": "#000000", "bold": False, "font": "Arial",
+        "align": 1, "confidence": junk_confidence,
+    }]
+    store, manifest, details, output = _assembly_hybrid_store(
+        tmp_path, ["warning_partial"],
+        prepared_text_items={"page_001": items},
+    )
+
+    route_c.build_hybrid_delivery(store, manifest)
+    outputs = legacy.assemble_legacy_results(store)
+    presentation = Presentation(outputs["16:9"])
+    texts = [
+        shape.text_frame.text
+        for shape in presentation.slides[0].shapes
+        if getattr(shape, "has_text_frame", False)
+        and shape.text_frame.text.strip()
+    ]
+    assert (junk_text in texts) is emitted
+
+    right = max(
+        (shape for shape in presentation.slides[0].shapes
+         if shape.shape_type == MSO_SHAPE_TYPE.PICTURE),
+        key=lambda shape: shape.left,
+    )
+    with Image.open(io.BytesIO(right.image.blob)) as image:
+        pixels = np.asarray(image.convert("RGBA"))
+    junk_region = pixels[6:8, 9:15, 3]
+    if emitted:
+        # Emitted text is punched out so it cannot double-print.
+        assert np.count_nonzero(junk_region) == 0
+    else:
+        # Rejected emission keeps the pixels baked like pending text.
+        assert np.count_nonzero(junk_region) == junk_region.size

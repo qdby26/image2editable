@@ -271,7 +271,7 @@ def _gradient_badge_row(texts, font_file, canvas=(2160, 3840)):
         region[ink] = np.clip(colors[ink], 0, 255)
         ys, xs = np.where(ink)
         boxes.append([x + int(xs.min()), 120 + int(ys.min()),
-                      int(xs.ptp() + 1), int(ys.ptp() + 1)])
+                      int(np.ptp(xs) + 1), int(np.ptp(ys) + 1)])
         x += 900
     return image, boxes
 
