@@ -102,6 +102,24 @@ def test_underlay_metrics_cover_text_hole_and_visual_hole(underlay_engine):
     assert layer["metrics"]["gradient_jump_p95"] <= 12.0
 
 
+def test_visual_metrics_empty_path_keeps_texture_deficit_key(underlay_engine):
+    """A hole with no donor-visible boundary (e.g. a component flush against
+    the canvas edge or fully ringed by other components) returns the empty
+    metrics dict; consumers index ``texture_deficit`` unconditionally."""
+    source = np.full((60, 60, 3), 200, dtype=np.uint8)
+    empty_metrics = underlay_engine._visual_metrics(
+        source, source, np.ones((60, 60), dtype=bool),
+        np.zeros((60, 60), dtype=bool),
+    )
+    hole = np.zeros((60, 60), dtype=bool)
+    hole[:8, :] = True  # hole flush to the canvas top: no donor outside
+    edge_metrics = underlay_engine._visual_metrics(
+        source, source, np.zeros((60, 60), dtype=bool), hole,
+    )
+    for metrics in (empty_metrics, edge_metrics):
+        assert "texture_deficit" in metrics
+
+
 def test_actual_higher_color_bleed_is_removed_from_movable_lower_layer(underlay_engine):
     source = np.full((80, 120, 3), (220, 230, 240), dtype=np.uint8)
     semantic = np.zeros((80, 120), dtype=bool)

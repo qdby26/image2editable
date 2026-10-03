@@ -982,7 +982,8 @@ def _advance_legacy_pages(
                 )
                 if init_outcome.get("status") == "awaiting_proposal_review":
                     return _proposal_review_waiting(store, manifest, page_id)
-            for _ in range(MAX_REPAIR_ROUNDS * 6 + 4):
+            durable_marker = None
+            for _ in range(MAX_REPAIR_ROUNDS * 12 + 8):
                 advance_kwargs = {
                     "_lease": lease,
                     "performance_trace": performance_trace,
@@ -997,6 +998,14 @@ def _advance_legacy_pages(
                     page_id,
                     **advance_kwargs,
                 )
+                if outcome["status"] == "processing":
+                    marker = _legacy_progress_marker(store, page_id)
+                    if marker is not None and marker == durable_marker:
+                        raise RuntimeError(
+                            "Legacy component page made no durable progress "
+                            f"between advances (phase={marker[0]})"
+                        )
+                    durable_marker = marker
                 if (
                     outcome["status"] == "preserved_with_warning"
                     and resume_round_limited_component_repair(store, page_id)
@@ -1029,6 +1038,18 @@ def _advance_legacy_pages(
             visual_worker_pool.close()
         if owns_ocr_worker_pool and ocr_worker_pool is not None:
             ocr_worker_pool.close()
+
+
+def _legacy_progress_marker(store: RunStore, page_id: str) -> tuple | None:
+    try:
+        state = store.read_json(
+            f"pages/{page_id}/reconstruction/component_state.json"
+        )
+    except (FileNotFoundError, ValueError):
+        return None
+    if not isinstance(state, dict):
+        return None
+    return (state.get("phase"), state.get("revision"))
 
 
 def _ensure_legacy_pages_processing(

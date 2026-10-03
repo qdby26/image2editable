@@ -734,6 +734,23 @@ def test_powerpoint_pids_parses_tasklist_csv(
     assert font_embed._powerpoint_pids() == {99284, 4321}
 
 
+def test_powerpoint_pids_none_stdout_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crashed pipe-reader leaves CompletedProcess.stdout as None; the
+    pid probe must fail closed instead of crashing the embed entry."""
+
+    class FakeCompleted:
+        returncode = 0
+        stdout = None
+
+    monkeypatch.setattr(
+        font_embed.subprocess, "run", lambda *a, **k: FakeCompleted()
+    )
+    assert font_embed._powerpoint_pids() is None
+    assert font_embed._powerpoint_running() is True
+
+
 def test_powerpoint_pids_empty_when_none_running(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

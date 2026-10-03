@@ -9,6 +9,8 @@
 - 组件修复请求新增 `plan_history` 字段：每轮请求回采前几轮已记录的方案（宿主方案与 fast 模式确定性方案均纳入；含动作＋对象＋执行后失败/冻结清单），让修复方看到已尝试动作及其结果，避免在相同证据上重复相同归一化方案而触发 `repeated_plan` 停机。
 - Fast 模式确定性修复计划增加轮次升级：第 3 轮起按上一轮质量报告的违规类型定向选择几何动作——`duplicate_shadow`/`missing_edge`（违规像素在掩码外、本属该组件）改发 `expand` 认领边缘带，`duplicate_pixels`/`alpha_halo`（掩码内重复残边）改发 `shrink` 侵蚀；margin 由 `edge_width_px + 容差` 逐轮递增折算（封顶 5%），侵蚀后会掏空掩码的组件保持 `accept` 诚实降级；无逐组件报告时回退盲 `shrink` 0.005 保底死锁破解。residual owner 继续走 `accept`+`absorb_residual`，文本节点不受影响，`rebuild_background` 照常回收释放像素。
 - partial 交付的降级层改用**源图真值像素**重绘：降级层不再声称编辑语义，其 RGB 通道在 alpha 内直接取源图像素替换提取残留（实测约 1.1% 的伪像素会被抹掉），形状/边界保持不变；冻结层不受影响。
+- 修复页级推进循环的耐久边界过紧：上限按 `advance` 调用次数封顶（`MAX_REPAIR_ROUNDS*6+4`），而走完 5 轮修复再叠加 fallback 尾链（`fallback_required→executed→quality_recorded→终态提交`）可超额崩溃。上限放宽至 `MAX_REPAIR_ROUNDS*12+8`，并新增真·无进展检测——连续两次 `processing` 间 `(phase, revision)` 不变才判死锁，崩溃语义从"调用数超限"精确为"无持久进展"。失败 run 可经 `runtime.retry_page` + `run_job` 从 durable 相位续跑（c5 实测：停在 `fallback_quality_recorded` 的页重试后 2 秒走完全程交付 partial）。
+- 修复 `_visual_metrics` 提前返回字典缺 `texture_deficit` 键导致 `KeyError`：当洞没有 donor 可见边界像素（组件贴画布边缘或被其他组件完全包围）时，`empty` 返回缺少该键而消费端无条件索引。三处镜像同步补齐。
 - 基准语料统一至 `benchmarks/corpus/` 与 `benchmarks/release/`；Skill 通过部分克隆和文件清单仅获取运行所需源码，跳过基准、测试、演示图片和开发发布工具。
 
 - 仅安装转换 Skill 时也自动准备项目 Runtime、依赖、OCR 和模型；Windows 新安装优先 D 盘及其他非 C 本地磁盘，macOS/Linux 优先其他已挂载本地磁盘，统一下载缓存和临时目录并复用已有环境。

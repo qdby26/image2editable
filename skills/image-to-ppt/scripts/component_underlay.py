@@ -32,6 +32,7 @@ def _visual_metrics(
         "boundary_color_mae": 0.0,
         "gradient_jump_p95": 0.0,
         "added_high_frequency_pixels": 0.0,
+        "texture_deficit": 0.0,
     }
     if not np.any(visual_hole):
         return empty

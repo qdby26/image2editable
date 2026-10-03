@@ -152,11 +152,11 @@ def _powerpoint_pids() -> set[int] | None:
                 "tasklist", "/FI", "IMAGENAME eq POWERPNT.EXE",
                 "/FO", "CSV", "/NH",
             ],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True, errors="replace", timeout=15,
         )
     except Exception:
         return None
-    if listing.returncode != 0:
+    if listing.returncode != 0 or listing.stdout is None:
         return None
     pids: set[int] = set()
     for line in listing.stdout.splitlines():

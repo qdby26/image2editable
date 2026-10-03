@@ -98,6 +98,82 @@ def test_new_legacy_warning_cannot_loop_indefinitely(tmp_path, monkeypatch):
     assert store.read_json("page_jobs.json")["pages"]["page_001"]["status"] == "processing"
 
 
+def _processing_page_store(tmp_path: Path):
+    store = RunStore(tmp_path)
+    manifest = {"schema_version": 1, "options": {"pipeline_mode": "fast"}}
+    store.write_json("page_jobs.json", {"schema_version": 1, "pages": {
+        "page_001": {"schema_version": 1, "status": "processing"},
+    }})
+    store.write_json(
+        "pages/page_001/reconstruction/component_state.json",
+        {"phase": "freeze_committed", "revision": 1},
+    )
+    return store, manifest
+
+
+def _stub_page_setup(store, manifest, monkeypatch):
+    monkeypatch.setattr(runtime, "_native_pdf_analysis", lambda *args: {})
+    monkeypatch.setattr(runtime, "_page_performance_trace", lambda *args: None)
+    monkeypatch.setattr(runtime, "_batch_legacy_ocr", lambda *args, **kwargs: {})
+
+
+def test_fallback_tail_can_exceed_per_round_call_budget(tmp_path, monkeypatch):
+    """A page that consumed every repair round still needs several advance
+    calls to walk the fallback chain (fallback_required -> fallback_executed
+    -> fallback_quality_recorded -> terminal). The durable boundary must not
+    cut that tail short."""
+    store, manifest = _processing_page_store(tmp_path)
+    _stub_page_setup(store, manifest, monkeypatch)
+    monkeypatch.setattr(runtime, "MAX_REPAIR_ROUNDS", 1)
+    state_path = "pages/page_001/reconstruction/component_state.json"
+    steps = iter(range(2, 20))
+
+    def advance(*args, **kwargs):
+        revision = next(steps, None)
+        if revision is None:
+            return {"status": "ready_for_assembly", "page_id": "page_001"}
+        store.write_json(state_path, {
+            "phase": "fallback_quality_recorded", "revision": revision,
+        })
+        return {"status": "processing", "page_id": "page_001"}
+
+    monkeypatch.setattr(runtime, "advance_legacy_page", advance)
+    monkeypatch.setattr(
+        runtime, "resume_round_limited_component_repair", lambda *args: False,
+    )
+    with ExecutionLease(tmp_path / "execution.lock", run_root=tmp_path) as lease:
+        assert runtime._advance_legacy_pages(
+            store, manifest, ["page_001"], lease,
+        ) is None
+    assert store.read_json("page_jobs.json")["pages"]["page_001"]["status"] == "validated"
+
+
+def test_processing_without_durable_progress_fails_fast(tmp_path, monkeypatch):
+    """Two consecutive processing outcomes with the same (phase, revision)
+    marker mean the state machine spun without committing anything."""
+    store, manifest = _processing_page_store(tmp_path)
+    _stub_page_setup(store, manifest, monkeypatch)
+    monkeypatch.setattr(runtime, "MAX_REPAIR_ROUNDS", 5)
+    store.write_json(
+        "pages/page_001/reconstruction/component_state.json",
+        {"phase": "freeze_committed", "revision": 7},
+    )
+    calls = []
+
+    def advance(*args, **kwargs):
+        calls.append(1)
+        return {"status": "processing", "page_id": "page_001"}
+
+    monkeypatch.setattr(runtime, "advance_legacy_page", advance)
+    monkeypatch.setattr(
+        runtime, "resume_round_limited_component_repair", lambda *args: False,
+    )
+    with ExecutionLease(tmp_path / "execution.lock", run_root=tmp_path) as lease:
+        with pytest.raises(RuntimeError, match="no durable progress"):
+            runtime._advance_legacy_pages(store, manifest, ["page_001"], lease)
+    assert len(calls) == 2
+
+
 @pytest.mark.parametrize("changed_output", [None, "background", "rgba"])
 @pytest.mark.parametrize("resumed", [False, True])
 def test_output_cycle_is_not_progress_despite_newly_refrozen_components(
