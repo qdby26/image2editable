@@ -743,6 +743,12 @@ def initialize_legacy_page(
     return {"status": "initialized", "page_id": page_id}
 
 
+# Violations whose offending pixels sit *outside* the mask are claimed by
+# expansion; violations confined to the mask rim are eroded instead.
+_EXPAND_ESCALATION_VIOLATIONS = frozenset({"duplicate_shadow", "missing_edge"})
+_SHRINK_ESCALATION_VIOLATIONS = frozenset({"duplicate_pixels", "alpha_halo"})
+
+
 def _record_deterministic_fast_plan(
     store: RunStore, page_id: str, request_path: Path, reconstruction: Path,
     *, _lease: ExecutionLease,
@@ -800,6 +806,7 @@ def _record_deterministic_fast_plan(
         if object_id not in absorbed_ids
     ]
     residual_ids: set[str] = set()
+    previous_quality = None
     quality_ref = request.get("evidence", {}).get("quality-report.json")
     if request["repair_round"] > 1 and quality_ref is not None:
         from image2editable.component_repair import _page_residual_owner_ids
@@ -815,32 +822,136 @@ def _record_deterministic_fast_plan(
                 store, quality=previous_quality, graph=repair_graph,
                 graph_root=request_path.parent,
             )
-    # After two rounds of the default accept/rebuild vocabulary, surviving
-    # candidates get a one-shot edge erosion instead of repeating the same
-    # normalized plan forever (residual owners keep their absorb path).
+    # Round-3+ escalation is violation-directed rather than a blind
+    # erosion: exterior-band defects (shadow/edge pixels lying outside the
+    # mask but owned by this component) are claimed with expand, while rim
+    # duplicates inside the mask are eroded with shrink. Components with
+    # violations that a geometric action cannot address keep accept and
+    # degrade honestly. The margin is derived from the recorded
+    # edge_width_px + tolerance so it actually covers the offending band,
+    # and widens each stalled round (capped at 5% of the smaller side).
     escalate = request["repair_round"] >= 3
+    report_by_id = {}
+    if escalate and previous_quality is not None:
+        entries = (
+            previous_quality.get("report", {}).get("component_reports") or []
+        )
+        if isinstance(entries, list):
+            for entry in entries:
+                if isinstance(entry, dict) and type(entry.get("component_id")) is str:
+                    report_by_id[entry["component_id"]] = entry
     text_candidate_ids = {
         node["id"] for node in graph["nodes"]
         if node.get("id") in request["candidate_ids"]
         and node.get("kind") == "text"
     }
+    nodes_by_id = {
+        node["id"]: node for node in graph["nodes"]
+        if isinstance(node, dict) and type(node.get("id")) is str
+    }
+    masks_cache: dict[str, Any] = {}
+
+    def _mask_array(object_id: str):
+        if object_id in masks_cache:
+            return masks_cache[object_id]
+        import numpy as np
+
+        node = nodes_by_id.get(object_id)
+        rel = node.get("mask") if isinstance(node, dict) else None
+        array = None
+        if type(rel) is str and rel:
+            try:
+                with Image.open(request_path.parent / rel) as mask:
+                    array = np.asarray(mask.convert("L")) > 0
+            except (OSError, ValueError):
+                array = None
+        masks_cache[object_id] = array
+        return array
+
+    def _image_min_dim() -> int | None:
+        for object_id in request["candidate_ids"]:
+            array = _mask_array(object_id)
+            if array is not None and array.ndim == 2:
+                return int(min(array.shape[:2]))
+        return None
+
+    def _shrink_survives(object_id: str, margin_ratio: float) -> bool:
+        import cv2
+        import numpy as np
+
+        array = _mask_array(object_id)
+        if array is None:
+            return True
+        radius = max(1, round(min(array.shape[:2]) * margin_ratio))
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1)
+        )
+        remaining = int(np.count_nonzero(
+            cv2.erode(array.astype(np.uint8), kernel)
+        ))
+        original = int(np.count_nonzero(array))
+        return remaining >= max(20, round(original * 0.4))
+
+    def _escalation_for(object_id: str):
+        if not escalate:
+            return None
+        entry = report_by_id.get(object_id)
+        if entry is None:
+            # No per-component report: keep the blind edge erosion that
+            # breaks the repeated-plan deadlock when we cannot tell which
+            # direction the defect lies in.
+            if _shrink_survives(object_id, 0.005):
+                return "shrink", 0.005
+            return None
+        violations = set(entry.get("violations") or [])
+        if violations & _EXPAND_ESCALATION_VIOLATIONS:
+            action = "expand"
+        elif violations & _SHRINK_ESCALATION_VIOLATIONS:
+            action = "shrink"
+        else:
+            return None
+        metrics = entry.get("metrics") if isinstance(entry, dict) else None
+        metrics = metrics if isinstance(metrics, dict) else {}
+        edge_width = metrics.get("edge_width_px")
+        tolerance = (
+            metrics.get("adaptive_pixel_tolerance")
+            or metrics.get("hard_pixel_tolerance")
+            or 3.0
+        )
+        margin_px = (
+            (edge_width if type(edge_width) in {int, float} and edge_width > 0 else 0)
+            + max(2.0, tolerance if type(tolerance) in {int, float} else 3.0)
+        ) * (request["repair_round"] - 2)
+        min_dim = _image_min_dim()
+        margin_ratio = (
+            min(0.05, max(0.005, margin_px / min_dim))
+            if min_dim else 0.005
+        )
+        margin_ratio = round(margin_ratio, 6)
+        if action == "shrink" and not _shrink_survives(object_id, margin_ratio):
+            return None
+        return action, margin_ratio
+
     actions = []
     for object_id in request["candidate_ids"]:
         absorbed = object_id in absorbed_ids
-        shrink = (
-            escalate
-            and not absorbed
-            and object_id not in residual_ids
-            and object_id not in text_candidate_ids
+        escalation = (
+            None
+            if absorbed
+            or object_id in residual_ids
+            or object_id in text_candidate_ids
+            else _escalation_for(object_id)
         )
         actions.append({
             "action": (
-                "discard" if absorbed else "shrink" if shrink else "accept"
+                "discard" if absorbed
+                else escalation[0] if escalation
+                else "accept"
             ),
             "object_ids": [object_id],
             "parameters": (
-                {"margin_ratio": 0.005}
-                if shrink
+                {"margin_ratio": escalation[1]}
+                if escalation
                 else {"preserve_mask": True}
                 if strict_escalation and not absorbed
                 else {}
@@ -848,7 +959,7 @@ def _record_deterministic_fast_plan(
             "confidence": 1.0,
             "evidence": [
                 "deterministic page route"
-                if not shrink
+                if not escalation
                 else "deterministic edge escalation after stalled rounds"
             ],
         })
@@ -5517,8 +5628,25 @@ def _hybrid_partial_slide_data(
     manifest_path = _legacy_ref_path(
         store, input_refs["presentation_manifest"]
     )
+    graph_dir = _legacy_ref_path(store, state["fallback_graph_ref"]).parent
     with Image.open(io.BytesIO(source_payload)) as image:
         page_size = image.size
+    # Frozen text is emitted as native boxes; keep its pixels out of
+    # degraded layers so they cannot double-print underneath. Pending
+    # text stays baked into the layer or it would vanish entirely.
+    frozen_text_alpha = np.zeros((page_size[1], page_size[0]), dtype=bool)
+    for node in graph["nodes"]:
+        if (
+            node.get("kind") == "text"
+            and node.get("state") == "frozen"
+            and type(node.get("mask")) is str
+        ):
+            mask_rel = node["mask"]
+            mask_path = graph_dir / mask_rel
+            with Image.open(mask_path) as text_mask_image:
+                mask_array = np.asarray(text_mask_image.convert("L")) > 0
+            if mask_array.shape == frozen_text_alpha.shape:
+                frozen_text_alpha |= mask_array
     output_dir = Path(
         tempfile.mkdtemp(prefix="assembly-assets-", dir=reconstruction)
     )
@@ -5537,15 +5665,29 @@ def _hybrid_partial_slide_data(
         )
         by_id = {node["id"]: node for node in active_nodes}
         source_image = Image.open(io.BytesIO(source_payload)).convert("RGB")
+        source_rgb = np.asarray(source_image)
         for index, layer in enumerate(layers, start=1):
             component_id = layer["component_id"]
             node = by_id[component_id]
-            alpha = layer["rgba"][:, :, 3] == 255
+            rgba = layer["rgba"]
+            if component_id in degraded_ids:
+                rgba = rgba.copy()
+                if source_rgb.shape == rgba[:, :, :3].shape:
+                    # A degraded layer no longer carries edit semantics,
+                    # so repainting its RGB channels with the true source
+                    # pixels inside the same alpha is the strict-fidelity
+                    # choice: it wipes extraction artifacts baked into
+                    # the layer while keeping the recorded shape.
+                    rgba[:, :, :3] = source_rgb
+                rgba[:, :, 3] = np.where(
+                    frozen_text_alpha, 0, rgba[:, :, 3]
+                )
+            alpha = rgba[:, :, 3] == 255
             ys, xs = np.nonzero(alpha)
             if len(xs):
                 left, right = int(xs.min()), int(xs.max()) + 1
                 top, bottom = int(ys.min()), int(ys.max()) + 1
-                crop = layer["rgba"][top:bottom, left:right]
+                crop = rgba[top:bottom, left:right]
                 component_path = output_dir / f"component-{index:04d}.png"
                 Image.fromarray(crop, mode="RGBA").save(component_path)
             else:

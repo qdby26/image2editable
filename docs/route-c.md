@@ -13,7 +13,9 @@ editable-reconstruction quality gates cannot pass a page.
   ended as `preserved_with_warning` is delivered degraded — either as a
   **partially editable page** (frozen component layers and native text are
   kept; quality-failed components are re-presented through the fallback
-  graph's preserved layers and reported via `degraded_component_ids`) or,
+  graph's preserved layers — repainted with the true source pixels inside
+  their alpha so no extraction artifact is shipped — and reported via
+  `degraded_component_ids`) or,
   when the bound fallback assets are unavailable or a failed component lost
   all of its pixels, as a **flattened full-page picture** of the bound
   source snapshot — together with a Route A handoff request.

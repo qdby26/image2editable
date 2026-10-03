@@ -665,6 +665,8 @@ def _write_partial_warning_page(
     text_right[2:6, 9:15] = 255
     text_dup = np.zeros((9, 16), dtype=np.uint8)
     text_dup[2:6, 0:6] = 255
+    text_baked = np.zeros((9, 16), dtype=np.uint8)
+    text_baked[6:8, 9:15] = 255
     mask_paths = {}
     for name, array in (
         ("component_0001", left),
@@ -674,6 +676,7 @@ def _write_partial_warning_page(
         ("text_0001", text_left),
         ("text_0002", text_right),
         ("text_0003", text_dup),
+        ("text_0004", text_baked),
     ):
         mask_path = masks / f"{name}.png"
         Image.fromarray(array).save(mask_path)
@@ -710,6 +713,7 @@ def _write_partial_warning_page(
             _node("text_0001", "text", None, "frozen", [0, 2, 8, 6], 0),
             _node("text_0002", "text", None, "pending", [9, 2, 15, 6], 1),
             _node("text_0003", "text", None, "frozen", [0, 2, 6, 6], 0),
+            _node("text_0004", "text", None, "frozen", [9, 6, 15, 8], 2),
         ]
     }
     graph["nodes"][1]["text_ids"] = ["text_0001", "text_0003"]
@@ -1358,6 +1362,82 @@ def test_hybrid_partial_delivery_keeps_layers_and_text(
     assert report["pages"][0]["delivery_mode"] == "partial"
     assert report["fully_editable"] is False
     assert report["degraded_pages"] == ["page_001"]
+
+
+def test_hybrid_partial_delivery_repaints_degraded_from_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A degraded layer no longer claims edit semantics, so its PNG must
+    show the true source pixels inside its alpha — extraction artifacts
+    baked into the shipped layer get repainted, not delivered."""
+    import io
+    import numpy as np
+
+    monkeypatch.setenv("IMAGE2EDITABLE_EMBED_FONTS", "0")
+    store, manifest, details, output = _assembly_hybrid_store(
+        tmp_path, ["warning_partial"]
+    )
+    state = store.read_json(
+        "pages/page_001/reconstruction/component_state.json"
+    )
+    manifest_ref = state["fallback_input_refs"]["presentation_manifest"]
+    manifest_path = store.root / manifest_ref["path"]
+    manifest_doc = json.loads(manifest_path.read_text(encoding="utf-8"))
+    corrupted = False
+    for component in manifest_doc["components"]:
+        if component["component_id"] != "parent_0002":
+            continue
+        rgba_ref = component["rgba"]
+        rgba_path = store.root / rgba_ref["path"]
+        array = np.array(Image.open(rgba_path).convert("RGBA"))
+        assert np.count_nonzero(array[:, :, 3]) > 0
+        array[array[:, :, 3] > 0, :3] = (255, 0, 255)
+        Image.fromarray(array, mode="RGBA").save(rgba_path)
+        rgba_ref["sha256"] = _sha256_path(rgba_path)
+        corrupted = True
+    assert corrupted
+    manifest_path.write_text(
+        json.dumps(manifest_doc, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    manifest_ref["sha256"] = _sha256_path(manifest_path)
+    store.write_json(
+        "pages/page_001/reconstruction/component_state.json", state
+    )
+
+    plan = route_c.build_hybrid_delivery(store, manifest)
+    assert plan["pages"][0]["delivery_mode"] == "partial"
+    outputs = legacy.assemble_legacy_results(store)
+    presentation = Presentation(outputs["16:9"])
+    pictures = [
+        shape for shape in presentation.slides[0].shapes
+        if shape.shape_type == MSO_SHAPE_TYPE.PICTURE
+    ]
+    assert len(pictures) == 3
+    # The degraded right-half layer was repainted from the source (all
+    # 16x9 source pixels are 30,90,150); the frozen left layer keeps its
+    # extracted pixels, and no picture may ship the baked magenta junk.
+    colors = []
+    for shape in pictures:
+        with Image.open(io.BytesIO(shape.image.blob)) as image:
+            colors.append(np.asarray(image.convert("RGBA")))
+    magenta = [
+        int(np.count_nonzero(
+            (array[:, :, :3] == (255, 0, 255)).all(axis=2)
+            & (array[:, :, 3] > 0)
+        ))
+        for array in colors
+    ]
+    assert magenta == [0, 0, 0]
+    right = max(pictures, key=lambda shape: shape.left)
+    with Image.open(io.BytesIO(right.image.blob)) as image:
+        pixels = np.asarray(image.convert("RGBA"))
+    opaque = pixels[pixels[:, :, 3] > 0]
+    assert np.count_nonzero(opaque[:, :3] != (30, 90, 150)) == 0
+    # Frozen text painted natively is punched out of the degraded layer so
+    # it cannot double-print; the pending text region stays baked in.
+    assert np.count_nonzero(pixels[6:8, 1:7, 3]) == 0
+    assert np.count_nonzero(pixels[2:6, 1:7, 3] == 255) == 4 * 6
 
 
 def test_hybrid_partial_delivery_falls_back_to_flattened(
