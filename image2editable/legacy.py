@@ -4341,9 +4341,32 @@ def _execute_legacy_parent_fallback(
         with Image.open(background_path) as image:
             background_pixels = np.asarray(image.convert("RGB")).copy()
         if background_pixels.shape == pixels.shape:
-            calibration = calibrate_page(
-                pixels, np.zeros(pixels.shape[:2], dtype=np.uint8)
-            )
+            # Calibrate against the same text mask the quality gate reads
+            # (cleanup mask, falling back to the raw detection mask) so
+            # halo/edge estimates match the reported violations. A page
+            # without persisted prepared state degrades to an empty mask —
+            # the claim still works, only the halo estimate is coarser.
+            text_mask = np.zeros(pixels.shape[:2], dtype=bool)
+            try:
+                prepared = importlib.import_module(
+                    "image_to_ppt"
+                ).load_component_layers(
+                    store.root / "pages" / page_id
+                    / "reconstruction/initial/prepared_page.json"
+                )
+                text_mask_path = Path(
+                    prepared.get(
+                        "_text_cleanup_mask_path",
+                        prepared["_text_mask_path"],
+                    )
+                )
+                with Image.open(text_mask_path) as image:
+                    loaded_mask = np.asarray(image.convert("L")) > 0
+                if loaded_mask.shape == text_mask.shape:
+                    text_mask = loaded_mask
+            except (OSError, ValueError, KeyError):
+                pass
+            calibration = calibrate_page(pixels, text_mask)
             claimed_shadow = np.zeros(pixels.shape[:2], dtype=bool)
             rewritten = False
             for node in next_graph["nodes"]:

@@ -1287,6 +1287,11 @@ def record_parent_fallback_execution(
             "status": "parent_pending",
             "parent_ids": list(state["fallback"]["parent_ids"]),
         }
+        if shadow_claims:
+            updated["fallback"]["shadow_claims"] = {
+                component_id: {"path": ref["path"], "sha256": ref["sha256"]}
+                for component_id, ref in shadow_claims.items()
+            }
         updated["revision"] += 1
         updated["updated_at"] = _utc_now()
         validate_component_repair_state(updated)
@@ -2814,6 +2819,10 @@ def _commit_parent_fallback_result(store, state: dict, page_id: str) -> dict:
         "status": "parent_preserved",
         "parent_ids": list(state["fallback"]["parent_ids"]),
     }
+    if state["fallback"].get("shadow_claims"):
+        updated["fallback"]["shadow_claims"] = state["fallback"][
+            "shadow_claims"
+        ]
     return _commit_ready_result(store, updated, page_id)
 
 
@@ -2822,6 +2831,12 @@ def _commit_preserved_warning(store, state: dict, page_id: str) -> dict:
     updated["phase"] = "preserved_with_warning"
     updated["status"] = "preserved_with_warning"
     updated["fallback"] = {"status": "warning", "parent_ids": []}
+    if state["fallback"].get("shadow_claims"):
+        # Keep the claim audit trail: the warning path still ships the
+        # grown mask, so the extension evidence must survive the reset.
+        updated["fallback"]["shadow_claims"] = state["fallback"][
+            "shadow_claims"
+        ]
     updated["revision"] += 1
     updated["updated_at"] = _utc_now()
     validate_component_repair_state(updated)

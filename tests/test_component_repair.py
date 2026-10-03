@@ -8102,3 +8102,101 @@ def test_parent_fallback_rejects_grown_mask_without_claim(
             store, "page_001", graph_path=graph_path,
             quality_input_refs=quality_input_refs,
         )
+
+
+def test_parent_fallback_shadow_claims_persist_in_state(
+    page_session: dict,
+) -> None:
+    """Recorded claims stay auditable in component_state — including on
+    the warning path that resets the fallback block."""
+    import numpy as np
+
+    store, graph_path, quality_input_refs = _fallback_execution_case(
+        page_session
+    )
+    state = store.read_json(
+        "pages/page_001/reconstruction/component_state.json"
+    )
+    # The fixture initial mask is 2x2 fully filled — point the recorded
+    # asset at a sparse silhouette so a disjoint extension is possible
+    # (the evidence file itself is hash-bound and must stay untouched).
+    initial = np.array([[True, True], [False, False]])
+    initial_path = graph_path.parent / "masks/candidate_b-initial.png"
+    Image.fromarray(
+        np.where(initial, 255, 0).astype(np.uint8)
+    ).save(initial_path)
+    state["parent_assets"]["candidate_b"] = {
+        "path": initial_path.relative_to(store.root).as_posix(),
+        "sha256": hashlib.sha256(initial_path.read_bytes()).hexdigest(),
+    }
+    store.write_json(
+        "pages/page_001/reconstruction/component_state.json", state
+    )
+    claim = np.array([[False, False], [True, False]])
+    grown = initial | claim
+
+    mask_path = graph_path.parent / "masks/candidate_b.png"
+    Image.fromarray(np.where(grown, 255, 0).astype(np.uint8)).save(mask_path)
+    claim_path = graph_path.parent / "masks/candidate_b-claim.png"
+    Image.fromarray(np.where(claim, 255, 0).astype(np.uint8)).save(claim_path)
+    rows, columns = np.where(grown)
+    graph = json.loads(graph_path.read_text(encoding="utf-8"))
+    for node in graph["nodes"]:
+        if node["id"] == "candidate_b":
+            node["mask_sha256"] = hashlib.sha256(
+                mask_path.read_bytes()
+            ).hexdigest()
+            node["bbox"] = [
+                int(columns.min()), int(rows.min()),
+                int(columns.max()) + 1, int(rows.max()) + 1,
+            ]
+    graph_path.write_text(json.dumps(graph), encoding="utf-8")
+    manifest_ref = quality_input_refs["presentation_manifest"]
+    manifest_path = store.root / manifest_ref["path"]
+    manifest_doc = json.loads(manifest_path.read_text(encoding="utf-8"))
+    graph_sha = hashlib.sha256(graph_path.read_bytes()).hexdigest()
+    manifest_doc["graph_sha256"] = graph_sha
+
+    def _rewrite_graph_sha(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if (
+                    isinstance(item, dict)
+                    and set(item) >= {"path", "sha256"}
+                    and isinstance(item.get("path"), str)
+                    and item["path"].endswith("component-graph.json")
+                ):
+                    item["sha256"] = graph_sha
+                else:
+                    _rewrite_graph_sha(item)
+        elif isinstance(value, list):
+            for item in value:
+                _rewrite_graph_sha(item)
+
+    _rewrite_graph_sha(manifest_doc)
+    manifest_path.write_text(json.dumps(manifest_doc), encoding="utf-8")
+    manifest_ref["sha256"] = hashlib.sha256(
+        manifest_path.read_bytes()
+    ).hexdigest()
+
+    claims = {
+        "candidate_b": {
+            "path": claim_path.relative_to(store.root).as_posix(),
+            "sha256": hashlib.sha256(claim_path.read_bytes()).hexdigest(),
+        }
+    }
+    record_parent_fallback_execution(
+        store, "page_001", graph_path=graph_path,
+        quality_input_refs=quality_input_refs, shadow_claims=claims,
+    )
+    persisted = store.read_json(
+        "pages/page_001/reconstruction/component_state.json"
+    )
+    assert persisted["fallback"]["shadow_claims"] == claims
+
+    component_repair._commit_preserved_warning(store, persisted, "page_001")
+    warned = store.read_json(
+        "pages/page_001/reconstruction/component_state.json"
+    )
+    assert warned["fallback"]["status"] == "warning"
+    assert warned["fallback"]["shadow_claims"] == claims

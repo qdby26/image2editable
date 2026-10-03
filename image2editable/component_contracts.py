@@ -178,12 +178,22 @@ def validate_component_repair_state(state: object) -> dict:
             if not isinstance(entry[name], list) or entry[name] != sorted(set(entry[name])):
                 raise ValueError("component repair history component ids are invalid")
     fallback = state["fallback"]
-    if not isinstance(fallback, dict) or set(fallback) != {"status", "parent_ids"}:
+    if not isinstance(fallback, dict) or not {"status", "parent_ids"} <= set(
+        fallback
+    ) <= {"status", "parent_ids", "shadow_claims"}:
         raise ValueError("component repair fallback is invalid")
     if fallback["status"] not in {"none", "required", "parent_pending", "parent_preserved", "warning"}:
         raise ValueError("component repair fallback status is invalid")
     if not isinstance(fallback["parent_ids"], list) or fallback["parent_ids"] != sorted(set(fallback["parent_ids"])):
         raise ValueError("component repair fallback parents are invalid")
+    shadow_claims = fallback.get("shadow_claims")
+    if shadow_claims is not None:
+        if not isinstance(shadow_claims, dict):
+            raise ValueError("component repair fallback shadow claims are invalid")
+        for component_id, claim_ref in shadow_claims.items():
+            if type(component_id) is not str or not component_id:
+                raise ValueError("component repair fallback shadow claim ids are invalid")
+            _validate_artifact_ref(claim_ref, "fallback shadow claim")
     if state["last_normalized_plan_sha256"] is not None:
         _validate_sha256(state["last_normalized_plan_sha256"], "last plan sha256")
     if state["result_ref"] is not None:
