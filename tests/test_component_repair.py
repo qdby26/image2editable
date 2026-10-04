@@ -216,6 +216,76 @@ def test_build_presentation_layer_repairs_gradient_component_holes() -> None:
     assert all(np.isfinite(value) for value in layer["metrics"].values())
 
 
+def test_presentation_layer_seals_carved_native_text_holes() -> None:
+    from scripts.component_underlay import build_presentation_layer
+
+    # Real case: a degraded region component surrounds text owned by a
+    # frozen text node; the carved glyphs sit inside the alpha silhouette
+    # as enclosed holes. Native text rendering above them needs a solid
+    # underlay surface, so the holes must join the generated underlay.
+    source = np.full((40, 60, 3), (245, 247, 250), dtype=np.uint8)
+    text_clean = source.copy()
+    text = np.zeros((40, 60), dtype=bool)
+    text[14:26, 18:26] = True
+    text[14:26, 32:42] = True
+    source[text] = (20, 40, 80)
+    semantic = np.zeros((40, 60), dtype=bool)
+    semantic[5:35, 5:55] = True
+    semantic &= ~text
+    ownership = semantic.copy()
+
+    layer = build_presentation_layer(
+        source_rgb=source,
+        text_clean_rgb=text_clean,
+        ownership_mask=ownership,
+        semantic_mask=semantic,
+        higher_layer_mask=np.zeros_like(semantic),
+        text_mask=text,
+    )
+
+    alpha = layer["presentation_alpha_mask"]
+    generated = layer["generated_underlay_mask"]
+    assert np.all(alpha[text])
+    assert np.all(generated[text])
+    # The seal must underlay with the text-clean surface, never bake the
+    # source glyphs back into the raster layer.
+    assert np.array_equal(layer["rgb"][text], text_clean[text])
+    # Ownership is untouched: sealed pixels are generated underlay only.
+    assert not np.any(layer["ownership_mask"] & text)
+
+
+def test_presentation_layer_keeps_transparent_ring_interior() -> None:
+    from scripts.component_underlay import build_presentation_layer
+
+    # A see-through ring interior that merely neighbours text is page
+    # background, not a carved glyph: it must keep its transparency.
+    height, width = 40, 60
+    source = np.full((height, width, 3), (245, 247, 250), dtype=np.uint8)
+    yy, xx = np.mgrid[:height, :width]
+    ring = ((yy - 20) ** 2 + (xx - 30) ** 2 <= 12 ** 2) & (
+        (yy - 20) ** 2 + (xx - 30) ** 2 > 7 ** 2
+    )
+    source[ring] = (30, 80, 160)
+    text_clean = source.copy()
+    semantic = ring.copy()
+    text = np.zeros((height, width), dtype=bool)
+    text[16:24, 44:54] = True
+    source[text] = (20, 40, 80)
+    ownership = semantic.copy()
+
+    layer = build_presentation_layer(
+        source_rgb=source,
+        text_clean_rgb=text_clean,
+        ownership_mask=ownership,
+        semantic_mask=semantic,
+        higher_layer_mask=np.zeros_like(semantic),
+        text_mask=text,
+    )
+
+    interior = ((yy - 20) ** 2 + (xx - 30) ** 2 <= 7 ** 2)
+    assert not np.any(layer["presentation_alpha_mask"][interior])
+
+
 def test_presentation_layer_keeps_source_pixels_owned_by_visual() -> None:
     from scripts.component_underlay import build_presentation_layer
 
@@ -474,6 +544,39 @@ def test_visual_metrics_limit_filters_to_local_hole(underlay_engine, monkeypatch
         "texture_deficit": 0.0,
     }
     assert areas and max(areas) <= (12 + 6) * (14 + 6)
+
+
+def test_underlay_boundary_metrics_require_minimum_evidence() -> None:
+    # A hole whose boundary barely touches donors (e.g. a 1-2px mask sliver at
+    # a card edge) produces a seam MAE from a handful of pixels: statistically
+    # meaningless and visually invisible. Below the evidence floor the metrics
+    # must report no measurable seam instead of a noise-scaled value.
+    from scripts.component_underlay import _visual_metrics
+
+    height, width = 24, 24
+    source = np.full((height, width, 3), 220, dtype=np.uint8)
+    visual_hole = np.zeros((height, width), dtype=bool)
+    visual_hole[8:16, 8:16] = True
+    # Sparse-donor case: only two hole pixels touch donors, so both the seam
+    # MAE and the gradient p95 rest on two samples.
+    donor_mask = np.zeros((height, width), dtype=bool)
+    donor_mask[7, 8:10] = True
+    donor_mask[6, 8:10] = True
+    candidate = np.full((height, width, 3), 40, dtype=np.uint8)
+
+    metrics = _visual_metrics(candidate, source, donor_mask, visual_hole)
+
+    assert metrics["boundary_color_mae"] == 0.0
+    assert metrics["gradient_jump_p95"] == 0.0
+
+    # The same mismatch with a full ring of boundary pixels keeps reporting the
+    # real seam value.
+    donor_mask = ~visual_hole
+
+    metrics = _visual_metrics(candidate, source, donor_mask, visual_hole)
+
+    assert metrics["boundary_color_mae"] > 100.0
+    assert metrics["gradient_jump_p95"] > 0.0
 
 
 def test_embedded_higher_regions_do_not_rescan_page_per_component(underlay_engine, monkeypatch):
@@ -898,7 +1001,13 @@ def test_presentation_layer_preserves_thin_visible_rim(size: int, text_position:
 
     assert np.array_equal(layer["ownership_mask"], visible)
     assert np.array_equal(layer["rgb"][visible], source[visible])
-    assert not np.any(layer["presentation_alpha_mask"] & higher)
+    # The layer may seal enclosed text holes even under a higher layer's
+    # ownership — the native text above still needs a backdrop wherever the
+    # higher layer's own alpha carries the same carved hole.  Non-text
+    # pixels under the higher layer stay untouched.
+    assert not np.any(
+        layer["presentation_alpha_mask"] & higher & ~text
+    )
 
 
 def test_presentation_layer_ignores_adjacent_higher_layer_at_semantic_edge() -> None:

@@ -1959,6 +1959,28 @@ def test_background_text_gate_ignores_decoration_inside_wide_ocr_box(
     assert not np.any(context.background_residual_text_ink & ~glyph)
 
 
+def test_residual_text_ink_ignores_structural_edge_under_former_glyphs() -> None:
+    # A soft card shadow running beneath erased glyphs leaves only a few
+    # gray levels of deviation at former ink positions — sub-visible edge
+    # shimmer, not readable residue.  The delta floor ignores it while a
+    # true leftover stroke sits an order higher and still counts.
+    image = np.full((80, 160, 3), 255, dtype=np.uint8)
+    image[:, 88:92] = 252          # soft step
+    image[:, 92:] = 249            # card shadow body
+    ink = np.zeros(image.shape[:2], dtype=bool)
+    ink[36:44, 30:38] = True      # former glyph on the flat surface
+    ink[36:44, 90:96] = True      # former glyph sitting on the shadow edge
+    image[36:44, 30:38] = 238     # confined faint ghost left where ink was
+    calibration = component_quality.PageCalibration(0.0, 0.0, 2, 2, 1)
+
+    residual = component_quality._residual_text_ink_mask(
+        image, ink, ink, calibration
+    )
+
+    assert not np.any(residual[:, 88:])     # the shadow edge is structural
+    assert np.any(residual[36:44, 30:38])   # the confined ghost still counts
+
+
 def test_page_background_residual_ignores_text_pixels_owned_by_a_component() -> None:
     case = _text_isolation_case()
     case["background"] = np.full_like(case["source"], 238)
@@ -3527,6 +3549,46 @@ def test_exterior_shadow_claim_returns_confined_mass() -> None:
     assert not np.any(claim & case["support"])
     # The whole 4-px shadow band is claimable, not only the 1-px ring.
     assert np.all(claim[36:40, 18:46])
+
+
+def test_exterior_shadow_claim_absorbs_flaggable_antialias_fringe() -> None:
+    """The claim must eat the outer AA fringe the gate can still flag.
+
+    The gate flags exterior pixels darker than baseline by ``>4`` while the
+    claim's ``darker`` seed/signature requires ``-6``: a 1-2 px fringe in
+    the 4..6 band is flaggable but unclaimable, so a confined shadow still
+    trips ``duplicate_shadow`` after the claim (real case: c17 parent_0006
+    left edge, ~250 fringe px at luma ~248 vs baseline 253).
+    """
+    case = _shadow_claim_case()
+    # Narrow the claimed core to 2 rows so the lighter AA fringe at rows
+    # 38-40 stays inside the claim's ``far`` confinement ring (the real
+    # case had the fringe 1-2 px past the claimed band).  91 vs baseline
+    # 96 is within the gate's ``>4`` flag band but outside the claim's
+    # ``-6`` ``darker`` band.
+    case["source"][38:40, 18:46] = 91
+    case["background"][38:40, 18:46] = 91
+    case["reconstructed"][38:40, 18:46] = 91
+    claim = component_quality.exterior_shadow_claim(
+        case["support"], case["source"], case["background"],
+        case["foreign"], case["calibration"],
+    )
+    assert np.all(claim[38:40, 18:46])
+    # The grown support must leave nothing the gate would flag: unchanged
+    # exterior pixels darker than the local baseline by more than 4.
+    grown = case["support"] | claim
+    adjacent = component_quality.cv2.dilate(
+        grown.astype(np.uint8), np.ones((3, 3), np.uint8)
+    ) > 0
+    exterior = adjacent & ~grown
+    unchanged = (
+        np.abs(
+            case["source"].astype(np.int16) - case["background"].astype(np.int16)
+        ).max(axis=2)
+        <= 3.0
+    )
+    luma = case["source"].astype(np.float32).max(axis=2)
+    assert not np.any(exterior & unchanged & (luma < 96.0 - 4.0))
 
 
 def test_exterior_shadow_claim_never_takes_foreign_pixels() -> None:

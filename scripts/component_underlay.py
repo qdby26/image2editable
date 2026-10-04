@@ -131,9 +131,19 @@ def _visual_metrics(
 
     if not boundary_errors:
         return empty
-    boundary_mae = float(np.concatenate(boundary_errors).mean())
+    # Seam claims need a minimum of boundary evidence: a hole that barely
+    # touches donors (a thin mask sliver at a surface edge) produces a MAE or
+    # p95 over a handful of pixels, which is noise rather than a visible seam.
+    boundary_values = np.concatenate(boundary_errors)
+    boundary_mae = (
+        float(boundary_values.mean())
+        if boundary_values.shape[0] >= 8 else 0.0
+    )
     gradient_values = np.concatenate(gradient_errors) if gradient_errors else np.array([])
-    gradient_jump_p95 = float(np.percentile(gradient_values, 95)) if gradient_values.size else 0.0
+    gradient_jump_p95 = (
+        float(np.percentile(gradient_values, 95))
+        if gradient_values.size >= 8 else 0.0
+    )
 
     candidate_gray = cv2.cvtColor(candidate, cv2.COLOR_RGB2GRAY)
     source_gray = cv2.cvtColor(source, cv2.COLOR_RGB2GRAY)
@@ -638,6 +648,21 @@ def build_presentation_layer(
         semantic & ~ownership & expanded_higher & ~higher_layer & ~text_hole
     )
     generated = text_hole | visual_hole
+    # Text carved out of this component's mask for a frozen text owner
+    # leaves glyph-shaped holes enclosed by the alpha silhouette. Native
+    # text rendered above them needs a solid underlay, so seal the text
+    # pixels into the generated layer (they stay the text-clean colour).
+    # Higher layers are no reason to skip: a sibling layer can carry the
+    # same carved hole, and the underlay exists precisely to back the ink
+    # wherever nothing above paints it (c10 灌药 card: 464px left bare by
+    # the higher-layer exclusion).  Other components' ownership stays
+    # excluded — those pixels are theirs to paint.
+    seal = _enclosed_holes(ownership | generated) & text
+    if other_ownership_mask is not None:
+        seal &= ~_mask_array(
+            "other_ownership_mask", other_ownership_mask, shape
+        )
+    generated |= seal
     rgb = np.asarray(text_clean_rgb, dtype=np.uint8).copy()
     rgb[ownership] = source[ownership]
     if np.any(text_hole):

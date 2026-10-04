@@ -204,6 +204,7 @@ class _WorkerStatus:
         self._path = Path(path)
         self._state: dict = {
             "phase": None, "attempt": 0, "owned": [], "protected": [],
+            "worker_pid": os.getpid(),
         }
 
     def _flush(self) -> None:
@@ -230,6 +231,7 @@ class _WorkerStatus:
             "attempt": self._state["attempt"],
             "owned": [dict(r) for r in self._state["owned"]],
             "protected": list(self._state["protected"]),
+            "worker_pid": self._state["worker_pid"],
         }
 
     def publish(self, kind: str, payload) -> None:
@@ -902,7 +904,16 @@ def _cleanup_worker(worker, status: dict | None) -> None:
     """Kill only verified owned POWERPNTs, then the worker itself."""
     owned: list = []
     protected: set[int] = set()
+    # The worker reports its own interpreter pid: under a launcher-style
+    # interpreter (e.g. a uv/redirector venv python.exe that re-execs into a
+    # child process) the Popen handle's pid is the shim, not the process
+    # that actually spawned owned children — comparing against worker.pid
+    # would then silently defeat owned cleanup entirely.
+    worker_pid = worker.pid
     if isinstance(status, dict):
+        reported_pid = status.get("worker_pid")
+        if type(reported_pid) is int:
+            worker_pid = reported_pid
         raw_owned = status.get("owned")
         if isinstance(raw_owned, list):
             owned = [r for r in raw_owned if isinstance(r, dict)]
@@ -911,7 +922,7 @@ def _cleanup_worker(worker, status: dict | None) -> None:
             protected = {p for p in raw_protected if type(p) is int}
     for record in owned:
         try:
-            _kill_owned_process(record, protected, worker.pid)
+            _kill_owned_process(record, protected, worker_pid)
         except Exception:
             pass
     try:
@@ -920,6 +931,41 @@ def _cleanup_worker(worker, status: dict | None) -> None:
             worker.wait(timeout=2)
     except Exception:
         pass
+    if worker_pid != worker.pid:
+        # Launcher-style interpreter: the Popen handle terminated the shim,
+        # which leaves the real interpreter (and its owned children inside
+        # it) running.  Kill the reported worker pid too, but only after
+        # verifying it is the same interpreter image — the pid could have
+        # been reused after the worker already exited.
+        import psutil
+
+        try:
+            real_worker = psutil.Process(worker_pid)
+            shim_exe = None
+            try:
+                shim_exe = os.path.normcase(psutil.Process(worker.pid).exe())
+            except (psutil.Error, OSError):
+                pass
+            real_exe = None
+            try:
+                real_exe = os.path.normcase(real_worker.exe())
+            except (psutil.Error, OSError):
+                pass
+            is_worker = (shim_exe is not None and real_exe == shim_exe)
+            if not is_worker and real_exe is None:
+                # exe unreadable: accept a recently-started process only —
+                # a worker cannot outlive the supervision watchdog anyway.
+                try:
+                    is_worker = abs(real_worker.create_time() - time.time()) < (
+                        _EMBED_WATCHDOG_S + _CLEANUP_TIMEOUT_S
+                    )
+                except (psutil.Error, OSError):
+                    is_worker = False
+            if is_worker and real_worker.is_running():
+                real_worker.kill()
+                real_worker.wait(timeout=2)
+        except (psutil.Error, OSError):
+            pass
 
 
 def _supervise_embed_worker(

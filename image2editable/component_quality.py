@@ -661,7 +661,10 @@ def _residual_text_ink_mask(
         local_delta = np.maximum(
             local_delta, cv2.absdiff(image[:, :, channel], local_fill)
         )
-    threshold = max(2.0, calibration.noise_l1 * 2.0)
+    # The delta floor must clear sub-visible edge shimmer: a deviation of a
+    # few gray levels at former ink positions is never readable residue, while
+    # a real leftover stroke or fill ghost sits an order higher.
+    threshold = max(6.0, calibration.noise_l1 * 2.0)
     gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
     edge_strength = cv2.morphologyEx(
         gray, cv2.MORPH_GRADIENT, np.ones((3, 3), dtype=np.uint8)
@@ -959,6 +962,28 @@ def exterior_shadow_claim(
         if np.any(mass & ~far):
             continue
         claim |= mass
+    if np.any(claim):
+        # The gate flags exterior pixels darker than the baseline by >4
+        # while ``darker`` requires -6: a 1-2 px antialias fringe in
+        # between would stay flaggable forever.  Absorb that fringe into
+        # the claim — pixels adjacent to the claimed mass, still unchanged
+        # in the background, mildly darker, foreign-free, and confined to
+        # ``far`` — so a claimed shadow leaves nothing for the gate.
+        fringe = (
+            unchanged
+            & (source_luma < baseline_luma - 4.0)
+            & ~support
+            & ~foreign
+            & far
+        )
+        for _ in range(3):
+            ring = cv2.dilate(
+                claim.astype(np.uint8), np.ones((3, 3), dtype=np.uint8)
+            ) > 0
+            absorb = ring & ~claim & fringe
+            if not np.any(absorb):
+                break
+            claim |= absorb
     return claim
 
 

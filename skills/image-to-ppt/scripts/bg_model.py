@@ -498,7 +498,12 @@ def build_clean_background(
     removal = build_removal_mask(element_masks, text_mask)
     repaired = repair_masked_background(img, removal, large_inpainter)
     if text_clean_image is None:
-        return repaired
+        ink_source = np.asarray(text_mask)
+        if text_restore_mask is not None:
+            restore_candidate = np.asarray(text_restore_mask)
+            if restore_candidate.shape == repaired.shape[:2]:
+                ink_source = restore_candidate | ink_source
+        return _flatten_text_ghosts(img, repaired, ink_source)
 
     trusted = np.asarray(text_clean_image)
     if trusted.shape != repaired.shape:
@@ -508,6 +513,7 @@ def build_clean_background(
     )
     if restore_source_mask.shape != repaired.shape[:2]:
         raise ValueError("text restore mask must match the image height and width")
+    ink_source = restore_source_mask | np.asarray(text_mask)
     text_removal = build_removal_mask([], restore_source_mask) > 0
     # Text cleanup preserves graphics, so never restore it over removed elements.
     element_removal = build_removal_mask(element_masks, np.zeros_like(text_mask)) > 0
@@ -533,7 +539,101 @@ def build_clean_background(
         dirty_labels = dirty_labels[dirty_labels > 0]
         text_removal &= ~np.isin(labels, dirty_labels)
     repaired[text_removal] = trusted[text_removal]
-    return repaired
+    return _flatten_text_ghosts(img, repaired, ink_source)
+
+
+def _flatten_text_ghosts(
+    img: np.ndarray,
+    repaired: np.ndarray,
+    ink_source: np.ndarray,
+) -> np.ndarray:
+    """Re-repair ink-shaped residue the background fill left behind.
+
+    Dense glyph masks (CJK strokes, bold art text) can leave a soft ghost in
+    the inpainted background even when the trusted text-clean pass is clean.
+    The residue is invisible at print scale but still trips the page-level
+    ``background_text_clean`` evidence, so re-fill detected stroke remnants
+    from their now-clean surroundings instead of shipping the ghost.
+    """
+    ink_source = np.asarray(ink_source) > 0
+    if not np.any(ink_source):
+        return repaired
+    try:
+        from scripts.component_quality import (
+            _residual_text_ink_mask, _text_ink_mask, calibrate_page,
+        )
+    except ModuleNotFoundError as error:
+        if error.name != "scripts.component_quality":
+            raise
+        from image2editable.component_quality import (
+            _residual_text_ink_mask, _text_ink_mask, calibrate_page,
+        )
+
+    calibration = calibrate_page(img, ink_source.astype(np.uint8))
+    ink = _text_ink_mask(img, ink_source, calibration)
+    # Match the gate's fence: the detector must see the same dilated ink
+    # neighborhood it uses at evaluation time, or edge-adjacent specks get
+    # dropped as structural and the ghost survives.
+    alignment_radius = max(
+        1,
+        (max(calibration.text_halo_px, calibration.edge_width_px) + 1) // 2,
+    )
+    ink_neighborhood = cv2.dilate(
+        ink.astype(np.uint8),
+        np.ones((2 * alignment_radius + 1,) * 2, dtype=np.uint8),
+    ) > 0
+    residual = _residual_text_ink_mask(
+        repaired, ink, ink_neighborhood, calibration
+    )
+    if not np.any(residual):
+        return repaired
+    # Detection marks stroke edges only; the soft halo between detected specks
+    # escapes the detector but still reads as ink to an inpaint donor. Close
+    # the specks, then escalate per text region: a dense leftover makes the
+    # whole region's donors untrusted, so the entire region is refilled from
+    # outside rather than patched spot by spot.
+    residual_strokes = (
+        cv2.morphologyEx(
+            residual.astype(np.uint8),
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21)),
+        )
+        > 0
+    )
+    residual_patch = (
+        cv2.dilate(
+            residual_strokes.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
+        )
+        > 0
+    )
+    ghost_mask = np.zeros(repaired.shape[:2], dtype=bool)
+    _, text_labels = cv2.connectedComponents(ink_source.astype(np.uint8), 8)
+    for label in np.unique(text_labels[residual_strokes]):
+        if not label:
+            continue
+        component = text_labels == label
+        coverage = int(np.count_nonzero(residual_strokes & component))
+        area = int(np.count_nonzero(component))
+        if coverage >= max(64, int(round(area * 0.005))):
+            ghost_mask |= component
+        else:
+            ghost_mask |= residual_patch & component
+    if not np.any(ghost_mask):
+        return repaired
+    ghost_mask = (
+        cv2.dilate(
+            ghost_mask.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
+        )
+        > 0
+    )
+    # Ghost remnants are thin and surrounded by already-clean surface, so the
+    # local inpainter is the right tool; routing through LaMa here would add a
+    # model call for what is a few speckled pixels.
+    output = _inpaint(repaired, ghost_mask.astype(np.uint8) * 255)
+    output[~ghost_mask] = repaired[~ghost_mask]
+    return output
 
 
 def build_removal_mask(

@@ -534,7 +534,8 @@ def test_worker_state_in_error_result_used_for_cleanup(
         "psutil.Process(child.pid).create_time(), 'exe': sys.executable, "
         "'parent_pid': os.getpid()}\n"
         "open(RESULT, 'w').write(json.dumps({'ok': False, 'error': 'boom',"
-        " 'worker_state': {'owned': [rec], 'protected': []}}))\n"
+        " 'worker_state': {'owned': [rec], 'protected': [],"
+        " 'worker_pid': os.getpid()}}))\n"
         "sys.exit(1)\n"
     )
     marker = tmp_path / "marker"
