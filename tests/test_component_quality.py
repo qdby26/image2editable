@@ -2033,6 +2033,84 @@ def test_material_edge_residual_adjacent_to_owned_component_is_ignored() -> None
     assert not np.any(unexplained)
 
 
+def test_material_long_thin_residual_on_owned_boundary_is_ignored() -> None:
+    """A 1-px ribbon running along an owned edge is boundary residue even
+    when longer than the area cap — real c17 case: 283px sliver along the
+    top of an org-chart box."""
+    shape = (96, 400)
+    evidence = np.zeros(shape, dtype=bool)
+    owned = np.zeros(shape, dtype=bool)
+    owned[30:60, 40:340] = True
+    evidence[30:60, 40:340] = True
+    evidence[29, 40:340] = True
+    calibration = component_quality.PageCalibration(1.0, 20.0, 2, 3, 20)
+
+    metrics, unexplained = component_quality.material_ownership_metrics(
+        evidence,
+        [owned],
+        np.zeros(shape, dtype=bool),
+        calibration,
+    )
+
+    assert metrics["unexplained_visual_pixels"] == 0
+    assert not np.any(unexplained)
+
+
+def test_material_fully_adjacent_thick_ring_residual_is_ignored() -> None:
+    """A ≤4px-thick ribbon that hugs owned pixels along its entire extent
+    is border residue too — c10 case: a 4px-thick card-outline ring fully
+    adjacent to the degraded parent mask."""
+    shape = (96, 400)
+    evidence = np.zeros(shape, dtype=bool)
+    owned = np.zeros(shape, dtype=bool)
+    owned[30:62, 42:342] = True
+    evidence[30:62, 42:342] = True
+    # 3px ring just outside the owned edge along three sides — interior
+    # distance-transform thickness 3.0 exceeds boundary_thickness (2) so
+    # only the high-adjacency forgiveness branch can clear it.  With
+    # edge_width_px=4 the owned neighbourhood reaches 3px, so every ring
+    # pixel is adjacent — matching the real c10 card-outline ring.
+    evidence[27:30, 42:342] = True
+    evidence[30:62, 39:42] = True
+    evidence[30:62, 342:345] = True
+    calibration = component_quality.PageCalibration(1.0, 20.0, 4, 3, 20)
+
+    metrics, unexplained = component_quality.material_ownership_metrics(
+        evidence,
+        [owned],
+        np.zeros(shape, dtype=bool),
+        calibration,
+    )
+
+    assert metrics["unexplained_visual_pixels"] == 0
+    assert not np.any(unexplained)
+
+
+def test_material_long_thin_residual_touching_only_at_ends_still_fails() -> None:
+    """A thin line that only brushes owned pixels at its ends is a missed
+    connector, not boundary residue — must still surface."""
+    shape = (96, 400)
+    evidence = np.zeros(shape, dtype=bool)
+    owned_a = np.zeros(shape, dtype=bool)
+    owned_b = np.zeros(shape, dtype=bool)
+    owned_a[20:50, 30:40] = True
+    owned_b[20:50, 360:370] = True
+    evidence[20:50, 30:40] = True
+    evidence[20:50, 360:370] = True
+    evidence[30, 40:360] = True
+    calibration = component_quality.PageCalibration(1.0, 20.0, 2, 3, 20)
+
+    metrics, unexplained = component_quality.material_ownership_metrics(
+        evidence,
+        [owned_a, owned_b],
+        np.zeros(shape, dtype=bool),
+        calibration,
+    )
+
+    assert metrics["unexplained_visual_pixels"] == 320
+    assert np.array_equal(unexplained, evidence & ~(owned_a | owned_b))
+
+
 def test_material_compact_residual_adjacent_to_owned_component_still_fails() -> None:
     shape = (96, 160)
     evidence = np.zeros(shape, dtype=bool)

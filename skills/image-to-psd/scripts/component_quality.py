@@ -1370,10 +1370,31 @@ def material_ownership_metrics(
         thickness = 2.0 * float(
             cv2.distanceTransform(region.astype(np.uint8), cv2.DIST_L2, 5).max()
         )
+        adjacent_pixels = int(
+            np.count_nonzero(region & owned_neighborhood[bounds])
+        )
+        # A thin ribbon that mostly hugs owned pixels is boundary residue
+        # (mask edge undershoot / anti-alias sliver) regardless of length;
+        # a thin line that only brushes owned pixels at its ends is a
+        # missed connector and must still surface.  Ribbons that hug owned
+        # pixels along (nearly) their whole extent are residue even up to
+        # a 4px stroke thickness — a detached element cannot have such
+        # adjacency.
         is_boundary_residual = (
-            area <= boundary_area_limit
-            and np.any(region & owned_neighborhood[bounds])
-            and thickness <= boundary_thickness
+            adjacent_pixels > 0
+            and (
+                (
+                    thickness <= boundary_thickness
+                    and (
+                        area <= boundary_area_limit
+                        or adjacent_pixels >= area * 0.6
+                    )
+                )
+                or (
+                    thickness <= 4.0
+                    and adjacent_pixels >= area * 0.9
+                )
+            )
         )
         if is_boundary_residual:
             continue
