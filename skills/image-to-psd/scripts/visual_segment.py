@@ -565,6 +565,23 @@ def execute_component_actions(
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(mask_payloads[node["id"]])
                 continue
+            if node["state"] == "inactive" and node["id"] in mask_payloads:
+                # Inactive (discarded/absorbed) nodes keep their original
+                # mask file untouched: actions never mutate their pixels, so
+                # rewriting path/sha would falsify the provenance check that
+                # requires every field but state to stay identical to the
+                # source record.  Nodes minted this round (merge/split) have
+                # no source payload and fall through to the rewrite branch;
+                # likewise any node whose pixels did change falls through so
+                # the validator still observes the mutation.
+                original = np.asarray(
+                    Image.open(io.BytesIO(mask_payloads[node["id"]])).convert("L")
+                ) > 0
+                if np.array_equal(original, mask):
+                    path = staging / node["mask"]
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(mask_payloads[node["id"]])
+                    continue
             path = mask_dir / f"{node['id']}.png"
             Image.fromarray(mask.astype(np.uint8) * 255).save(path)
             node["mask"] = f"masks/{node['id']}.png"

@@ -3834,6 +3834,32 @@ def test_execute_discard_inactivates_redundant_candidate(tmp_path: Path) -> None
     assert by_id["right"]["state"] == "pending"
 
 
+def test_execute_discard_preserves_inactive_mask_provenance(
+    tmp_path: Path,
+) -> None:
+    """Discarding a node must not rewrite its mask path/sha — the
+    provenance check requires every field except state to stay put."""
+    image, graph, input_dir = _action_case(tmp_path)
+    left = next(node for node in graph["nodes"] if node["id"] == "left")
+    # Initial evidence masks carry numbered names (0018-component_0009.png);
+    # the discard must not rename the file behind the validator's back.
+    renamed = input_dir / "masks/0018-left.png"
+    renamed.write_bytes((input_dir / "masks/left.png").read_bytes())
+    left["mask"] = "masks/0018-left.png"
+
+    result = execute_component_actions(
+        image, graph, [_action("discard", ["left"])], sam_runner=None,
+        input_dir=input_dir, output_dir=tmp_path / "round-discard",
+    )
+
+    node = next(node for node in result["nodes"] if node["id"] == "left")
+    assert node["state"] == "inactive"
+    assert node["mask"] == "masks/0018-left.png"
+    assert (
+        tmp_path / "round-discard" / "masks/0018-left.png"
+    ).read_bytes() == renamed.read_bytes()
+
+
 def test_execute_background_rebuild_action_preserves_component_graph(tmp_path: Path) -> None:
     image, graph, input_dir = _action_case(tmp_path)
 
