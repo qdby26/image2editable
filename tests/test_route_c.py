@@ -2545,17 +2545,22 @@ def test_completed_reentry_rejects_bool_request_schema(
 
 
 @pytest.mark.parametrize(
-    ("junk_text", "junk_confidence", "emitted"),
+    ("junk_text", "junk_box", "junk_confidence", "emitted"),
     [
-        ("m", 0.4, False),   # single ascii + low confidence
-        ("xy", 0.4, False),  # low confidence alone
-        ("m", 0.95, True),   # confident single glyph stays native
+        ("m", [9, 6, 6, 2], 0.4, False),   # single ascii + low confidence
+        ("xy", [9, 6, 6, 2], 0.4, False),  # low confidence alone
+        # confident single glyph near other text stays native
+        ("m", [9, 6, 6, 2], 0.95, True),
+        # confident single glyph floating far from any text is an OCR
+        # false positive (real c3 case: "m" at 0.957, 180px from text)
+        ("m", [15, 7, 1, 1], 0.95, False),
     ],
 )
 def test_hybrid_partial_delivery_gates_frozen_text_emission(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     junk_text: str,
+    junk_box: list[int],
     junk_confidence: float,
     emitted: bool,
 ) -> None:
@@ -2579,7 +2584,7 @@ def test_hybrid_partial_delivery_gates_frozen_text_emission(
         "align": 1, "confidence": 1.0,
     }, {
         # text_0004: frozen node sitting inside the degraded region.
-        "box": [9, 6, 6, 2], "text": junk_text, "font_size": 8.0,
+        "box": junk_box, "text": junk_text, "font_size": 8.0,
         "color": "#000000", "bold": False, "font": "Arial",
         "align": 1, "confidence": junk_confidence,
     }]
@@ -2606,7 +2611,8 @@ def test_hybrid_partial_delivery_gates_frozen_text_emission(
     )
     with Image.open(io.BytesIO(right.image.blob)) as image:
         pixels = np.asarray(image.convert("RGBA"))
-    junk_region = pixels[6:8, 9:15, 3]
+    jx, jy, jw, jh = junk_box
+    junk_region = pixels[jy:jy + jh, jx:jx + jw, 3]
     if emitted:
         # Emitted text is punched out so it cannot double-print.
         assert np.count_nonzero(junk_region) == 0

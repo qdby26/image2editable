@@ -5706,7 +5706,9 @@ def _hybrid_partial_slide_data(
     # treatment pending text gets — so nothing is lost visually.
     emitted_text_ids = set()
 
-    def _emittable_native_text(record: dict) -> bool:
+    def _emittable_native_text(
+        record: dict, records: list[dict]
+    ) -> bool:
         text = str(record["normalized"].get("text") or "").strip()
         raw = record.get("raw")
         confidence = raw.get("confidence") if isinstance(raw, dict) else None
@@ -5716,13 +5718,32 @@ def _hybrid_partial_slide_data(
             and confidence < 0.6
         ):
             return False
-        if len(text) == 1 and text.isascii() and (
-            confidence is None
-            or not isinstance(confidence, (int, float))
-            or isinstance(confidence, bool)
-            or confidence < 0.9
-        ):
-            return False
+        if len(text) == 1 and text.isascii():
+            if (
+                confidence is None
+                or not isinstance(confidence, (int, float))
+                or isinstance(confidence, bool)
+                or confidence < 0.9
+            ):
+                return False
+            # A confident-but-wrong single glyph (OCR reads a stray mark
+            # as "m" at 0.96) only gets caught by context: real single
+            # chars (KPI digits, bullets) sit near other text. Isolated
+            # by >4x own box size → stays baked like pending text.
+            box = record["normalized"]["box"]
+            cx = (box[0] + box[2]) / 2
+            cy = (box[1] + box[3]) / 2
+            radius = 4 * max(box[2] - box[0], box[3] - box[1])
+            for other in records:
+                if other is record:
+                    continue
+                obox = other["normalized"]["box"]
+                ocx = (obox[0] + obox[2]) / 2
+                ocy = (obox[1] + obox[3]) / 2
+                if math.hypot(ocx - cx, ocy - cy) < radius:
+                    break
+            else:
+                return False
         return True
 
     def _native_text_items() -> list:
@@ -5790,13 +5811,14 @@ def _hybrid_partial_slide_data(
     # emission gate decides which frozen ids qualify; items it rejects
     # keep their pixels like pending text, so nothing can vanish.
     try:
+        text_records = _component_text_records(
+            prepared.get("text_items", []), page_size
+        )
         emitted_text_ids = {
             record["normalized"]["id"]
-            for record in _component_text_records(
-                prepared.get("text_items", []), page_size
-            )
+            for record in text_records
             if record["normalized"]["id"] in frozen_text_ids
-            and _emittable_native_text(record)
+            and _emittable_native_text(record, text_records)
         }
     except ValueError:
         emitted_text_ids = set()
