@@ -1079,6 +1079,107 @@ def test_glow_bridged_owned_components_split_into_separate_objects(tmp_path):
                    for e in covering)
 
 
+def test_card_edge_sliver_is_not_an_independent_unit(tmp_path):
+    from image2editable.layout_first import _dedupe_card_rasters
+
+    rgba=np.full((190,4,4),255,np.uint8);rgba[:,:,:3]=[30,60,140]
+    path=tmp_path/'edge.png';Image.fromarray(rgba).save(path)
+    elements=[{'object_id':'card','role':'card','route':'native_shape','bbox':[0,0,440,290],
+               'shape':{'fill_rgb':[30,60,140]}},
+              {'object_id':'unit','role':'visual','route':'raster_component',
+               'component':{'path':str(path),'x':437,'y':30,'w':4,'h':190}}]
+    result,_=_dedupe_card_rasters(elements)
+    assert [e['object_id'] for e in result]==['card']
+
+
+def test_tail_punctuation_context_merges_without_repeating_glyph(tmp_path):
+    from image2editable.layout_first import _recover_text_gaps,_text_mask
+
+    rgb=np.full((160,600,3),255,np.uint8)
+    cv2.putText(rgb,'?',(240,85),cv2.FONT_HERSHEY_SIMPLEX,1,(30,30,30),2)
+    items=[{'text':'癌','box':[60,55,150,40]}]
+    def reader(path,**kwargs):
+        return [{'text':'癌?','box':[50,5,60,30],'confidence':.99}],None
+    result,_,_=_recover_text_gaps(rgb,items,_text_mask(items,rgb.shape[:2]),tmp_path,reader)
+    assert [v['text'] for v in result]==['癌?']
+
+
+def test_tiny_owned_residual_does_not_emit_independent_object(tmp_path):
+    from image2editable.layout_first import _emit_residual
+
+    rgba=np.full((21,7,4),255,np.uint8)
+    elements=[]
+    count=_emit_residual([{'rgba':rgba,'x':50,'y':50,'w':7,'h':21,'owned':True}],
+                         elements,tmp_path,np.full((2160,3840),100,np.uint8),
+                         (2160,3840),np.zeros((2160,3840),np.uint8),[])
+    assert count==0
+
+
+def test_split_color_label_refits_its_own_weight(monkeypatch):
+    from image2editable.layout_first import refine_layout_text
+
+    rgb=np.full((100,300,3),255,np.uint8)
+    cv2.rectangle(rgb,(20,20),(80,70),(20,60,180),-1)
+    cv2.rectangle(rgb,(100,20),(220,70),(50,50,50),-1)
+    monkeypatch.setattr('scripts.font_match.match_text_face',lambda *a,**k:
+                        {'font':'Microsoft YaHei','bold':True,'font_size_px':80})
+    item={'text':'标签：正文','box':[10,10,230,70],'bold':False,'font_size':14,
+          'words':[{'text':'标签：','box':[0,0,.35,1]},{'text':'正文','box':[.4,0,.6,1]}]}
+    result,_=refine_layout_text(rgb,[item])
+    assert len(result)==2
+    assert result[0]['bold'] is True
+    assert result[0]['font_size']==256
+
+
+def test_frame_stroke_width_is_measured_from_pixels(tmp_path):
+    from image2editable.layout_first import prepare_layout
+
+    rgb=np.full((600,1200,3),255,np.uint8)
+    cv2.rectangle(rgb,(100,100),(1100,500),(250,240,200),-1)
+    cv2.rectangle(rgb,(100,100),(1100,500),(220,160,20),4)
+    path=tmp_path/'frame.png';Image.fromarray(rgb).save(path)
+    slide,_=prepare_layout(path,tmp_path/'assets',text_items=[])
+    cards=[e for e in slide['visual_elements'] if e.get('role')=='card']
+    assert cards
+    assert 3<=cards[0]['shape']['line_width']<=6
+
+
+def test_audit_does_not_call_foreign_icon_a_duplicate_card(tmp_path):
+    from image2editable.layout_first import _audit_invariants
+
+    rgba = np.zeros((100,160,4),np.uint8)
+    rgba[20:80,110:150] = [20,40,90,255]
+    path=tmp_path/'icon.png';Image.fromarray(rgba).save(path)
+    elements=[{'object_id':'card','route':'native_shape','role':'card','bbox':[0,0,100,100],
+               'shape':{'fill_rgb':[245,245,245]}},
+              {'object_id':'icon','route':'raster_component','role':'visual',
+               'component':{'path':str(path),'x':0,'y':0,'w':160,'h':100}}]
+    assert _audit_invariants(elements,[],(200,200))['i3']==0
+
+
+def test_three_stamp_series_preserves_filled_ink_and_route(tmp_path):
+    from image2editable.layout_first import prepare_layout
+
+    rgb = np.full((1000, 1800, 3), 255, np.uint8)
+    items = []
+    for n, y in enumerate((60, 370, 680)):
+        cv2.rectangle(rgb, (100, y), (1700, y+260), (245, 248, 252), -1)
+        points = np.array([[1350, y+65], [1610, y+50], [1630, y+190], [1370, y+210]])
+        cv2.fillConvexPoly(rgb, points, (210, 65, 50))
+        cv2.putText(rgb, 'ABC', (1390, y+155), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255,255,255), 4)
+        items.append({'text': 'ABC', 'box': [1380,y+105,200,55], 'color':'#ffffff',
+                      'font_size':32,'confidence':.99})
+    path = tmp_path/'stamps.png'
+    Image.fromarray(rgb).save(path)
+    slide, _ = prepare_layout(path, tmp_path/'assets', text_items=items)
+    stamps = [e for e in slide['visual_elements'] if e['object_id'].startswith('emblem_')]
+    assert len(stamps) == 3
+    for e in stamps:
+        rgba = np.asarray(Image.open(e['component']['path']).convert('RGBA'))
+        red = (rgba[:,:,0]>180)&(rgba[:,:,1]<100)&(rgba[:,:,3]>250)
+        assert red.sum() > 20000
+
+
 def test_duplicate_emblems_on_same_ink_cluster_collapse_to_one(tmp_path):
     from image2editable.layout_first import prepare_layout
 
@@ -1122,6 +1223,82 @@ def test_sibling_card_series_suppresses_read_digit_when_others_unread(tmp_path):
     assert '03' not in texts
     assert '标题一' in texts and '标题二' in texts
     assert audit['text_audit'].get('unit_suppressed', 0) >= 1
+
+
+def test_inverted_highlight_card_keeps_series_membership(tmp_path):
+    # a highlight column inverts BOTH card surface and digit color (light
+    # digits on a dark card while siblings are dark on light). Series
+    # membership is positional and scale-based only: any absolute element-to
+    # -element color comparison ejects the recolored sibling and leaves the
+    # read digit native while its twins ship as PNGs.
+    from image2editable.layout_first import prepare_layout
+
+    pixels = np.full((600, 1400, 3), 255, np.uint8)
+    cv2.rectangle(pixels, (60, 80), (620, 560), (250, 246, 240), -1)    # light card
+    cv2.rectangle(pixels, (730, 80), (1290, 560), (28, 52, 150), -1)    # dark card
+    for x0 in (190, 340):                                              # dark digits, OCR'd
+        cv2.rectangle(pixels, (x0, 140), (x0 + 90, 330), (40, 70, 170), -1)
+    for x0 in (870, 1020):                                             # light digits, unread
+        cv2.rectangle(pixels, (x0, 140), (x0 + 90, 330), (235, 238, 255), -1)
+    items = [{'text': '01', 'box': [188, 138, 254, 194], 'color': '#2846aa',
+              'font_size': 80, 'confidence': .95}]
+    path = tmp_path / 'inverted.png'
+    Image.fromarray(pixels).save(path)
+    slide, audit = prepare_layout(path, tmp_path / 'assets', text_items=items,
+                                  card_mode='native')
+    texts = [i['text'] for i in slide['text_items']]
+    assert '01' not in texts, \
+        'read digit on the light card must follow its inverted sibling to PNG'
+    assert audit['text_audit'].get('unit_suppressed', 0) >= 1
+
+
+def test_free_sliver_near_owned_artwork_is_merged(tmp_path):
+    # card-interior artwork lands in the owned residual pass; a sliver just
+    # outside the card edge lands in the free pass. Same-pass merging leaves
+    # the sliver as its own tiny object; the merge pool must span both passes
+    # so the sliver attaches to the artwork (png2 p02 regression).
+    from image2editable.layout_first import prepare_layout
+
+    rng = np.random.default_rng(7)
+    pixels = np.full((800, 1200, 3), 255, np.uint8)
+    cv2.rectangle(pixels, (700, 200), (1100, 700), (30, 60, 160), -1)
+    pixels[300:500, 730:930] = rng.integers(60, 200, (200, 200, 3), np.uint8)
+    cv2.rectangle(pixels, (665, 400), (690, 440), (30, 30, 30), -1)
+    path = tmp_path / 'sliver.png'
+    Image.fromarray(pixels).save(path)
+    slide, audit = prepare_layout(path, tmp_path / 'assets', text_items=[],
+                                  card_mode='native')
+    visuals = [e for e in slide['visual_elements']
+               if e.get('role') == 'visual' and 'component' in e]
+    tiny = [e for e in visuals
+            if max(e['component']['w'], e['component']['h']) < 50
+            or e['component']['w'] * e['component']['h'] < 800 * 1200 * .0003]
+    assert visuals, 'artwork should survive as a raster object'
+    assert not tiny, f'independent tiny objects survived: {tiny}'
+
+
+def test_visible_owned_sliver_without_merge_target_is_emitted(tmp_path):
+    # a divider dash floating mid-card is an owned residual sliver with no
+    # merge target nearby. Absorbing it into the flat card fill deletes the
+    # pixels; only a sliver whose contrast is below the visible threshold may
+    # be dropped (png2 p03 divider-dash regression).
+    from image2editable.layout_first import prepare_layout
+
+    rng = np.random.default_rng(7)
+    pixels = np.full((1000, 1400, 3), 255, np.uint8)
+    cv2.rectangle(pixels, (100, 100), (800, 800), (30, 60, 160), -1)
+    pixels[200:400, 300:500] = rng.integers(60, 200, (200, 200, 3), np.uint8)
+    cv2.rectangle(pixels, (300, 600), (360, 603), (240, 245, 255), -1)
+    path = tmp_path / 'dash.png'
+    Image.fromarray(pixels).save(path)
+    slide, audit = prepare_layout(path, tmp_path / 'assets', text_items=[],
+                                  card_mode='native')
+    visuals = [e for e in slide['visual_elements']
+               if e.get('role') == 'visual' and 'component' in e]
+    dash = [e for e in visuals
+            if e['component']['y'] <= 620 and e['component']['y'] + e['component']['h'] >= 590
+            and e['component']['w'] >= 40]
+    assert dash, 'visible in-card divider dash was silently dropped'
 
 
 def test_dark_card_with_painted_light_content_is_still_a_card(tmp_path):
@@ -1348,3 +1525,562 @@ def test_wide_outlined_card_is_not_an_endpointless_native_line(tmp_path):
                                  'text_items': text}), encoding='utf-8')
     convert_layout([path], output_path=tmp_path / 'wide-card.pptx', run_dir=tmp_path / 'run',
                    text_cache=cache, slide_size='16:9', background_mode='source', render=False)
+
+
+def test_enclosed_text_item_is_dropped(tmp_path):
+    from image2editable.layout_first import refine_layout_text
+
+    rgb = np.full((600, 1200, 3), 255, np.uint8)
+    items = [
+        {'box': [100, 200, 30, 60], 'text': '引', 'font_size': 20, 'font': 'Arial',
+         'color': '#0039b6', 'bold': True, 'confidence': 0.9},
+        {'box': [100, 200, 240, 62], 'text': '张女士，', 'font_size': 20, 'font': 'Arial',
+         'color': '#222222', 'bold': False, 'confidence': 0.95},
+    ]
+    refined, audit = refine_layout_text(rgb, items)
+    assert [i['text'] for i in refined] == ['张女士，']
+    assert audit['overlap_dropped'] == 1
+
+
+def test_card_edge_fringe_line_is_not_emitted(tmp_path):
+    from image2editable.layout_first import prepare_layout
+
+    pixels = np.full((500, 800, 3), 255, np.uint8)
+    pixels[120:340, 100:700] = (235, 243, 251)
+    pixels[115:117, 100:700] = (236, 244, 252)
+    pixels[117:119, 100:700] = (210, 226, 246)
+    path = tmp_path / 'fringe.png'
+    Image.fromarray(pixels).save(path)
+    slide, _ = prepare_layout(path, tmp_path / 'assets', text_items=[])
+    lines = [e for e in slide['visual_elements']
+             if e.get('route') == 'native_shape' and e.get('shape', {}).get('shape_type') == 'line']
+    assert not lines
+    assert any(e['route'] == 'raster_component'
+               and e['component']['y'] <= 117 < e['component']['y'] + e['component']['h']
+               for e in slide['visual_elements'])
+
+
+def test_sandwiched_two_tone_separator_becomes_raster(tmp_path):
+    from image2editable.layout_first import prepare_layout
+
+    pixels = np.full((700, 1200, 3), 255, np.uint8)
+    pixels[100:280, 200:1000] = (235, 243, 251)
+    pixels[320:500, 200:1000] = (235, 243, 251)
+    pixels[290:292, 200:1000] = (192, 215, 248)
+    pixels[292:294, 200:1000] = (121, 170, 241)
+    pixels[294:296, 200:1000] = (192, 215, 248)
+    path = tmp_path / 'sandwich.png'
+    Image.fromarray(pixels).save(path)
+    slide, _ = prepare_layout(path, tmp_path / 'assets', text_items=[])
+    lines = [e for e in slide['visual_elements']
+             if e.get('route') == 'native_shape' and e.get('shape', {}).get('shape_type') == 'line']
+    assert not lines
+    assert any(e['route'] == 'raster_component'
+               and e['component']['x'] <= 210 and e['component']['x'] + e['component']['w'] >= 990
+               and e['component']['y'] <= 292 < e['component']['y'] + e['component']['h']
+               for e in slide['visual_elements'])
+
+
+def test_full_width_band_emits_one_strip_not_lines(tmp_path):
+    from image2editable.layout_first import prepare_layout
+
+    pixels = np.full((600, 1200, 3), 255, np.uint8)
+    pixels[200:202] = (244, 248, 254)
+    pixels[202:210] = (46, 125, 235)
+    pixels[210:212] = (244, 248, 254)
+    pixels[208:280, 500:700] = (46, 125, 235)
+    pixels[320:520, 100:900] = (235, 243, 251)
+    path = tmp_path / 'band.png'
+    Image.fromarray(pixels).save(path)
+    slide, _ = prepare_layout(path, tmp_path / 'assets', text_items=[])
+    lines = [e for e in slide['visual_elements']
+             if e.get('route') == 'native_shape' and e.get('shape', {}).get('shape_type') == 'line']
+    assert not lines
+    strips = [e for e in slide['visual_elements'] if e['object_id'].startswith('band_')]
+    assert len(strips) == 1
+    assert strips[0]['bbox'][0] <= 4 and strips[0]['bbox'][2] >= 1196
+    assert strips[0]['bbox'][1] <= 202 and strips[0]['bbox'][3] >= 210
+
+
+def test_sibling_card_labels_unify_typography(tmp_path):
+    from image2editable.layout_first import prepare_layout
+
+    pixels = np.full((900, 1400, 3), 255, np.uint8)
+    for top in (80, 330, 580):
+        pixels[top:top+200, 200:1200] = (240, 246, 252)
+        cv2.putText(pixels, 'AB', (245, top + 85), cv2.FONT_HERSHEY_SIMPLEX, 1.6,
+                    (0, 57, 182), 3, cv2.LINE_AA)
+    text = [
+        {'box': [240, 120, 190, 55], 'text': '病例：', 'font_size': 20, 'font': 'Arial',
+         'color': '#0039b6', 'bold': True, 'confidence': .9},
+        {'box': [240, 370, 190, 55], 'text': '主诉：', 'font_size': 19.5, 'font': 'Arial',
+         'color': '#0039b6', 'bold': True, 'confidence': .9},
+        {'box': [240, 620, 190, 55], 'text': '经过：', 'font_size': 19, 'font': 'Arial',
+         'color': '#003ab6', 'bold': False, 'confidence': .9},
+    ]
+    path = tmp_path / 'series.png'
+    Image.fromarray(pixels).save(path)
+    slide, _ = prepare_layout(path, tmp_path / 'assets', text_items=text)
+    kept = [i for i in slide['text_items'] if i['text'] and i['box'][1] > 60]
+    assert kept
+    assert {i['bold'] for i in kept} == {True}
+    assert len({i['font_size'] for i in kept}) == 1
+    assert len({i['color'] for i in kept}) == 1
+
+
+def test_long_sentence_with_unread_glyph_stays_native(tmp_path):
+    # p04 B-any-01c regression: an OCR-readable body line sat beside one
+    # unread same-color glyph (quote/punctuation) and the whole sentence was
+    # rasterized, violating text rule 1. Partial-unit suppression only covers
+    # compact text units ("70%" style); a line many glyph-heights wide is a
+    # sentence and must stay native.
+    from image2editable.layout_first import prepare_layout
+
+    pixels = np.full((600, 1600, 3), 255, np.uint8)
+    cv2.rectangle(pixels, (80, 120), (1520, 460), (252, 248, 240), -1)
+    cv2.rectangle(pixels, (140, 200), (1420, 260), (31, 95, 191), -1)
+    cv2.rectangle(pixels, (1450, 210), (1480, 240), (31, 95, 191), -1)
+    items = [{'text': '面对这位接触性出血的育龄女性患者你会想到什么',
+              'box': [140, 200, 1280, 60], 'color': '#1f5fbf',
+              'font_size': 40, 'confidence': .95}]
+    path = tmp_path / 'sentence.png'
+    Image.fromarray(pixels).save(path)
+    slide, _ = prepare_layout(path, tmp_path / 'assets', text_items=items,
+                              card_mode='native')
+    texts = [i['text'] for i in slide['text_items']]
+    assert any('接触性出血' in text for text in texts), \
+        'a wide OCR line must stay native text, not a raster unit'
+
+
+def test_wide_body_line_is_not_dragged_into_label_series(tmp_path):
+    # p02 B-any-01c regression: the slot-member match accepted a body line as
+    # the series twin of a compact label, so label suppression rasterized a
+    # full sentence. Slot members must be compact text units as well.
+    from image2editable.layout_first import prepare_layout
+
+    pixels = np.full((1100, 2200, 3), 255, np.uint8)
+    cv2.rectangle(pixels, (560, 80), (2060, 480), (252, 248, 240), -1)
+    cv2.rectangle(pixels, (60, 140), (480, 420), (232, 224, 208), -1)
+    cv2.rectangle(pixels, (1600, 190), (1800, 300), (31, 95, 191), 8)
+    cv2.rectangle(pixels, (180, 220), (460, 290), (31, 95, 191), -1)
+    cv2.rectangle(pixels, (1000, 200), (1900, 260), (31, 95, 191), -1)
+    items = [{'text': '标签', 'box': [180, 220, 280, 70], 'color': '#1f5fbf',
+              'font_size': 45, 'confidence': .95},
+             {'text': '这是一行正文不应该被拖进标签的系列栅格化',
+              'box': [1000, 200, 900, 60], 'color': '#1f5fbf',
+              'font_size': 40, 'confidence': .95}]
+    path = tmp_path / 'series.png'
+    Image.fromarray(pixels).save(path)
+    slide, _ = prepare_layout(path, tmp_path / 'assets', text_items=items,
+                              card_mode='native')
+    texts = [i['text'] for i in slide['text_items']]
+    assert any('不应该被拖进' in text for text in texts), \
+        'a wide body line must not be suppressed as a label-series member'
+
+
+def test_card_frame_chain_never_swallows_its_host_card(tmp_path):
+    # p04 B-any-01c regression: a card's own frame ink comp seeded an unread
+    # row chain that covered the whole card -> the card shipped twice (native
+    # shape + whole-card PNG, I3 violation). A unit may never swallow a card.
+    from image2editable.layout_first import prepare_layout
+
+    pixels = np.full((900, 2400, 3), 255, np.uint8)
+    for x0 in (80, 1300):
+        cv2.rectangle(pixels, (x0, 200), (x0 + 1020, 700), (255, 244, 191), -1)
+        cv2.rectangle(pixels, (x0 + 8, 208), (x0 + 1012, 692), (235, 205, 60), 12)
+    for x0 in (400, 1620):
+        cv2.rectangle(pixels, (x0, 380), (x0 + 240, 540), (90, 90, 90), -1)
+    path = tmp_path / 'framed.png'
+    Image.fromarray(pixels).save(path)
+    slide, audit = prepare_layout(path, tmp_path / 'assets', text_items=[],
+                                  card_mode='native')
+    cards = [e for e in slide['visual_elements'] if e.get('role') == 'card']
+    assert cards, 'the yellow cards should be detected'
+    assert all(8 <= c['shape']['line_width'] <= 16 for c in cards if c['bbox'][2]-c['bbox'][0] > 800)
+    for e in slide['visual_elements']:
+        if 'component' not in e:
+            continue
+        comp = e['component']
+        ex0, ey0 = comp['x'], comp['y']
+        ex1, ey1 = ex0 + comp['w'], ey0 + comp['h']
+        for card in cards:
+            cx0, cy0, cx1, cy1 = card['bbox']
+            inter = (max(0, min(ex1, cx1) - max(ex0, cx0))
+                     * max(0, min(ey1, cy1) - max(ey0, cy0)))
+            assert inter < .6 * (cx1 - cx0) * (cy1 - cy0), \
+                f'{e["object_id"]} raster-covers card {card["object_id"]}'
+
+
+def test_row_chain_box_stops_at_element_gaps():
+    # a row chain is one element: growth is bounded by member height and the
+    # chain box may never exceed a few glyph heights, so an icon or stamp
+    # sitting element-gaps away is never welded into the row (p02 regression).
+    from image2editable.layout_first import _row_chain_box
+
+    # element-ladder: each next comp sits just inside the growing box reach,
+    # so an unbounded chain sweeps the whole row; element-bounded growth must
+    # stop before crossing gaps larger than the member height.
+    comps = [{'bbox': (x, 100, x + w_, 220), 'area': 3000, 'h': 120,
+              'color': np.array([30, 60, 160]), 'mask': np.ones((120, 60), bool)}
+             for x, w_ in ((100, 60), (190, 90), (330, 90), (500, 120),
+                           (700, 120), (1100, 120), (1500, 120))]
+    box, members = _row_chain_box(comps, [(100, 100, 160, 220)])
+    assert box[2] - 100 <= 120 * 5, \
+        f'chain welded a whole row of separate elements: {box}'
+
+
+def test_nested_card_surface_never_seeds_outer_unit(tmp_path):
+    # p02 B-any-01d regression: a nested label pill's surface is ink vs the
+    # outer row card, so the whole pill became one giant comp and
+    # _row_chain_box welded the pill + the neighbouring icon + a stamp into a
+    # row-wide unit PNG. A nested card renders itself; its pixels must not
+    # seed the outer region's unread-ink comps.
+    from image2editable.layout_first import prepare_layout
+
+    pixels = np.full((1000, 2400, 3), 255, np.uint8)
+    for y0 in (100, 500):
+        # sibling row card
+        cv2.rectangle(pixels, (200, y0), (2200, y0 + 300), (252, 248, 240), -1)
+        # nested label pill on the left of each row
+        cv2.rectangle(pixels, (300, y0 + 60), (740, y0 + 240), (235, 240, 250), -1)
+        cv2.rectangle(pixels, (300, y0 + 60), (740, y0 + 240), (60, 90, 180), 6)
+        # an icon far to the right on the same row card
+        cv2.circle(pixels, (1600, y0 + 150), 90, (40, 40, 40), -1)
+        cv2.circle(pixels, (1600, y0 + 150), 50, (252, 248, 240), -1)
+    # unread glyph marks inside the lower pill (a stamp OCR could not read)
+    cv2.putText(pixels, 'XYZ', (330, 720), cv2.FONT_HERSHEY_SIMPLEX, 2.0,
+                (60, 90, 180), 8, cv2.LINE_AA)
+    items = [{'text': '懂理论', 'box': [330, 160, 380, 100], 'color': '#3c5ab4',
+              'font_size': 60, 'confidence': .95}]
+    path = tmp_path / 'nested.png'
+    Image.fromarray(pixels).save(path)
+    slide, _ = prepare_layout(path, tmp_path / 'assets', text_items=items,
+                              card_mode='native')
+    cards = [e for e in slide['visual_elements'] if e.get('role') == 'card']
+    pills = [c for c in cards if c['bbox'][2] - c['bbox'][0] < 1000]
+    assert len(pills) >= 2, f'expected two nested pill cards, got {cards}'
+    for e in slide['visual_elements']:
+        if 'component' not in e:
+            continue
+        comp = e['component']
+        ex0, ey0 = comp['x'], comp['y']
+        ex1, ey1 = ex0 + comp['w'], ey0 + comp['h']
+        for pill in pills:
+            px0, py0, px1, py1 = pill['bbox']
+            inter = (max(0, min(ex1, px1) - max(ex0, px0))
+                     * max(0, min(ey1, py1) - max(ey0, py0)))
+            frac = inter / ((px1 - px0) * (py1 - py0))
+            assert frac < .6, \
+                f'{e["object_id"]} covers {frac:.0%} of nested card {pill["object_id"]}'
+
+
+def test_unified_series_size_survives_assembler_width_fit():
+    # the assembler shrinks each run's font until the text fits its OCR box;
+    # a median-unified size that only fits SOME members renders different pt
+    # per member (v27 p04: items all 19.2 but pptx showed 15.28/16.83/16.77).
+    # The unified size must already sit under every member's own width clamp.
+    from image2editable.layout_first import _unify_series_styles
+    from scripts.ppt_assemble import _fit_ocr_font_size
+
+    page_w = 3840
+    regions = [{'bbox': (0, 0, 1900, 700), 'transform': None,
+                'shape': {'fill_rgb': (252, 248, 240)}},
+               {'bbox': (0, 760, 1900, 1400), 'transform': None,
+                'shape': {'fill_rgb': (252, 248, 240)}}]
+    items = [{'text': '就诊经过：', 'box': [200, 300, 250, 90],
+              'color': '#0039b6', 'font': 'Microsoft YaHei',
+              'font_size': 60, 'bold': True},
+             {'text': '思', 'box': [200, 1040, 250, 90],
+              'color': '#0039b6', 'font': 'Microsoft YaHei',
+              'font_size': 40, 'bold': True}]
+    _unify_series_styles(items, regions, page=(page_w, 2160))
+    sizes = {round(it['font_size'], 3) for it in items}
+    assert len(sizes) == 1
+    for it in items:
+        width_in = it['box'][2] * (40.0 / 3.0) / page_w
+        fitted = _fit_ocr_font_size(it['text'], it.get('font', 'Microsoft YaHei'),
+                                    it.get('bold', False), it.get('italic', False),
+                                    it['font_size'], width_in)
+        assert fitted == it['font_size'], \
+            'the unified size is still per-item clamped -> renders uneven'
+
+
+def test_unify_series_skips_sentence_wide_body_line():
+    # p04 B-any-01d regression: '不好意思就医，目...' (width > 6 glyph
+    # heights) shared the normalized slot of '课堂提问：' on a sibling card
+    # and unioned into the blue label series -> recoloured #193778.
+    # _unify_series_styles must keep the suppression pass's compactness gate:
+    # a line many glyph-heights wide is a sentence, never a series member.
+    from image2editable.layout_first import _unify_series_styles
+
+    regions = [{'bbox': (100, 200, 900, 700), 'transform': None,
+                'shape': {'fill_rgb': (252, 248, 240)}},
+               {'bbox': (1000, 200, 1800, 700), 'transform': None,
+                'shape': {'fill_rgb': (252, 248, 240)}}]
+    items = [{'text': '课堂提问：', 'box': [150, 300, 250, 80],
+              'color': '#0039b6', 'font': 'Microsoft YaHei',
+              'font_size': 40, 'bold': True},
+             {'text': '不好意思就医，目前已经两个月了', 'box': [1050, 300, 700, 60],
+              'color': '#33383b', 'font': 'Microsoft YaHei',
+              'font_size': 36, 'bold': False}]
+    _unify_series_styles(items, regions, page=(2400, 1200))
+    assert items[1]['color'] == '#33383b'
+    assert items[1]['font_size'] == 36
+
+
+def test_source_title_recovery_rejects_crop_sized_recognition_box(tmp_path, monkeypatch):
+    from image2editable.layout_first import _recover_source_titles
+
+    monkeypatch.setattr('scripts.art_text.estimate_art_text_runs', lambda *a, **k: [{'text': 'TITLE'}])
+    rgb = np.full((700, 1400, 3), 240, np.uint8)
+    cv2.rectangle(rgb, (600, 220), (900, 330), (20, 20, 20), -1)
+    items = [{'text': 'header', 'box': [600, 50, 400, 70]},
+             {'text': 'footer', 'box': [600, 330, 400, 70]}]
+    def reader(path, **kwargs):
+        w, h = Image.open(path).size
+        return [{'text': 'TITLE', 'box': [0, 0, w, h], 'confidence': .99}], None
+    result, _ = _recover_source_titles(rgb, items, tmp_path, reader)
+    assert result == items
+
+
+def test_refine_trims_overlapping_padding_without_deleting_words():
+    from image2editable.layout_first import refine_layout_text
+
+    items = [{'text': '张女士，', 'box': [20, 20, 220, 50], 'color': '#333333',
+              'words': [{'text': '张女士，', 'box': [.1, 0, .7, 1]}]},
+             {'text': '36岁，', 'box': [220, 20, 180, 50], 'color': '#333333',
+              'words': [{'text': '36岁，', 'box': [.1, 0, .8, 1]}]}]
+    result, _ = refine_layout_text(np.full((100, 500, 3), 255, np.uint8), items)
+    assert [v['text'] for v in result] == ['张女士，', '36岁，']
+    assert result[0]['box'][0]+result[0]['box'][2] <= result[1]['box'][0]
+
+
+def test_sentence_with_terminal_punctuation_is_not_a_compact_series():
+    from image2editable.layout_first import _unify_series_styles
+
+    regions = [{'bbox': [0, 0, 600, 300], 'shape': {'fill_rgb': [255, 255, 255]}},
+               {'bbox': [700, 0, 1300, 300], 'shape': {'fill_rgb': [255, 255, 255]}}]
+    items = [{'text': '课堂提问：', 'box': [30, 30, 240, 80], 'font_size': 28,
+              'color': '#0039b6', 'bold': True},
+             {'text': '不好意思就医，', 'box': [730, 30, 460, 80], 'font_size': 24,
+              'color': '#33383b', 'bold': False}]
+    _unify_series_styles(items, regions, page=(1400, 400))
+    assert items[1]['color'] == '#33383b'
+    assert items[1]['font_size'] == 24
+
+
+def test_geometry_removes_thin_protrusion_from_rounded_card():
+    from image2editable.layout_first import _geometry
+    from image2editable.shape_analysis import _rounded_rectangle
+
+    mask = np.zeros((260, 700), np.uint8)
+    mask[70:230, 40:640] = _rounded_rectangle(160, 600, 35).astype(np.uint8) * 255
+    cv2.line(mask, (150, 30), (150, 85), 255, 5)
+    rgb = np.full((260, 700, 3), 255, np.uint8)
+    rgb[mask != 0] = [240, 220, 180]
+    measured = _geometry(rgb, mask, np.zeros(mask.shape, np.uint8))
+    assert measured is not None
+    assert measured['shape']['shape_type'] == 'rounded_rectangle'
+    assert measured['bbox'][1] >= 68
+
+
+def test_refine_trims_misread_tail_overlapping_next_prefix():
+    from image2editable.layout_first import refine_layout_text
+
+    rgb = np.full((160, 500, 3), 255, np.uint8)
+    items = [
+        {'text': '就医，目', 'box': [100, 50, 150, 36], 'confidence': .92,
+         'words': [{'text': '就', 'box': [0, 0, .25, 1]},
+                   {'text': '医', 'box': [.25, 0, .25, 1]},
+                   {'text': '，', 'box': [.5, 0, .1, 1]},
+                   {'text': '目', 'box': [.8, 0, .2, 1]}]},
+        {'text': '自购', 'box': [220, 50, 100, 36], 'confidence': .95,
+         'words': [{'text': '自', 'box': [0, 0, .5, 1]},
+                   {'text': '购', 'box': [.5, 0, .5, 1]}]},
+    ]
+    refined, audit = refine_layout_text(rgb, items)
+    assert [item['text'] for item in refined] == ['就医，', '自购']
+    assert audit['duplicate_spans_removed'] == 1
+
+
+def test_refine_drops_different_ocr_text_for_same_glyph_geometry():
+    # p04 B-any-01d regression: adjacent OCR spans both read the same glyph
+    # geometry as different text. Text equality is unavailable here; geometric
+    # containment must remove the smaller duplicate without deleting a real
+    # neighbouring span.
+    from image2editable.layout_first import refine_layout_text
+
+    rgb = np.full((160, 500, 3), 255, np.uint8)
+    items = [
+        {'text': '不好意思就医，目', 'box': [100, 50, 220, 36],
+         'font_size': 20, 'color': '#33383b', 'confidence': .92},
+        {'text': '目', 'box': [290, 50, 30, 36],
+         'font_size': 20, 'color': '#33383b', 'confidence': .80},
+        {'text': '之后', 'box': [350, 50, 60, 36],
+         'font_size': 20, 'color': '#33383b', 'confidence': .90},
+    ]
+    refined, _ = refine_layout_text(rgb, items)
+    texts = [item['text'] for item in refined]
+    assert texts.count('目') == 0
+    assert '不好意思就医，目' in texts
+    assert '之后' in texts
+
+
+def test_card_raster_dedupe_preserves_unique_foreign_ink(tmp_path):
+    # p02 B-any-01d regression: a unit covering a pill/card also contains a
+    # book icon or emblem outside the native card fill. Bbox mutual coverage
+    # alone deleted the unit and the unique visual disappeared from the PPTX.
+    from image2editable.layout_first import _dedupe_card_rasters
+
+    card_path = tmp_path / 'card.png'
+    Image.new('RGBA', (200, 100), (235, 240, 250, 255)).save(card_path)
+    card = {'object_id': 'card_0001', 'role': 'card', 'route': 'native_shape',
+            'bbox': [0, 0, 200, 100],
+            'shape': {'fill_rgb': [235, 240, 250]}}
+    unit_rgba = np.full((100, 200, 4), (235, 240, 250, 255), np.uint8)
+    unit_rgba[30:70, 135:175] = (38, 58, 150, 255)
+    unit_path = tmp_path / 'unit.png'
+    Image.fromarray(unit_rgba).save(unit_path)
+    unit = {'object_id': 'unit_0001', 'role': 'visual',
+            'route': 'raster_component',
+            'component': {'path': str(unit_path), 'x': 0, 'y': 0,
+                          'w': 200, 'h': 100}}
+    kept, dropped = _dedupe_card_rasters([card, unit])
+    assert dropped == 0
+    assert unit in kept
+
+
+def test_card_raster_dedupe_drops_pure_card_fill(tmp_path):
+    from image2editable.layout_first import _dedupe_card_rasters
+
+    card = {'object_id': 'card_0001', 'role': 'card', 'route': 'native_shape',
+            'bbox': [0, 0, 200, 100],
+            'shape': {'fill_rgb': [235, 240, 250]}}
+    unit_path = tmp_path / 'unit.png'
+    Image.new('RGBA', (200, 100), (235, 240, 250, 255)).save(unit_path)
+    unit = {'object_id': 'unit_0001', 'role': 'visual',
+            'route': 'raster_component',
+            'component': {'path': str(unit_path), 'x': 0, 'y': 0,
+                          'w': 200, 'h': 100}}
+    kept, dropped = _dedupe_card_rasters([card, unit])
+    assert dropped == 1
+    assert unit not in kept
+
+
+def test_mixed_color_line_split_keeps_glyph_with_own_color():
+    # p04 '血': a yellow glyph followed by a white run was sampled as white
+    # because a few brighter fringe pixels out-scored the populous ink in the
+    # decile-core vote. The split then assigned the glyph to the white chunk,
+    # its box released the foreign-coloured ink and the glyph shipped twice.
+    from image2editable.layout_first import refine_layout_text
+
+    pixels = np.tile(np.array([60, 100, 200], np.uint8), (140, 760, 1))
+    text = '接触性出血的育龄女性'
+    words = []
+    for i, ch in enumerate(text):
+        x0 = 40 + i * 60
+        pixels[74:104, x0 + 12:x0 + 48] = (255, 217, 23) if i < 5 else (255, 255, 255)
+        if i == 4:
+            for k in range(6):
+                pixels[76 + k * 4:80 + k * 4, x0 + 50:x0 + 58] = 255
+        words.append({'text': ch, 'box': [(x0 - 20) / 720, .1, 60 / 720, .8]})
+    item = {'box': [20, 60, 720, 60], 'text': text, 'color': '#ffffff',
+            'font_size': 40, 'words': words}
+    items, audit = refine_layout_text(pixels, [item])
+    joined = ''.join(i['text'] for i in items)
+    assert joined == text
+    yellow = [i for i in items if i['color'].lower() != '#ffffff']
+    assert len(yellow) == 1 and yellow[0]['text'] == '接触性出血'
+
+
+def test_contained_residual_record_absorbs_into_host_element(tmp_path):
+    # p02 stamp bar: a record fully inside a raster element's box is the same
+    # visual — emitting it as its own PNG draws the zone twice (I3).
+    from image2editable.layout_first import _emit_residual
+
+    unit = np.zeros((100, 200, 4), np.uint8)
+    unit[10:90, 20:180] = (200, 30, 30, 255)
+    host = tmp_path / 'unit_0001.png'
+    Image.fromarray(unit).save(host)
+    elements = [{'object_id': 'unit_0001', 'route': 'raster_component', 'role': 'visual',
+                 'component': {'path': str(host), 'x': 0, 'y': 0, 'w': 200, 'h': 100}}]
+    bar = np.full((60, 30, 4), (210, 40, 40, 255), np.uint8)
+    rec = {'rgba': bar, 'x': 150, 'y': 20, 'w': 30, 'h': 60, 'owned': True}
+    diff = np.zeros((600, 800), np.float32)
+    text = np.zeros((600, 800), np.uint8)
+    emitted = _emit_residual([rec], elements, tmp_path, diff, (600, 800), text, [])
+    assert emitted == 0
+    merged = np.asarray(Image.open(elements[0]['component']['path']))
+    assert merged[30:70, 155:175, 3].mean() == 255
+
+
+def test_record_inside_bigger_record_merges_before_emit(tmp_path):
+    # p04 photo strip: the owned slice of one visual sits inside the free
+    # record's box; two PNGs covering the same zone violates I3.
+    from image2editable.layout_first import _emit_residual
+
+    big = np.full((100, 200, 4), (240, 200, 180, 255), np.uint8)
+    small = np.full((60, 40, 4), (240, 210, 190, 255), np.uint8)
+    records = [{'rgba': big, 'x': 0, 'y': 0, 'w': 200, 'h': 100, 'owned': False},
+               {'rgba': small, 'x': 150, 'y': 30, 'w': 40, 'h': 60, 'owned': True}]
+    diff = np.zeros((600, 800), np.float32)
+    text = np.zeros((600, 800), np.uint8)
+    elements = []
+    emitted = _emit_residual(records, elements, tmp_path, diff, (600, 800), text, [])
+    assert emitted == 1
+    comp = elements[0]['component']
+    merged = np.asarray(Image.open(comp['path']))
+    assert merged.shape[:2] == (100, 200)
+    assert merged[40:80, 155:190, 3].mean() == 255
+
+
+def test_audit_i1_solid_underlay_not_flagged(tmp_path):
+    # p05 chevron nav: inpainting erases glyph RGB but keeps alpha opaque, so a
+    # solid-colour underlay legitimately covers the glyph zone.  I1 must only
+    # fire when the PNG actually re-prints the glyph ink colour.
+    from image2editable.layout_first import _audit_invariants
+
+    src = np.full((120, 320, 3), (228, 236, 248), np.uint8)
+    src[40:80, 60:260] = (90, 143, 226)  # dark blue glyph strokes
+    underlay = np.full((120, 320, 4), (228, 236, 248, 255), np.uint8)
+    path = tmp_path / 'object_0001.png'
+    Image.fromarray(underlay).save(path)
+    elements = [{'route': 'raster_component',
+                 'component': {'path': str(path), 'x': 0, 'y': 0, 'w': 320, 'h': 120}}]
+    items = [{'box': (30, 20, 260, 80)}]
+    audit = _audit_invariants(elements, items, (120, 320), src)
+    assert audit['i1'] == 0
+
+
+def test_audit_i1_reprinted_glyph_flagged(tmp_path):
+    # A residual PNG that carries the same ink as the source glyphs is a real
+    # duplicate: same positions, same colour.
+    from image2editable.layout_first import _audit_invariants
+
+    src = np.full((120, 320, 3), (228, 236, 248), np.uint8)
+    src[40:80, 60:260] = (90, 143, 226)
+    dup = np.zeros((120, 320, 4), np.uint8)
+    dup[40:80, 60:260] = (90, 143, 226, 255)  # re-printed glyph ink
+    path = tmp_path / 'object_0002.png'
+    Image.fromarray(dup).save(path)
+    elements = [{'route': 'raster_component',
+                 'component': {'path': str(path), 'x': 0, 'y': 0, 'w': 320, 'h': 120}}]
+    items = [{'box': (30, 20, 260, 80)}]
+    audit = _audit_invariants(elements, items, (120, 320), src)
+    assert audit['i1'] == 1
+
+
+def test_text_color_picks_dominant_ink_over_foreign_fringe():
+    # A bright foreign sliver inside the crop (the neighbouring run's AA spill)
+    # out-contrasts the real ink on a dark card; the dominant ink bucket must
+    # win before the top-decile core vote.  Lives in the layout-first-private
+    # sampler since the shared scripts module was restored to c162378.
+    from image2editable.text_color import sample_text_color
+
+    region = np.full((100, 60, 3), (60, 100, 200), np.uint8)
+    region[10:92, 8:38] = (255, 217, 23)
+    for k in range(5):
+        region[12 + k * 16:20 + k * 16, 44:52] = 255
+    color = sample_text_color(region)
+    actual = tuple(int(color[i:i + 2], 16) for i in (1, 3, 5))
+    assert actual == pytest.approx((255, 217, 23), abs=30)

@@ -57,7 +57,7 @@ def _word_bounds(item):
 
 
 def refine_layout_text(rgb, text_items):
-    from scripts.text_detect import _sample_text_color
+    from image2editable.text_color import sample_text_color
 
     items = deepcopy(text_items)
     removed = []
@@ -73,8 +73,15 @@ def refine_layout_text(rgb, text_items):
                 continue
             for count in range(min(len(a), len(b), 8), 0, -1):
                 suffix = ''.join(word[0] for word in a[-count:])
-                if suffix != ''.join(word[0] for word in b[:count]):
-                    continue
+                same_text = suffix == ''.join(word[0] for word in b[:count])
+                if not same_text:
+                    if count != 1 or len(a) < 2 or first['box'][0] >= second['box'][0]:
+                        continue
+                    ax, ay, aw, ah = a[-1][1]
+                    bx, by, bw, bh = b[0][1]
+                    intersection = max(0, min(ax + aw, bx + bw) - max(ax, bx)) * max(0, min(ay + ah, by + bh) - max(ay, by))
+                    if intersection < .8 * aw * ah or aw > bw * 1.1:
+                        continue
                 def span(words):
                     return [min(v[1][0] for v in words), min(v[1][1] for v in words),
                             max(v[1][0]+v[1][2] for v in words), max(v[1][1]+v[1][3] for v in words)]
@@ -109,6 +116,28 @@ def refine_layout_text(rgb, text_items):
                     target['words'] = [{'text': word, 'box': [(bounds[0]-x)/(right-x), (bounds[1]-y)/(bottom-y),
                                                             bounds[2]/(right-x), bounds[3]/(bottom-y)]} for word, bounds in retained]
                 break
+    for first in items:
+        for second in items:
+            if first is second or first['box'][0] >= second['box'][0]:
+                continue
+            x, y, iw, ih = first['box']
+            sx, sy, sw, sh = second['box']
+            if x+iw <= sx or min(y+ih, sy+sh)-max(y, sy) < min(ih, sh)*.7:
+                continue
+            a, b = _word_bounds(first), _word_bounds(second)
+            if not a or not b:
+                continue
+            right = max(v[1][0]+v[1][2] for v in a)
+            left = min(v[1][0] for v in b)
+            if right <= left:
+                boundary = (right+left)/2
+                for item, start, end in ((first, x, min(x+iw, boundary)),
+                                         (second, max(sx, boundary), sx+sw)):
+                    words = _word_bounds(item)
+                    item['box'] = [start, item['box'][1], end-start, item['box'][3]]
+                    item['words'] = [{'text': word, 'box': [(box[0]-start)/(end-start),
+                        (box[1]-item['box'][1])/item['box'][3], box[2]/(end-start),
+                        box[3]/item['box'][3]]} for word, box in words]
     result, mixed = [], 0
     for item in items:
         if not item['text']:
@@ -125,7 +154,7 @@ def refine_layout_text(rgb, text_items):
             if not any(char.isalnum() for char in word):
                 color = measured[-1][2] if measured else item.get('color', '#000000')
             else:
-                color = _sample_text_color(crop) if crop.size and np.max(crop)-np.min(crop) > 12 else item.get('color', '#000000')
+                color = sample_text_color(crop) if crop.size and np.max(crop)-np.min(crop) > 12 else item.get('color', '#000000')
             measured.append((word, box, color))
         chunks = []
         for entry in measured:
@@ -155,8 +184,40 @@ def refine_layout_text(rgb, text_items):
             bottom = max(e[1][1]+e[1][3] for e in chunk)
             child = {k: v for k, v in item.items() if k not in {'words', 'box'}}
             child.update(text=text, box=[x, y, right-x, bottom-y], color=chunk[0][2])
+            if text.rstrip().endswith(('：', ':')):
+                from scripts.font_match import match_text_face
+                crop = rgb[max(0,round(y)):min(rgb.shape[0],round(bottom)),
+                           max(0,round(x)):min(rgb.shape[1],round(right))]
+                fitted = match_text_face(crop.tobytes(),crop.shape[1],crop.shape[0],text) if crop.size else None
+                if fitted:
+                    child.update(font=fitted['font'],bold=fitted['bold'],
+                                 font_size=fitted['font_size_px']*960/rgb.shape[1])
             result.append(child)
-    return result, {'duplicate_spans_removed': len(removed), 'removed_spans': removed, 'mixed_color_lines': mixed}
+    # a short item swallowed by a wider item is almost always OCR reading the
+    # same ink twice (the split pass can also leave such a stub behind); keep
+    # only the wider read so the slide does not draw the glyph twice.
+    kept = []
+    for index, item in enumerate(result):
+        ax, ay, aw, ah = item['box']
+        swallowed = False
+        for other_index, other in enumerate(result):
+            if other_index == index or not other['text']:
+                continue
+            bx, by, bw, bh = other['box']
+            inter = (max(0, min(ax + aw, bx + bw) - max(ax, bx))
+                     * max(0, min(ay + ah, by + bh) - max(ay, by)))
+            if inter < aw * ah * .8:
+                continue
+            if inter >= bw * bh * .8 and (
+                    len(item['text']), item.get('confidence', 0), -index) >= (
+                    len(other['text']), other.get('confidence', 0), -other_index):
+                continue
+            swallowed = True
+            break
+        if not swallowed:
+            kept.append(item)
+    return kept, {'duplicate_spans_removed': len(removed), 'removed_spans': removed,
+                  'mixed_color_lines': mixed, 'overlap_dropped': len(result) - len(kept)}
 
 
 def _text_mask(items, size):
@@ -217,6 +278,27 @@ def _surface(rgb, mask, text):
 
 
 def _geometry(rgb, mask, text, outline=False):
+    x, y, w, h = cv2.boundingRect(mask)
+    if min(w, h) >= 8:
+        local = mask[y:y+h, x:x+w]
+        row_span = np.count_nonzero(local, axis=1)
+        column_span = np.count_nonzero(local, axis=0)
+        rows = np.flatnonzero(row_span >= w * .5)
+        columns = np.flatnonzero(column_span >= h * .5)
+        if len(rows) and len(columns):
+            top, bottom = int(rows[0]), int(rows[-1]) + 1
+            left, right = int(columns[0]), int(columns[-1]) + 1
+            narrow_rows = (top and row_span[:top].max() < w*.1) or (bottom < h and row_span[bottom:].max() < w*.1)
+            narrow_columns = (left and column_span[:left].max() < h*.1) or (right < w and column_span[right:].max() < h*.1)
+            if (narrow_rows or narrow_columns) and (
+                    bottom-top >= h*.7 and right-left >= w*.7):
+                mask = mask.copy()
+                if narrow_rows:
+                    mask[:y+top] = 0
+                    mask[y+bottom:] = 0
+                if narrow_columns:
+                    mask[:, :x+left] = 0
+                    mask[:, x+right:] = 0
     ys, xs = np.nonzero(mask)
     x, y, w, h = cv2.boundingRect(mask)
     if min(w, h) < 8:
@@ -744,7 +826,8 @@ def _recover_source_titles(rgb, items, asset_dir, reader):
         for item in found:
             tx, ty, tw, th = item['box']
             if (item.get('confidence', 0) < .98 or not 2 <= len(item.get('text', '').strip()) <= 16
-                    or min(tx, ty) < 0 or min(tw, th) <= 0 or tx+tw > right-left or ty+th > bottom-top):
+                    or min(tx, ty) < 0 or min(tw, th) <= 0 or tx+tw > right-left or ty+th > bottom-top
+                    or (tw >= (right-left)*.95 and th >= (bottom-top)*.95)):
                 continue
             updated = deepcopy(item)
             updated['box'] = [left+tx, top+ty, tw, th]
@@ -844,7 +927,8 @@ def _recover_text_gaps(rgb, items, text, asset_dir, reader):
                     horizontal_pad = max(pad, round(min(h, sh)*.3))
                     ink_left = int(min(s[0] for s in letters))
                     ink_right = int(max(s[0]+s[2] for s in letters))
-                    window = (left+max(0, ink_left-horizontal_pad), top,
+                    window = ((max(0,round(x+w-h)) if first['text'] and '\u4e00' <= first['text'][-1] <= '\u9fff'
+                               else left+max(0, ink_left-horizontal_pad)), top,
                               min(right, left+ink_right+horizontal_pad), bottom)
                 if window not in windows:
                     windows.append(window)
@@ -886,6 +970,17 @@ def _recover_text_gaps(rgb, items, text, asset_dir, reader):
         calls += 1
         for item in found:
             tx, ty, tw, th = item['box']
+            fragment = item.get('text','').strip()
+            punctuation = fragment.lstrip(''.join(c for c in fragment if c.isalnum()))
+            prefix = fragment[:-len(punctuation)] if punctuation else fragment
+            tail_host = next((v for v in items if prefix and v['text'].rstrip().endswith(prefix)
+                              and abs(v['box'][1]-(top+ty)) < v['box'][3]*.5
+                              and abs(v['box'][0]+v['box'][2]-(left+tx)) < v['box'][3]*1.5),None)
+            if tail_host is not None and punctuation and all(c in '？?！!，,。；;' for c in punctuation):
+                tail_host['text'] += punctuation
+                tail_host['box'][2] = max(tail_host['box'][2],left+tx+tw-tail_host['box'][0])
+                text |= _text_mask([tail_host],text.shape)
+                continue
             if (item.get('confidence', 0) < .9 or not any(c.isalnum() for c in item.get('text', ''))
                     or min(tx, ty) < 0 or min(tw, th) <= 0 or tx+tw > right-left or ty+th > bottom-top):
                 continue
@@ -984,9 +1079,14 @@ def _row_chain_box(comps, seed_boxes):
     changed = True
     while changed:
         changed = False
-        grow = (box[2] - box[0]) * .6
         members = [comp_by_box[b] for b in seed_set if b in comp_by_box]
         max_area = max((c.get('area', 0) for c in members), default=0)
+        # a chain is one element: hops stay within one member-height of the
+        # current box, and the whole chain never exceeds a few glyph heights.
+        # Without both bounds a row of labels, icons and stamp borders welded
+        # into a single page-wide PNG (p02 row-unit regression).
+        max_member_h = max((c['bbox'][3] - c['bbox'][1] for c in members), default=0)
+        grow = min((box[2] - box[0]) * .6, max_member_h) if max_member_h else (box[2] - box[0]) * .6
         dominant = (max(members, key=lambda c: c.get('area', 0)).get('color')
                     if members else None)
         for comp in comps:
@@ -1005,6 +1105,8 @@ def _row_chain_box(comps, seed_boxes):
                                       - np.asarray(dominant, dtype=np.int16))) > 60):
                 continue
             new = [min(box[0], lx0), min(box[1], ly0), max(box[2], lx1), max(box[3], ly1)]
+            if max_member_h and new[2] - new[0] > max_member_h * 5:
+                continue
             if new != box:
                 box = new
                 changed = True
@@ -1065,6 +1167,13 @@ def _suppress_mixed_unit_text(rgb, regions, items, text):
         interior = cv2.erode(region['aligned_mask'], np.ones((7, 7), np.uint8)) != 0
         contrast = np.max(np.abs(crop.astype(np.int16) - region['surface'][0].astype(np.int16)), axis=2)
         ink = ((contrast > 45) & interior & (text[ry:bottom, rx:right] == 0)).astype(np.uint8)
+        for child in regions:
+            if (child is region or child['transform'] is not None
+                    or child['shape'].get('shape_type') != 'rounded_rectangle'):
+                continue
+            cx, cy, cr, cb = child['bbox']
+            if rx <= cx and ry <= cy and cr <= right and cb <= bottom:
+                ink[cy - ry:cb - ry, cx - rx:cr - rx][child['aligned_mask'] != 0] = 0
         count, labels, stats, _ = cv2.connectedComponentsWithStats(ink, 8)
         comps = []
         for label in range(1, count):
@@ -1077,32 +1186,30 @@ def _suppress_mixed_unit_text(rgb, regions, items, text):
                           'mask': labels[ly:ly + lh, lx:lx + lw] == label})
         region_comps[id(region)] = comps
 
-    def _parse_color(item):
-        color = (item.get('color') or '').lstrip('#')
-        if len(color) != 6:
-            return None
-        try:
-            return tuple(int(color[i:i + 2], 16) for i in (0, 2, 4))
-        except ValueError:
-            return None
-
     def _color_dist(med, rgb_color):
         return max(abs(int(med[0]) - rgb_color[0]), abs(int(med[1]) - rgb_color[1]),
                    abs(int(med[2]) - rgb_color[2]))
 
-    def _same_family(a, b):
-        # absolute distance stays strict; a recolored sibling (highlight column)
-        # only counts as the same series when both members share a hue family,
-        # which keeps a dark icon from matching a light title at the same slot.
-        if _color_dist(a, b) <= 45:
+    def _surface_rgb(region):
+        fill = (region.get('shape') or {}).get('fill_rgb')
+        return tuple(int(v) for v in fill[:3]) if fill else None
+
+    def _polarity_member(color, surface, ref_color, ref_surface):
+        # membership never compares absolute element colors. When both cards
+        # share a surface luminance class the slot member must keep the same
+        # element-vs-surface polarity, so a dark icon cannot stand in for a
+        # light title at the same slot. An inverted highlight column flips its
+        # surface together with its contents; the luminance classes diverge and
+        # position + scale decide alone.
+        if surface is None or ref_surface is None:
             return True
-        ha = cv2.cvtColor(np.uint8([[a]]), cv2.COLOR_RGB2HSV)[0, 0]
-        hb = cv2.cvtColor(np.uint8([[b]]), cv2.COLOR_RGB2HSV)[0, 0]
-        if ha[2] >= 200 and hb[2] >= 200:
+        sl = sum(int(v) for v in surface)
+        rsl = sum(int(v) for v in ref_surface)
+        if abs(sl - rsl) > 180:
             return True
-        if ha[1] < 40 or hb[1] < 40:
-            return False
-        return min(abs(int(ha[0]) - int(hb[0])), 180 - abs(int(ha[0]) - int(hb[0]))) <= 12
+        el = sum(int(v) for v in color)
+        rl = sum(int(v) for v in ref_color)
+        return (el - sl) * (rl - rsl) >= 0
 
     def _raster_bound(item, region):
         # mirrors the emblem pass gates: light glyph on a neutral card, compact
@@ -1120,9 +1227,14 @@ def _suppress_mixed_unit_text(rgb, regions, items, text):
         ax0, ay0, ax1, ay1 = a['bbox']
         bx0, by0, bx1, by1 = b['bbox']
         ah, bh = ay1 - ay0, by1 - by0
-        if ah <= 0 or bh <= 0 or not (.55 <= ah / bh <= 1.8):
+        aw, bw = ax1 - ax0, bx1 - bx0
+        if min(ah, bh, aw, bw) <= 0:
             return False
-        return min(ay1, by1) - max(ay0, by0) >= .5 * min(ah, bh)
+        if .55 <= ah / bh <= 1.8 and min(ay1, by1) - max(ay0, by0) >= .5 * min(ah, bh):
+            return True
+        # column series: same x-run on vertically separate cards. Label pills
+        # stacked down a page form one series exactly like a row of digits.
+        return .55 <= aw / bw <= 1.8 and min(ax1, bx1) - max(ax0, bx0) >= .6 * min(aw, bw)
 
     for item in items:
         rgb_color = _parse_color(item)
@@ -1133,6 +1245,13 @@ def _suppress_mixed_unit_text(rgb, regions, items, text):
         region = next((r for r in regions
                        if r['bbox'][0] <= cx <= r['bbox'][2] and r['bbox'][1] <= cy <= r['bbox'][3]), None)
         if region is None or region['transform'] is not None or ih <= 0:
+            continue
+        if iw > ih * 6 or any(mark in item.get('text', '') for mark in '，。；！？,;!?'):
+            # a line many glyph-heights wide is a sentence, not a text unit:
+            # text rule 1 keeps stably-read lines native. Partial-unit and
+            # series suppression only apply inside a compact unit (the "70"
+            # of "70%"); an unread glyph beside a sentence never rasterizes
+            # the sentence (p04/p02 line-units regression).
             continue
         rx, ry, right, bottom = region['bbox']
         # single text unit partially read (e.g. "70" read, "%" unread):
@@ -1147,8 +1266,12 @@ def _suppress_mixed_unit_text(rgb, regions, items, text):
             overlap = max(0, min(y + ih, ly1) - max(y, ly0)) / min(ih, lh)
             gap = max(lx0 - (x + iw), x - lx1, 0)
             if overlap >= .4 and gap <= ih * 1.5:
+                if os.environ.get('LF_DEBUG_UNITS'):
+                    print(f'[suppress-A] {item["text"][:24]!r} box={item["box"]}'
+                          f' comp={(lx0, ly0, lx1, ly1)} ih={ih}')
                 dropped.append(item)
                 units.append({'region': region, 'color': rgb_color, 'members': None,
+                              'items': [item], 'reason': 'partial-unit',
                               'box': (min(x, lx0), min(y, ly0),
                                       max(x + iw, lx1), max(y + ih, ly1))})
                 break
@@ -1186,7 +1309,8 @@ def _suppress_mixed_unit_text(rgb, regions, items, text):
                     continue
                 if comp['h'] < ih * .3 or comp['h'] > ih * 3.0:
                     continue
-                if not _same_family(tuple(int(v) for v in comp['color']), rgb_color):
+                if not _polarity_member(comp['color'], _surface_rgb(other),
+                                        rgb_color, _surface_rgb(region)):
                     continue
                 member_ink += comp['area']
                 ink_boxes.append(comp['bbox'])
@@ -1198,10 +1322,14 @@ def _suppress_mixed_unit_text(rgb, regions, items, text):
                                       cand['box'][2], cand['box'][3])
                 if not (mx0 <= cx2 <= mx1 and my0 <= cy2 <= my1):
                     continue
-                if ih2 < ih * .3 or ih2 > ih * 3.0:
+                if ih2 < ih * .3 or ih2 > ih * 3.0 or iw2 > ih2 * 6:
+                    # slot members are compact text units like the seed; a
+                    # body line at the same normalized position is a different
+                    # element, not a series twin
                     continue
                 cand_rgb = _parse_color(cand)
-                if cand_rgb is not None and not _same_family(cand_rgb, rgb_color):
+                if cand_rgb is not None and not _polarity_member(
+                        cand_rgb, _surface_rgb(other), rgb_color, _surface_rgb(region)):
                     continue
                 member_item = cand
                 break
@@ -1215,17 +1343,23 @@ def _suppress_mixed_unit_text(rgb, regions, items, text):
             if ink_boxes:
                 slot_ink_boxes.append((other, ink_boxes))
         if slot_raster and series_found:
+            if os.environ.get('LF_DEBUG_UNITS'):
+                print(f'[suppress-B] {item["text"][:24]!r} box={item["box"]}'
+                      f' members={[m["text"][:12] for m, _ in slot_items]}'
+                      f' ink_boxes={len(slot_ink_boxes)}')
             for member, host in slot_items:
                 if member not in dropped:
                     dropped.append(member)
                 units.append({'region': host, 'color': _parse_color(member), 'members': None,
+                              'items': [member], 'reason': 'series',
                               'box': tuple(map(round, (
                     member['box'][0], member['box'][1],
                     member['box'][0] + member['box'][2], member['box'][1] + member['box'][3])))})
             for other, ink_boxes in slot_ink_boxes:
                 chain_box, members = _row_chain_box(
                     region_comps.get(id(other), ()), ink_boxes)
-                units.append({'region': other, 'color': None,
+                units.append({'region': other, 'color': None, 'items': [],
+                              'reason': 'series-ink',
                               'box': chain_box, 'members': members})
     # unread repeated ink rows: when no card in a series got OCR at all, repeated
     # glyph rows across sibling cards still collapse into one unit PNG each.
@@ -1265,7 +1399,10 @@ def _suppress_mixed_unit_text(rgb, regions, items, text):
                           for c in region_comps.get(id(other), ()))
                 if hit:
                     box, members = _row_chain_box(comps, [comp['bbox']])
-                    units.append({'region': region, 'color': None,
+                    if os.environ.get('LF_DEBUG_UNITS'):
+                        print(f'[suppress-C] unread row chain box={box} seed={(lx0, ly0, lx1, ly1)}')
+                    units.append({'region': region, 'color': None, 'items': [],
+                                  'reason': 'unread-row',
                                   'box': box, 'members': members})
                     for c in comps:
                         cx2 = (c['bbox'][0] + c['bbox'][2]) / 2 - rx
@@ -1296,19 +1433,61 @@ def _suppress_mixed_unit_text(rgb, regions, items, text):
                     prev['members'] = prev['members'] + spec['members']
                 else:
                     prev['members'] = None
+                for member in spec.get('items', ()):
+                    if all(member is not m for m in prev['items']):
+                        prev['items'].append(member)
                 break
         else:
             merged.append({'region': host, 'color': spec['color'], 'members': spec.get('members'),
+                           'items': list(spec.get('items', ())), 'reason': spec.get('reason'),
                            'box': tuple(int(v) for v in (x0, y0, x1, y1))})
-    if not dropped and not merged:
-        return items, text, [], 0
-    ids = {id(item) for item in dropped}
+    # invariant gate before committing any suppression:
+    # - a unit may never swallow its own host card (the card is emitted on
+    #   its own; a PNG covering it duplicates the same element, I3)
+    # - a unit may never clip a live text item (I2: a PNG either contains an
+    #   OCR item whole or does not touch it)
+    # violating specs are dropped; their member items are restored to native
+    # text and the ink falls back to the residual pass as ordinary objects.
+    survived = []
+    for spec in merged:
+        x0, y0, x1, y1 = spec['box']
+        bad = False
+        hx0, hy0, hx1, hy1 = spec['region']['bbox']
+        inter = (max(0, min(x1, hx1) - max(x0, hx0))
+                 * max(0, min(y1, hy1) - max(y0, hy0)))
+        h_area = max(1, (hx1 - hx0) * (hy1 - hy0))
+        if inter > .6 * h_area:
+            bad = True
+        if not bad:
+            member_ids = {id(m) for m in spec['items']}
+            for it in items:
+                if id(it) in member_ids:
+                    continue
+                ix, iy, iw2, ih2 = it['box']
+                inter = (max(0, min(x1, ix + iw2) - max(x0, ix))
+                         * max(0, min(y1, iy + ih2) - max(y0, iy)))
+                frac = inter / max(1.0, iw2 * ih2)
+                if .02 < frac < .9:
+                    bad = True
+                    break
+        if not bad:
+            survived.append(spec)
+    merged = survived
+    suppressed = []
+    for spec in merged:
+        for member in spec['items']:
+            if all(member is not m for m, _ in suppressed):
+                suppressed.append((member, spec.get('reason')))
+    if not suppressed and not merged:
+        return items, text, [], []
+    ids = {id(item) for item, _ in suppressed}
     items = [item for item in items if id(item) not in ids]
-    for item in dropped:
+    for item, _ in suppressed:
         x, y, iw, ih = map(round, item['box'])
         pad = max(2, round(ih * .06))
         text[max(0, y - pad):min(h, y + ih + pad), max(0, x - pad):min(w, x + iw + pad)] = 0
-    return items, text, merged, len(dropped)
+    return items, text, merged, [{'text': item.get('text', ''), 'reason': reason}
+                                 for item, reason in suppressed]
 
 
 def _split_owned_bridges(contours, difference, owned, h, w):
@@ -1397,6 +1576,436 @@ def _clean_source_backdrop(rgb, affected):
             fill = cv2.inpaint(crop, local, 7, cv2.INPAINT_TELEA)
         cleaned[top:bottom, left:right][cleaning != 0] = fill[cleaning != 0]
     return cleaned
+
+
+def _parse_color(item):
+    color = (item.get('color') or '').lstrip('#')
+    if len(color) != 6:
+        return None
+    try:
+        return tuple(int(color[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return None
+
+
+def _dedupe_card_rasters(elements):
+    # A raster is a duplicate of a native card only when its covered pixels
+    # are explainable by the card's fill. Bounding-box overlap is insufficient:
+    # p02 units can cover a pill while also carrying a unique icon or emblem.
+    cards = [e for e in elements if e.get('role') == 'card' and 'bbox' in e]
+    dropped = []
+    for element in elements:
+        if (element.get('route') != 'raster_component' or 'component' not in element
+                or element.get('role') == 'card'):
+            continue
+        comp = element['component']
+        x, y = int(comp['x']), int(comp['y'])
+        right, bottom = x + int(comp['w']), y + int(comp['h'])
+        try:
+            with Image.open(comp['path']) as image:
+                rgba = np.asarray(image.convert('RGBA'))
+        except (OSError, ValueError, KeyError):
+            continue
+        alpha = rgba[:, :, 3] > 8
+        for card in cards:
+            cx, cy, cr, cb = map(int, card['bbox'])
+            ix0, iy0 = max(x, cx), max(y, cy)
+            ix1, iy1 = min(right, cr), min(bottom, cb)
+            inter_area = max(0, ix1 - ix0) * max(0, iy1 - iy0)
+            raster_area = max(1, int(alpha.sum()))
+            card_area = max(1, (cr - cx) * (cb - cy))
+            sliver = (min(right-x,bottom-y) <= min(cr-cx,cb-cy)*.02
+                      and inter_area >= .7*(right-x)*(bottom-y))
+            if (not sliver and inter_area <= .5 * card_area) or inter_area <= .5 * (right - x) * (bottom - y):
+                continue
+            # Compare only opaque raster pixels that lie inside the native card.
+            # A small RGB tolerance accommodates antialiasing and gradients,
+            # while a substantial foreign-color region proves unique content.
+            lx0, ly0, lx1, ly1 = ix0 - x, iy0 - y, ix1 - x, iy1 - y
+            crop_alpha = alpha[ly0:ly1, lx0:lx1]
+            fill = (card.get('shape') or {}).get('fill_rgb')
+            if not fill:
+                continue
+            rgb = rgba[ly0:ly1, lx0:lx1, :3].astype(np.int16)
+            fill_arr = np.asarray(fill[:3], dtype=np.int16)
+            explainable = np.max(np.abs(rgb - fill_arr), axis=2) <= 45
+            opaque_inside = int(crop_alpha.sum())
+            if opaque_inside == 0:
+                continue
+            explained = int((crop_alpha & explainable).sum()) / opaque_inside
+            # Require the whole raster's opaque content to be card-like too;
+            # otherwise an icon/stamp embedded in the unit must survive.
+            opaque_content_explained = alpha & (np.max(
+                np.abs(rgba[:, :, :3].astype(np.int16) - fill_arr), axis=2) <= 45)
+            stroke = (card.get('shape') or {}).get('stroke_rgb')
+            if stroke:
+                yy, xx = np.indices(alpha.shape)
+                px = x + (xx + .5) * (right - x) / alpha.shape[1]
+                py = y + (yy + .5) * (bottom - y) / alpha.shape[0]
+                edge_distance = np.minimum.reduce((abs(px - cx), abs(px - cr),
+                                                   abs(py - cy), abs(py - cb)))
+                edge_width = max(3, float(card['shape'].get('line_width', 1)) * 2)
+                stroke_matches = np.max(np.abs(rgba[:, :, :3].astype(np.int16)
+                    - np.asarray(stroke, dtype=np.int16)), axis=2) <= 45
+                opaque_content_explained |= alpha & stroke_matches & (edge_distance <= edge_width)
+            foreign = int((alpha & ~opaque_content_explained).sum())
+            if foreign <= max(48, raster_area * .002):
+                dropped.append(element)
+                break
+    ids = {id(e) for e in dropped}
+    return [e for e in elements if id(e) not in ids], len(dropped)
+
+
+def _emit_residual(records, elements, asset_dir, difference, page_size,
+                   text, items):
+    """Emit residual records as object_NNNN.png elements, merging as needed.
+
+    Two merge passes guard the one-zone-one-element invariant: a record whose
+    box sits mostly inside a bigger pending record's or an already-emitted
+    raster element's box is the same visual (a stamp bar inside the stamp
+    unit's box; the owned slice of a photo that continues past the card edge),
+    so it folds into the host instead of double-drawing the zone (I3). Small
+    fragments still merge into the nearest bigger object across passes.
+    """
+    h, w = page_size
+    frag = max(48, round(h * .023))
+    frag_area = h * w * .0003
+    merge_gap = max(frag, round(h * .015))
+    targets = [e for e in elements
+               if e.get('route') == 'raster_component' and e.get('component')]
+
+    def _overlay(canvas, rec, ux0, uy0):
+        sub = canvas[rec['y'] - uy0:rec['y'] - uy0 + rec['h'],
+                     rec['x'] - ux0:rec['x'] - ux0 + rec['w']]
+        a = rec['rgba'][..., 3:4].astype(np.float32) / 255
+        sub[..., :3] = (rec['rgba'][..., :3] * a + sub[..., :3] * (1 - a)).astype(np.uint8)
+        sub[..., 3] = np.maximum(sub[..., 3], rec['rgba'][..., 3])
+
+    def _inside(box, host):
+        sx, sy, sw, sh = box
+        bx, by, bw, bh = host
+        inter = (max(0, min(sx + sw, bx + bw) - max(sx, bx))
+                 * max(0, min(sy + sh, by + bh) - max(sy, by)))
+        return inter >= .6 * sw * sh
+
+    def _absorb_record(dst, rec):
+        ux0, uy0 = min(rec['x'], dst['x']), min(rec['y'], dst['y'])
+        ux1 = max(rec['x'] + rec['w'], dst['x'] + dst['w'])
+        uy1 = max(rec['y'] + rec['h'], dst['y'] + dst['h'])
+        canvas = np.zeros((uy1 - uy0, ux1 - ux0, 4), np.uint8)
+        canvas[dst['y'] - uy0:dst['y'] - uy0 + dst['h'],
+               dst['x'] - ux0:dst['x'] - ux0 + dst['w']] = dst['rgba']
+        _overlay(canvas, rec, ux0, uy0)
+        dst.update({'rgba': canvas, 'x': ux0, 'y': uy0,
+                    'w': ux1 - ux0, 'h': uy1 - uy0})
+
+    def _absorb_element(elem, rec):
+        comp = elem['component']
+        ux0, uy0 = min(rec['x'], comp['x']), min(rec['y'], comp['y'])
+        ux1 = max(rec['x'] + rec['w'], comp['x'] + comp['w'])
+        uy1 = max(rec['y'] + rec['h'], comp['y'] + comp['h'])
+        canvas = np.zeros((uy1 - uy0, ux1 - ux0, 4), np.uint8)
+        canvas[comp['y'] - uy0:comp['y'] - uy0 + comp['h'],
+               comp['x'] - ux0:comp['x'] - ux0 + comp['w']] = \
+            np.asarray(Image.open(comp['path']))
+        _overlay(canvas, rec, ux0, uy0)
+        Image.fromarray(canvas).save(comp['path'])
+        comp.update({'x': ux0, 'y': uy0, 'w': ux1 - ux0, 'h': uy1 - uy0})
+
+    emitted = []
+    for rec in sorted(records, key=lambda r: r['w'] * r['h']):
+        is_frag = max(rec['w'], rec['h']) < frag or rec['w'] * rec['h'] < frag_area
+        rec_box = (rec['x'], rec['y'], rec['w'], rec['h'])
+        # containment merge: the host already claims this zone. Pending records
+        # emit later so the merged pixels still reach their PNG; elements
+        # rewrite their PNG in place.
+        host = next((e for e in targets
+                     if _inside(rec_box, (e['component']['x'], e['component']['y'],
+                                          e['component']['w'], e['component']['h']))), None)
+        if host is not None:
+            _absorb_element(host, rec)
+            continue
+        bigger = next((cand for cand in records
+                       if cand is not rec and cand['w'] * cand['h'] > rec['w'] * rec['h']
+                       and _inside(rec_box, (cand['x'], cand['y'], cand['w'], cand['h']))), None)
+        if bigger is not None:
+            _absorb_record(bigger, rec)
+            continue
+        if is_frag:
+            best, best_elem, best_d = None, None, merge_gap + 1
+            for cand in records:
+                if cand is rec or max(cand['w'], cand['h']) <= max(rec['w'], rec['h']):
+                    continue
+                gx = max(rec['x'] - (cand['x'] + cand['w']), cand['x'] - (rec['x'] + rec['w']), 0)
+                gy = max(rec['y'] - (cand['y'] + cand['h']), cand['y'] - (rec['y'] + rec['h']), 0)
+                if max(gx, gy) < best_d:
+                    best, best_elem, best_d = cand, None, max(gx, gy)
+            for elem in targets:
+                comp = elem['component']
+                if max(comp['w'], comp['h']) <= max(rec['w'], rec['h']):
+                    continue
+                gx = max(rec['x'] - (comp['x'] + comp['w']), comp['x'] - (rec['x'] + rec['w']), 0)
+                gy = max(rec['y'] - (comp['y'] + comp['h']), comp['y'] - (rec['y'] + rec['h']), 0)
+                if max(gx, gy) < best_d:
+                    best, best_elem, best_d = None, elem, max(gx, gy)
+            if os.environ.get('LF_DEBUG_RESIDUAL'):
+                print(f'[residual-frag] {"owned" if rec["owned"] else "free"}'
+                      f' bbox=({rec["x"]},{rec["y"]},{rec["w"]},{rec["h"]}) best_d={best_d}')
+            if best_elem is not None:
+                _absorb_element(best_elem, rec)
+                continue
+            if best is not None:
+                _absorb_record(best, rec)
+                continue
+            if rec['owned']:
+                # a targetless card-owned sliver is dropped only when it sits
+                # below the visible threshold vs the card surface; visible
+                # leftovers (divider dashes, accent ticks) ship as objects and
+                # ride the card group instead of being deleted (png2 p03).
+                strong = rec['rgba'][..., 3] >= 128
+                if not strong.any() or difference[rec['y']:rec['y'] + rec['h'],
+                                                  rec['x']:rec['x'] + rec['w']][strong].mean() < 30:
+                    if os.environ.get('LF_DEBUG_RESIDUAL'):
+                        print(f'[residual-absorb] owned bbox=({rec["x"]},{rec["y"]},{rec["w"]},{rec["h"]})')
+                    continue
+        emitted.append(rec)
+    emitted_count = 0
+    for rec in emitted:
+        if rec['owned'] and rec['w']*rec['h'] < h*w*.0001:
+            continue
+        if os.environ.get('LF_DEBUG_RESIDUAL'):
+            ra = rec['rgba'][..., 3] != 0
+            tz = text[rec['y']:rec['y'] + rec['h'], rec['x']:rec['x'] + rec['w']] != 0
+            print(f'[emit] {"owned" if rec["owned"] else "free"}'
+                  f' bbox=({rec["x"]},{rec["y"]},{rec["w"]},{rec["h"]})'
+                  f' alpha={int(ra.sum())} alpha_in_text={int((ra & tz).sum())}')
+            for it in items:
+                ix, iy, iw, ih = it['box']
+                if (min(rec['x'] + rec['w'], ix + iw) - max(rec['x'], ix) > 0
+                        and min(rec['y'] + rec['h'], iy + ih) - max(rec['y'], iy) > 0):
+                    print(f'    item-hit {it.get("text","")[:20]!r} box={[round(v) for v in it["box"]]}'
+                          f' runs={len(it.get("runs") or [])} rot={it.get("rotation_degrees")}')
+        index = sum(1 for e in elements
+                    if e['object_id'].startswith('object_'))
+        path = asset_dir / f'object_{index + 1:04d}.png'
+        Image.fromarray(rec['rgba']).save(path)
+        elements.append({'object_id': f'object_{index + 1:04d}', 'route': 'raster_component',
+                         'role': 'visual', 'z_index': 1000 + index,
+                         'component': {'path': str(path), 'x': rec['x'], 'y': rec['y'],
+                                       'w': rec['w'], 'h': rec['h']}})
+        emitted_count += 1
+    return emitted_count
+
+
+def _audit_invariants(elements, items, page_size, rgb=None):
+    # I1 raster opaque ink must not sit on a live text item's glyph strokes.
+    #    The glyph region is the item box's non-background source pixels, so a
+    #    PNG underlay (a pill body behind native text) is legitimate while a
+    #    PNG re-printing the glyphs is not.
+    # I2 a PNG may contain an OCR item's box whole or not at all, never partly.
+    # I3 no element twice: raster-vs-card mutual coverage >.5, or a PNG whose
+    #    opaque pixels are >50% covered by another PNG's opaque pixels.
+    h, w = page_size
+    kept = np.zeros((h, w), np.uint8)
+    for item in items:
+        ix, iy, iw, ih = map(round, item['box'])
+        pad = max(2, round(ih * .06))
+        x0, y0 = max(0, ix - pad), max(0, iy - pad)
+        x1, y1 = min(w, ix + iw + pad), min(h, iy + ih + pad)
+        if rgb is None:
+            kept[y0:y1, x0:x1] = 1
+            continue
+        crop = rgb[y0:y1, x0:x1]
+        if crop.size == 0:
+            continue
+        bg = np.median(crop.reshape(-1, 3), axis=0)
+        ink = np.max(np.abs(crop.astype(np.int16) - bg), axis=2) > 45
+        kept[y0:y1, x0:x1][ink] = 1
+    rasters = [e for e in elements
+               if e.get('route') == 'raster_component' and 'component' in e]
+    cards = [e for e in elements if e.get('role') == 'card' and 'bbox' in e]
+    pixels = {}
+
+    def rgba_of(element):
+        if id(element) not in pixels:
+            with Image.open(element['component']['path']) as image:
+                pixels[id(element)] = np.asarray(image.convert('RGBA'))
+        return pixels[id(element)]
+
+    def alpha_of(element):
+        return rgba_of(element)[:, :, 3] > 0
+
+    i1 = i2 = i3 = 0
+    for element in rasters:
+        comp = element['component']
+        x, y = comp['x'], comp['y']
+        right, bottom = x + comp['w'], y + comp['h']
+        alpha = alpha_of(element)
+        zone = kept[y:bottom, x:right]
+        overlap = 0
+        if zone.shape == alpha.shape:
+            if rgb is not None:
+                # Count only pixels that re-print the source ink: a solid
+                # underlay (inpainted glyphs stay opaque) is legitimate.
+                same = np.max(np.abs(rgba_of(element)[:, :, :3].astype(np.int16)
+                                     - rgb[y:bottom, x:right].astype(np.int16)),
+                              axis=2) <= 45
+                overlap = int(np.count_nonzero(alpha & (zone != 0) & same))
+            else:
+                overlap = int(np.count_nonzero(alpha & (zone != 0)))
+        if overlap > max(32, int(np.count_nonzero(alpha) * .01)):
+            i1 += 1
+        for item in items:
+            ix, iy, iw, ih = item['box']
+            inter = (max(0, min(right, ix + iw) - max(x, ix))
+                     * max(0, min(bottom, iy + ih) - max(y, iy)))
+            frac = inter / max(1.0, iw * ih)
+            if .02 < frac < .9:
+                i2 += 1
+                break
+        for card in cards:
+            cx, cy, cr, cb = card['bbox']
+            inter = (max(0, min(right, cr) - max(x, cx))
+                     * max(0, min(bottom, cb) - max(y, cy)))
+            if (inter > .5 * (cr - cx) * (cb - cy)
+                    and inter > .5 * (right - x) * (bottom - y)):
+                _, duplicate = _dedupe_card_rasters([card, element])
+                i3 += duplicate
+                if duplicate:
+                    break
+    for index, element in enumerate(rasters):
+        comp = element['component']
+        alpha = alpha_of(element)
+        for other in rasters[:index]:
+            oc = other['component']
+            ix0, iy0 = max(comp['x'], oc['x']), max(comp['y'], oc['y'])
+            ix1 = min(comp['x'] + comp['w'], oc['x'] + oc['w'])
+            iy1 = min(comp['y'] + comp['h'], oc['y'] + oc['h'])
+            if ix1 <= ix0 or iy1 <= iy0:
+                continue
+            covered = (alpha[iy0 - comp['y']:iy1 - comp['y'],
+                            ix0 - comp['x']:ix1 - comp['x']]
+                       & alpha_of(other)[iy0 - oc['y']:iy1 - oc['y'],
+                                         ix0 - oc['x']:ix1 - oc['x']])
+            if np.count_nonzero(covered) > np.count_nonzero(alpha) * .5:
+                i3 += 1
+                break
+    return {'i1': i1, 'i2': i2, 'i3': i3}
+
+
+def _unify_series_styles(items, regions, page=(0, 0)):
+    """Median-unify typography inside a sibling-card slot series.
+
+    Same-slot labels repeated across row- or column-sibling cards belong to
+    one design series; a single OCR style slip (lost bold, off hue, half-point
+    size drift) must not break the visual identity.  Items only unify when
+    their host surfaces share a luminance class and the ink keeps the same
+    element-vs-surface polarity, so an inverted highlight column forms its
+    own series instead of borrowing the light-column colour.
+    """
+    hosts = {}
+    for idx, item in enumerate(items):
+        iw, ih = item['box'][2], item['box'][3]
+        if ih <= 0 or iw > ih * 6 or any(mark in item.get('text', '') for mark in '，。；！？,;!?'):
+            # same compactness gate as _suppress_mixed_unit_text: a line many
+            # glyph-heights wide is a sentence. Sharing a normalized slot with
+            # a compact label on a sibling card does not make it a series
+            # member (p04 '不好意思就医，目...' recoloured #193778).
+            continue
+        cx = item['box'][0] + item['box'][2] / 2
+        cy = item['box'][1] + item['box'][3] / 2
+        for region in regions:
+            if region.get('transform') is not None:
+                continue
+            x, y, right, bottom = region['bbox']
+            if x <= cx <= right and y <= cy <= bottom:
+                hosts[idx] = region
+                break
+
+    def sibling(a, b):
+        ax0, ay0, ax1, ay1 = a['bbox']
+        bx0, by0, bx1, by1 = b['bbox']
+        ox = max(0, min(ax1, bx1) - max(ax0, bx0)) / max(1, min(ax1 - ax0, bx1 - bx0))
+        oy = max(0, min(ay1, by1) - max(ay0, by0)) / max(1, min(ay1 - ay0, by1 - by0))
+        return ox >= .6 or oy >= .6
+
+    def anchor(item, region):
+        rx, ry, rright, rbottom = region['bbox']
+        rw, rh = max(1, rright - rx), max(1, rbottom - ry)
+        x, y, w, h = item['box']
+        return ((x - rx) / rw, (x + w / 2 - rx) / rw, (y - ry) / rh, h / rh)
+
+    def luminance(fill):
+        return sum(int(v) for v in fill[:3]) if fill else None
+
+    parent = list(range(len(items)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i, hi in hosts.items():
+        for j, hj in hosts.items():
+            if j <= i or hi is hj or not sibling(hi, hj):
+                continue
+            ai, aj = anchor(items[i], hi), anchor(items[j], hj)
+            if min(abs(ai[0] - aj[0]), abs(ai[1] - aj[1])) > .05:
+                continue
+            if abs(ai[2] - aj[2]) > .12 or not .6 <= ai[3] / max(1e-6, aj[3]) <= 1.7:
+                continue
+            si = luminance(hi['shape'].get('fill_rgb'))
+            sj = luminance(hj['shape'].get('fill_rgb'))
+            ci, cj = _parse_color(items[i]), _parse_color(items[j])
+            if si is None or sj is None or ci is None or cj is None:
+                continue
+            if abs(si - sj) > 180:
+                continue
+            if (sum(ci) - si) * (sum(cj) - sj) < 0:
+                continue
+            pi, pj = find(i), find(j)
+            if pi != pj:
+                parent[pi] = pj
+
+    groups = {}
+    for idx in hosts:
+        groups.setdefault(find(idx), []).append(idx)
+    try:
+        from scripts.ppt_assemble import _ocr_measurement_font
+    except Exception:
+        _ocr_measurement_font = None
+    page_w, page_h = page
+    content_in = min(40.0 / 3.0, (page_w / page_h) * 7.5) if page_w and page_h else 40.0 / 3.0
+    for member in groups.values():
+        if len(member) < 2:
+            continue
+        sizes = sorted(items[i].get('font_size', 0) for i in member)
+        parsed = [_parse_color(items[i]) for i in member]
+        if any(color is None for color in parsed):
+            continue
+        median_color = np.median(parsed, axis=0)
+        bold = sum(1 for i in member if items[i].get('bold')) * 2 > len(member)
+        size = sizes[len(sizes) // 2]
+        # the assembler shrinks each run's font until the text fits its OCR
+        # box, so identical font_size fields can still render different pt.
+        # Pull the unified size under every member's own width clamp so the
+        # series renders at one size (v27 p04 15.28/16.83/16.77 regression).
+        for i in member:
+            if _ocr_measurement_font is None or not page_w:
+                break
+            it = items[i]
+            font = _ocr_measurement_font(it.get('font', 'Microsoft YaHei'),
+                                         bold, it.get('italic', False))
+            measured = max((font.getlength(line)
+                            for line in str(it.get('text') or '').split('\n')),
+                           default=0) if font is not None else 0
+            if measured > 0:
+                size = min(size, it['box'][2] * content_in / page_w * 72000.0 / measured)
+        for i in member:
+            items[i]['font_size'] = size
+            items[i]['bold'] = bold
+            items[i]['color'] = '#%02x%02x%02x' % tuple(int(v) for v in median_color)
 
 
 def prepare_layout(source, asset_dir, *, text_items, card_mode='native', background=None, label_reader=None,
@@ -1503,8 +2112,30 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
     items, text, recovery_audit = _recover_labels(rgb, regions, items, text, asset_dir, label_reader)
     text_audit.update(recovery_audit)
     text, released = _release_boxed_decorations(rgb, items, regions, text)
-    items, text, unit_specs, unit_suppressed = _suppress_mixed_unit_text(rgb, regions, items, text)
-    text_audit['unit_suppressed'] = unit_suppressed
+    stamp_items = []
+    for item in items:
+        color = _parse_color(item)
+        x, y, iw, ih = item['box']
+        host = next((r for r in regions if r['bbox'][0] <= x+iw/2 <= r['bbox'][2]
+                     and r['bbox'][1] <= y+ih/2 <= r['bbox'][3]), None)
+        fill = host['shape'].get('fill_rgb', [255]*3) if host else [255]*3
+        if color is None or min(color) < 200 or max(fill)-min(fill) > 45:
+            continue
+        crop = saturated[max(0, round(y-ih*.8)):min(h, round(y+ih*1.8)),
+                         max(0, round(x-ih*.8)):min(w, round(x+iw+ih*.8))]
+        if crop.size and crop.mean() > .15:
+            stamp_items.append(item)
+    stamp_ids = {id(item) for item in stamp_items}
+    items, text, unit_specs, suppressed_items = _suppress_mixed_unit_text(
+        rgb, regions, [item for item in items if id(item) not in stamp_ids], text)
+    items += stamp_items
+    unit_specs = [spec for spec in unit_specs if not any(
+        max(0, min(spec['box'][2], item['box'][0]+item['box'][2])-max(spec['box'][0], item['box'][0]))
+        * max(0, min(spec['box'][3], item['box'][1]+item['box'][3])-max(spec['box'][1], item['box'][1])) > 0
+        for item in stamp_items)]
+    text_audit['unit_suppressed'] = len(suppressed_items)
+    text_audit['suppressed_items'] = suppressed_items
+    _unify_series_styles(items, regions, page=(w, h))
     consumed = np.zeros((h, w), np.uint8)
     elements = []
     card_images = 0
@@ -1519,18 +2150,52 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
             expected[mask] = restored[mask]
         else:
             expected[y:bottom, x:right][region['aligned_mask'] != 0] = fill[region['aligned_mask'] != 0]
-        edge = mask & (cv2.erode(region['mask'], np.ones((5, 5), np.uint8)) == 0) & (text == 0)
+        inner = cv2.erode(region['mask'], np.ones((max(3, round(min(right-x, bottom-y)*.1)),)*2, np.uint8))
+        edge = mask & (inner == 0) & (text == 0)
         if np.count_nonzero(edge) > 16:
             deviation = np.max(np.abs(rgb[edge].astype(int)-expected[edge].astype(int)), axis=1)
-            if np.median(deviation) > 16:
+            contrast = edge & (np.max(np.abs(rgb.astype(int)-expected.astype(int)), axis=2) > 45)
+            contours, _ = cv2.findContours(contrast.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            frames = [c for c in contours if cv2.boundingRect(c)[2] >= (right-x)*.8
+                      and cv2.boundingRect(c)[3] >= (bottom-y)*.8]
+            if frames:
+                frame = np.zeros((h, w), np.uint8)
+                cv2.drawContours(frame, frames, -1, 255, -1)
+                frame[cv2.erode(frame, np.ones((max(3, round(min(right-x, bottom-y)*.1)),)*2, np.uint8)) != 0] = 0
+                edge = contrast & (frame != 0)
+                deviation = np.max(np.abs(rgb[edge].astype(int)-expected[edge].astype(int)), axis=1)
+            if len(deviation) and (frames or np.median(deviation) > 16):
                 region['shape']['stroke_rgb'] = np.median(rgb[edge], axis=0).astype(int).tolist()
-                region['shape']['line_width'] = max(1, min(right-x, bottom-y)*.025)
-                border = mask & (cv2.erode(region['mask'], np.ones((9, 9), np.uint8)) == 0)
+                stroke = np.asarray(region['shape']['stroke_rgb'])
+                stroke_mask = (np.max(np.abs(rgb.astype(np.int16)-stroke),axis=2) <= 35) & edge
+                widths = []
+                for fraction in (.35,.5,.65):
+                    xx = round(x+(right-x)*fraction)
+                    yy = round(y+(bottom-y)*fraction)
+                    for ray in (stroke_mask[y:y+max(3,round((bottom-y)*.15)),xx],
+                                stroke_mask[max(y,bottom-max(3,round((bottom-y)*.15))):bottom,xx],
+                                stroke_mask[yy,x:x+max(3,round((right-x)*.15))],
+                                stroke_mask[yy,max(x,right-max(3,round((right-x)*.15))):right]):
+                        if ray.any():
+                            widths.append(int(ray.sum()))
+                region['shape']['line_width'] = float(np.median(widths)) if widths else max(1, min(right-x, bottom-y)*.025)
+                if frames:
+                    stroke_width = region['shape']['line_width']
+                    region['native_bbox'] = [round(x+stroke_width/2),round(y+stroke_width/2),
+                                             round(right-stroke_width/2),round(bottom-stroke_width/2)]
+                    if region['shape']['shape_type'] == 'rounded_rectangle':
+                        top_rows = mask[y:y+max(2,round(stroke_width)),x:right]
+                        starts = [int(np.flatnonzero(row)[0]) for row in top_rows if row.any()]
+                        if starts:
+                            radius = float(max(starts))
+                            region['shape']['corner_ratio'] = min(.5,max(0,radius-stroke_width/2)
+                                / max(1,min(right-x,bottom-y)-stroke_width))
+                border = (contrast & (frame != 0)) if frames else mask & (cv2.erode(region['mask'], np.ones((9, 9), np.uint8)) == 0)
                 expected[border] = rgb[border]
         consumed[mask] = 255
         if card_mode == 'native':
             elements.append({'object_id': f'card_{index:04d}', 'route': 'native_shape', 'role': 'card',
-                             'z_index': index, 'bbox': region['bbox'], 'shape': region['shape']})
+                             'z_index': index, 'bbox': region.get('native_bbox',region['bbox']), 'shape': region['shape']})
         else:
             local_x, local_y, lw, lh = cv2.boundingRect(region['mask'])
             cleaned = rgb.copy()
@@ -1605,6 +2270,53 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
                          'component': {'path': str(path), 'x': ux0 + bx0, 'y': uy0 + by0,
                                        'w': bx1 - bx0, 'h': by1 - by0}})
         unit_mask[uy0:uy1, ux0:ux1][alpha != 0] = 255
+    # Full-width coherent bands (header rules, accent strips) emit as one
+    # raster strip each.  The pale-line pass below would otherwise shred a
+    # band into per-edge 1px lines while the residual pass fragments its core;
+    # page after page that yields inconsistent band reconstructions.
+    dev_now = np.max(np.abs(rgb.astype(np.int16) - expected.astype(np.int16)), axis=2)
+    free_rows = (consumed == 0) & (text == 0)
+    free_frac = free_rows.mean(axis=1)
+    row_hits = (dev_now > 20) & free_rows
+    qualified = np.zeros(h, bool)
+    for y in np.nonzero((free_frac >= .5) & (row_hits.mean(axis=1) >= .9))[0]:
+        px = rgb[y][row_hits[y]]
+        med = np.median(px, axis=0)
+        if (np.max(np.abs(px.astype(np.int16) - med), axis=1) <= 45).mean() >= .8:
+            qualified[y] = True
+    band_index = 0
+    y = 0
+    while y < h:
+        if not qualified[y]:
+            y += 1
+            continue
+        y0 = y
+        while y < h and qualified[y]:
+            y += 1
+        y1 = y
+        while y0 > 0 and free_frac[y0 - 1] >= .5 and (dev_now[y0 - 1][free_rows[y0 - 1]] > 8).mean() >= .5:
+            y0 -= 1
+        while y1 < h and free_frac[y1] >= .5 and (dev_now[y1][free_rows[y1]] > 8).mean() >= .5:
+            y1 += 1
+        if not 2 <= y1 - y0 <= max(8, h * .03):
+            continue
+        hits = row_hits[y0:y1]
+        columns = np.nonzero(hits.any(axis=0))[0]
+        if len(columns) < w * .9 or columns[0] > w * .01 or columns[-1] < w * .99:
+            continue
+        x0, x1 = int(columns[0]), int(columns[-1]) + 1
+        band_index += 1
+        strip = np.dstack((rgb[y0:y1, x0:x1],
+                           np.clip((dev_now[y0:y1, x0:x1].astype(np.float32) - 8)
+                                   * 255 / 40, 0, 255).astype(np.uint8)))
+        path = asset_dir / f'band_{band_index:04d}.png'
+        Image.fromarray(strip).save(path)
+        elements.append({'object_id': f'band_{band_index:04d}', 'route': 'raster_component',
+                         'role': 'visual', 'z_index': 4 + band_index, 'bbox': [x0, y0, x1, y1],
+                         'component': {'path': str(path), 'x': x0, 'y': y0,
+                                       'w': x1 - x0, 'h': y1 - y0}})
+        expected[y0:y1, x0:x1] = rgb[y0:y1, x0:x1]
+        consumed[y0:y1, x0:x1] = 255
     pale = ((chroma >= 6) & (rgb.min(axis=2) >= 160) & (consumed == 0)).astype(np.uint8)
     contours, _ = cv2.findContours(pale, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     for contour in contours:
@@ -1626,6 +2338,7 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
     line_mask = cv2.morphologyEx(pale & ((consumed == 0) & (text == 0)).astype(np.uint8), cv2.MORPH_CLOSE,
                                np.ones((1, max(7, round(w*.009))), np.uint8))
     contours, _ = cv2.findContours(line_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    native_edges = [e['bbox'] for e in elements if e['route'] == 'native_shape']
     for contour in contours:
         x, y, lw, lh = cv2.boundingRect(contour)
         if lw < w*.12 or lh > max(8, h*.006):
@@ -1633,6 +2346,34 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
         actual = pale[y:y+lh, x:x+lw] != 0
         pixels = rgb[y:y+lh, x:x+lw][actual]
         if not len(pixels):
+            continue
+        # AA fringe rows glued to a single card/frame edge are edge blending,
+        # not an independent divider: repainting them as a line re-creates the
+        # fade as a bar.  Leave the pixels to the residual pass instead.
+        cy = y + lh / 2
+        gap = max(4, h * .003)
+        sides = set()
+        for sx0, sy0, sx1, sy1 in native_edges:
+            if min(x + lw, sx1) - max(x, sx0) < lw * .5:
+                continue
+            if abs(cy - sy0) <= gap:
+                sides.add('top')
+            if abs(cy - sy1) <= gap:
+                sides.add('bottom')
+        if sides and sides != {'top', 'bottom'}:
+            continue
+        # a "line" whose band rows carry strongly different tones is a
+        # mini-band a 1-D native shape cannot reproduce (pale AA edge +
+        # saturated core split into separate pale contours); hand the rows
+        # to the residual pass for a faithful raster strip.
+        wy0, wy1 = max(0, y - 2), min(h, y + lh + 2)
+        band_dev = np.max(np.abs(rgb[wy0:wy1, x:x + lw].astype(np.int16)
+                                 - expected[wy0:wy1, x:x + lw].astype(np.int16)), axis=2)
+        row_meds = [np.median(rgb[wy0 + dy, x:x + lw][band_dev[dy] > 20], axis=0)
+                    for dy in range(wy1 - wy0)
+                    if (band_dev[dy] > 20).mean() >= .5]
+        if len(row_meds) >= 2 and (
+                np.abs(np.max(row_meds, axis=0) - np.min(row_meds, axis=0)).max() > 45):
             continue
         color = np.median(pixels, axis=0).astype(int).tolist()
         elements.append({'object_id': f'line_{len(elements):04d}', 'route': 'native_shape', 'role': 'line',
@@ -1697,13 +2438,25 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
     difference = np.max(np.abs(rgb.astype(np.int16)-expected.astype(np.int16)), axis=2)
     residual = (difference > 20).astype(np.uint8)
     residual[(emblem_mask | unit_mask) != 0] = 0
-    residual = cv2.morphologyEx(residual, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+    if os.environ.get('LF_DEBUG_RESIDUAL'):
+        for yy in range(228, 240):
+            print(f'[row{yy}] diff>20={int((difference[yy]>20).sum())} consumed={int((consumed[yy]!=0).sum())} text={int((text[yy]!=0).sum())} emblem/unit={int(((emblem_mask|unit_mask)[yy]!=0).sum())} exp_med={np.median(expected[yy],axis=0).astype(int).tolist()}')
+    # the 2x2 open's anchor eats the first row/column of every seed island,
+    # orphaning edge rows next to consumed bands/cards (1px white seam on the
+    # render); restore seed pixels that sit next to a survivor so only truly
+    # isolated noise is removed.
+    opened = cv2.morphologyEx(residual, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+    residual = opened | (residual & cv2.dilate(opened, np.ones((3, 3), np.uint8)))
+    if os.environ.get('LF_DEBUG_RESIDUAL'):
+        for yy in range(230, 236):
+            print(f'[post-open row{yy}] free_seed={int(((residual[yy]!=0)&(consumed[yy]==0)).sum())} owned_seed={int(((residual[yy]!=0)&(consumed[yy]!=0)).sum())}')
     column_lefts = [r['bbox'][0] for r in regions if r['bbox'][2] - r['bbox'][0] > w * .2]
     cut = int(np.median(column_lefts)) if column_lefts else None
     if cut is not None:
         residual[:, max(0, cut - 2):min(w, cut + 3)] = 0
     close = np.ones((max(3, round(h*.005)), max(3, round(w*.003))), np.uint8)
     residual_objects = 0
+    records = []
     for owned, seed in ((False, residual & (consumed == 0)), (True, residual & (consumed != 0))):
         # small CLOSE merges fragments of one object (icon balls, photo halves)
         # without bridging the >=30px gaps between separate cards; reapply the
@@ -1715,7 +2468,6 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
         if owned:
             contours = _split_owned_bridges(contours, difference, consumed, h, w)
         pass_tag = 'owned' if owned else 'free'
-        records = []
         for contour in sorted(contours, key=lambda c: cv2.boundingRect(c)[1]):
             x, y, rw, rh = cv2.boundingRect(contour)
             if rw*rh < max(16, h*w*.00001) or (rw >= w*.85 and rh >= h*.75):
@@ -1758,61 +2510,53 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
             if x0 <= 2 and y0 <= 2 and x1 >= alpha.shape[1] - 2 and y1 >= alpha.shape[0] - 2:
                 x0, y0, x1, y1 = 0, 0, alpha.shape[1], alpha.shape[0]
             patch = np.dstack((patch_rgb[y0:y1, x0:x1], alpha[y0:y1, x0:x1]))
-            records.append({'rgba': patch, 'x': x + x0, 'y': y + y0, 'w': x1 - x0, 'h': y1 - y0})
-        # prefer-large over shatter: sub-threshold slivers merge into the nearest
-        # bigger object in the same pass; isolated card-owned slivers absorb into
-        # the card, isolated free slivers survive (may be a real element).
-        frag = max(48, round(h * .023))
-        merge_gap = max(frag, round(h * .015))
-        emitted = []
-        for rec in sorted(records, key=lambda r: r['w'] * r['h']):
-            if max(rec['w'], rec['h']) < frag:
-                best, best_d = None, merge_gap + 1
-                for cand in records:
-                    if cand is rec or max(cand['w'], cand['h']) <= max(rec['w'], rec['h']):
-                        continue
-                    gx = max(rec['x'] - (cand['x'] + cand['w']), cand['x'] - (rec['x'] + rec['w']), 0)
-                    gy = max(rec['y'] - (cand['y'] + cand['h']), cand['y'] - (rec['y'] + rec['h']), 0)
-                    if max(gx, gy) < best_d:
-                        best, best_d = cand, max(gx, gy)
-                if best is not None:
-                    ux0 = min(rec['x'], best['x'])
-                    uy0 = min(rec['y'], best['y'])
-                    ux1 = max(rec['x'] + rec['w'], best['x'] + best['w'])
-                    uy1 = max(rec['y'] + rec['h'], best['y'] + best['h'])
-                    canvas = np.zeros((uy1 - uy0, ux1 - ux0, 4), np.uint8)
-                    canvas[best['y'] - uy0:best['y'] - uy0 + best['h'],
-                           best['x'] - ux0:best['x'] - ux0 + best['w']] = best['rgba']
-                    sub = canvas[rec['y'] - uy0:rec['y'] - uy0 + rec['h'],
-                                 rec['x'] - ux0:rec['x'] - ux0 + rec['w']]
-                    a = rec['rgba'][..., 3:4].astype(np.float32) / 255
-                    sub[..., :3] = (rec['rgba'][..., :3] * a + sub[..., :3] * (1 - a)).astype(np.uint8)
-                    sub[..., 3] = np.maximum(sub[..., 3], rec['rgba'][..., 3])
-                    best.update({'rgba': canvas, 'x': ux0, 'y': uy0, 'w': ux1 - ux0, 'h': uy1 - uy0})
-                    continue
-                if owned:
-                    if os.environ.get('LF_DEBUG_RESIDUAL'):
-                        print(f'[residual-absorb] owned bbox=({rec["x"]},{rec["y"]},{rec["w"]},{rec["h"]})')
-                    continue
-            emitted.append(rec)
-        for rec in emitted:
-            path = asset_dir / f'object_{residual_objects+1:04d}.png'
-            Image.fromarray(rec['rgba']).save(path)
-            elements.append({'object_id': f'object_{residual_objects+1:04d}', 'route': 'raster_component',
-                             'role': 'visual', 'z_index': 1000+residual_objects,
-                             'component': {'path': str(path), 'x': rec['x'], 'y': rec['y'],
-                                           'w': rec['w'], 'h': rec['h']}})
-            residual_objects += 1
+            records.append({'rgba': patch, 'x': x + x0, 'y': y + y0,
+                            'w': x1 - x0, 'h': y1 - y0, 'owned': owned})
+    # prefer-large over shatter: sub-threshold slivers merge into the nearest
+    # bigger object across BOTH residual passes (an illustration split by a
+    # card mask cannot hide its own fragments) then into an emitted visual
+    # element (a dash under an icon rides the icon's PNG); isolated card-owned
+    # slivers absorb into the card, isolated free slivers survive.
+    residual_objects += _emit_residual(records, elements, asset_dir, difference,
+                                       (h, w), text, items)
     residual_candidates = residual_objects
+    for fragment in list(elements):
+        c = fragment.get('component')
+        if not c or not fragment['object_id'].startswith('unit_') or c['w']*c['h'] >= h*w*.0001:
+            continue
+        choices=[]
+        for parent in elements:
+            p=parent.get('component')
+            if parent is fragment or not p or p['w']*p['h'] <= c['w']*c['h']:
+                continue
+            dx=max(0,p['x']-c['x']-c['w'],c['x']-p['x']-p['w'])
+            dy=max(0,p['y']-c['y']-c['h'],c['y']-p['y']-p['h'])
+            if max(dx,dy) <= min(w,h)*.005:
+                choices.append((dx+dy,parent))
+        if choices:
+            parent=min(choices,key=lambda pair:pair[0])[1];p=parent['component']
+            left,top=min(c['x'],p['x']),min(c['y'],p['y'])
+            right,bottom=max(c['x']+c['w'],p['x']+p['w']),max(c['y']+c['h'],p['y']+p['h'])
+            canvas=Image.new('RGBA',(right-left,bottom-top))
+            for part in (p,c):
+                with Image.open(part['path']) as image:
+                    canvas.alpha_composite(image.convert('RGBA'),(part['x']-left,part['y']-top))
+            canvas.save(p['path'])
+            p.update(x=left,y=top,w=right-left,h=bottom-top)
+            parent['bbox']=[left,top,right,bottom]
+            elements.remove(fragment)
     elements, visual_parts_merged = _merge_repeated_visuals(elements, asset_dir, (w, h))
+    elements, card_raster_dedup = _dedupe_card_rasters(elements)
     elements, groups = _group_layout(elements, items, asset_dir, (w, h), card_mode)
     residual_objects = sum(e['role'] == 'visual' for e in elements)
     card_images = sum(e['role'] == 'card' and e['route'] == 'raster_component' for e in elements)
     native_shapes = sum(e['route'] == 'native_shape' for e in elements)
+    invariants = _audit_invariants(elements, items, (h, w), rgb)
     audit = {'objects': [{k: e[k] for k in ('object_id', 'route', 'role', 'bbox') if k in e} for e in elements],
              'native_shapes': native_shapes, 'card_images': card_images, 'residual_objects': residual_objects,
              'text_boxes': len(items), 'text_audit': text_audit, 'cards': len(regions), 'card_groups': len(groups),
              'object_groups': groups, 'residual_candidates': residual_candidates, 'visual_parts_merged': visual_parts_merged,
+             'invariants': invariants, 'card_raster_dedup': card_raster_dedup,
              'source_sha256': _digest(source),
              'background_kind': 'external' if background else 'source_fill' if preserve_backdrop and reconstructed is not None else 'source_cleaned' if preserve_backdrop else 'flat',
              'warnings': ['object grouping is local; complex touching decorations require review'] if residual_objects else []}
