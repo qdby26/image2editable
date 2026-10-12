@@ -442,6 +442,7 @@ def detect_defects(source, pptx, rendered, *, output_dir, slide_index=0):
     # or symbols (no CJK, no digits — keeps page numbers and '01'-'04'
     # numbering safe) sitting inside a raster object's region: graphics
     # OCR'd into glyphs.
+    phantom_ids = set()
     for obj in texts:
         content = obj['text'].strip()
         squashed = ''.join(content.split())
@@ -453,16 +454,48 @@ def detect_defects(source, pptx, rendered, *, output_dir, slide_index=0):
         x, y, w, h = obj['bbox']
         for raster in rasters:
             rx, ry, rw, rh = raster['bbox']
-            if rx <= x and ry <= y and rx+rw >= x+w and ry+rh >= y+h:
+            if rx <= x and ry <= y and rx+rw >= x+w and rx+rh >= y+h:
+                phantom_ids.add(obj['id'])
                 add('phantom_text', obj['bbox'], max(1, round(w*h)), [obj, raster],
                     reason='native glyph inside raster graphic region (OCR artefact)')
+                break
+    # superscript phantom digit: a degenerate narrow digit box (<=2 digit
+    # chars, width <=0.35*height — real one-char boxes carry textbox
+    # insets) pinned to the upper-left of a same-baseline neighbour whose
+    # text starts with the same digit — a duplicated leading glyph that
+    # renders as a stray superscript ('HPV 1' + '16/18型'). Page numbers
+    # and step digits fail the neighbour or narrowness test.
+    for obj in texts:
+        sq = ''.join(obj['text'].split())
+        if not (1 <= len(sq) <= 2 and all(ch.isdigit() for ch in sq)):
+            continue
+        x, y, w, h = obj['bbox']
+        if w > .35*h:
+            continue
+        for other in texts:
+            if other is obj:
+                continue
+            ox, oy, ow, oh = other['bbox']
+            gap = ox-(x+w)
+            if not (-.1*oh <= gap < .3*oh):
+                continue
+            if abs(oy-y) > .15*oh or not (.7*oh <= h <= 1.4*oh):
+                continue
+            if ''.join(other['text'].split()).startswith(sq):
+                phantom_ids.add(obj['id'])
+                add('phantom_text', obj['bbox'], max(1, round(w*h)), [obj, other],
+                    reason='narrow digit box duplicates neighbour leading glyph '
+                           '(superscript artefact)')
                 break
     # weight_loss: source glyphs are bold but the native text renders at
     # regular weight. Measured as the 90th-percentile stroke width
     # (distance transform over the ink mask) plus ink density inside the
     # text frame; weight_loss = fixable when source exceeds render by
-    # 30% in stroke width and 15% in density.
+    # 30% in stroke width and 15% in density. Phantom-flagged boxes are
+    # excluded: a graphic OCR'd into a glyph is not a weight issue.
     for obj in texts:
+        if obj['id'] in phantom_ids:
+            continue
         x, y, r, b = _rect(obj['bbox'], width, height)
         if r <= x or b <= y or (r-x)*(b-y) < 400:
             continue
@@ -574,9 +607,25 @@ def detect_defects(source, pptx, rendered, *, output_dir, slide_index=0):
                 flagged[cy, cx] = True
     flagged = cv2.morphologyEx(flagged.astype(np.uint8), cv2.MORPH_CLOSE,
                                np.ones((3, 3), np.uint8)) > 0
+    # calibration (B-gen-06 annotation set): a real added patch is a solid
+    # changed mass — its shifted pixels fill the flagged region's interior.
+    # Halo noise (sub-pixel shifts around rendered glyphs and shape edges)
+    # and the flattening of a faint source gradient form only thin
+    # outlines, which a 13px opening removes. Keep a region only when the
+    # surviving mass covers >=50% of its flagged near-background pixels.
+    changed_solid = (delta >= 4.5) & near_bg
+    changed_solid = cv2.morphologyEx(changed_solid.astype(np.uint8),
+                                   cv2.MORPH_OPEN, np.ones((13, 13), np.uint8)) > 0
     count, labels, stats, _ = cv2.connectedComponentsWithStats(flagged.astype(np.uint8), 8)
     for index, (x, y, w, h, area) in enumerate(stats[1:], 1):
         if area*cell*cell < width*height*.004:
+            continue
+        cellmask = np.repeat(np.repeat(labels == index, cell, axis=0), cell, axis=1)
+        ch, cw = cellmask.shape
+        cellmask = cellmask[:height, :width]
+        sel = cellmask & near_bg
+        solid = sel & changed_solid
+        if sel.sum() == 0 or solid.sum()/sel.sum() < .5:
             continue
         box = [x*cell, y*cell, w*cell, h*cell]
         related = [o for o in objects if _intersection(o['bbox'], box)]

@@ -302,6 +302,39 @@ def test_run01_p05_low_contrast_backdrop_patch(tmp_path):
     assert any(d['bbox'][1]+d['bbox'][3] > 1800 for d in matches), matches
 
 
+def test_v32flatbg_p05_superscript_phantom_digit(tmp_path):
+    # 'HPV 16/18型' was emitted as 'HPV ' + a degenerate 12px-wide '1' box
+    # + '16/18型': the '1' duplicates the neighbour's leading glyph and
+    # renders as a stray superscript. Board: B-gen-06 task 2.
+    run = WORK/'routeb/v32-flatbg/p05'
+    report = detect_defects(WORK/'flatfirst/task0/render/flatbg-p05.png',
+                            run/'out.pptx', run/'render_001.png', output_dir=tmp_path)
+    matches = [d for d in report['defects'] if d['category'] == 'phantom_text'
+               and d['severity'] == 'hard'
+               and 1800 <= d['bbox'][0] <= 1950 and 650 <= d['bbox'][1] <= 800]
+    assert matches, report['defects']
+
+
+@pytest.mark.parametrize('label', ['run01-p02', 'run01-p04'])
+def test_patch_calibration_kills_edge_noise(label, tmp_path):
+    # Annotation set: flagged cells driven by text/shape halo pixels or by
+    # flattening the source's own faint gradient are not patches — only a
+    # solid changed mass counts (open >=50% of flagged near-bg pixels).
+    page = int(label[-2:])
+    report = trial_report(page, tmp_path)
+    assert not [d for d in report['defects'] if d['category'] == 'patch'], \
+        [d['bbox'] for d in report['defects'] if d['category'] == 'patch']
+
+
+def test_phantom_bubble_is_not_double_counted_as_weight_loss(tmp_path):
+    # p03's 'O' bubble glyph belongs to phantom_text; it must not also be
+    # reported as weight_loss.
+    report = trial_report(3, tmp_path)
+    offenders = [d for d in report['defects'] if d['category'] == 'weight_loss'
+                 and d['bbox'][0] > 2800]
+    assert not offenders, offenders
+
+
 def test_merge_skips_structural_defects(tmp_path):
     from PIL import Image
     from pptx import Presentation
