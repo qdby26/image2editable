@@ -192,6 +192,16 @@ def refine_layout_text(rgb, text_items):
                 if fitted:
                     child.update(font=fitted['font'],bold=fitted['bold'],
                                  font_size=fitted['font_size_px']*960/rgb.shape[1])
+                    from scripts.font_match import resolve_font
+                    face = resolve_font(child['font'], child['bold'], size=1000)
+                    color = np.array([int(child['color'][i:i+2], 16) for i in (1, 3, 5)])
+                    ink = (np.max(np.abs(crop.astype(int)-color), axis=2) <= 45).astype(np.uint8)
+                    ix, iy, iw, ih = cv2.boundingRect(ink)
+                    bounds = face.getmask(text).getbbox() if face else None
+                    if bounds and 0 < ink.mean() < .5 and ih >= crop.shape[0]*.3:
+                        pixels = ih*1000/(bounds[3]-bounds[1])
+                        child.update(font_size=pixels*960/rgb.shape[1], box_kind='ink',
+                                     measured_ink_box=[x+ix,y+iy,iw,ih])
             result.append(child)
     # a short item swallowed by a wider item is almost always OCR reading the
     # same ink twice (the split pass can also leave such a stub behind); keep
@@ -275,6 +285,20 @@ def _surface(rgb, mask, text):
                                           np.rint(end).astype(int).tolist()],
                                'angle': 0 if axis == 1 else 270}
     return fill, payload
+
+
+def _corner_radius(mask):
+    h, w = mask.shape
+    limit = min(h, w)//2
+    profiles = []
+    for corner in (mask, mask[:, ::-1], mask[::-1], mask[::-1, ::-1]):
+        rows = corner[:limit, :w//2] != 0
+        profiles.append(np.argmax(rows, axis=1))
+    observed = np.median(profiles, axis=0)
+    y = np.arange(limit)
+    return min(range(1, limit+1), key=lambda radius: float(np.minimum(
+        np.abs(observed-np.where(y < radius,
+            radius-np.sqrt(np.maximum(0, radius**2-(radius-y)**2)), 0)), 3).sum()))
 
 
 def _geometry(rgb, mask, text, outline=False):
@@ -977,6 +1001,8 @@ def _recover_text_gaps(rgb, items, text, asset_dir, reader):
                               and abs(v['box'][1]-(top+ty)) < v['box'][3]*.5
                               and abs(v['box'][0]+v['box'][2]-(left+tx)) < v['box'][3]*1.5),None)
             if tail_host is not None and punctuation and all(c in '？?！!，,。；;' for c in punctuation):
+                if any('\u4e00' <= c <= '\u9fff' for c in tail_host['text']):
+                    punctuation = punctuation.translate(str.maketrans('?!,;', '？！，；'))
                 tail_host['text'] += punctuation
                 tail_host['box'][2] = max(tail_host['box'][2],left+tx+tw-tail_host['box'][0])
                 text |= _text_mask([tail_host],text.shape)
@@ -1153,7 +1179,7 @@ def _release_boxed_decorations(rgb, items, regions, text):
     return text, released
 
 
-def _suppress_mixed_unit_text(rgb, regions, items, text):
+def _suppress_mixed_unit_text(rgb, regions, items, text, visual_mask=None):
     dropped = []
     units = []
     h, w = text.shape
@@ -1167,13 +1193,18 @@ def _suppress_mixed_unit_text(rgb, regions, items, text):
         interior = cv2.erode(region['aligned_mask'], np.ones((7, 7), np.uint8)) != 0
         contrast = np.max(np.abs(crop.astype(np.int16) - region['surface'][0].astype(np.int16)), axis=2)
         ink = ((contrast > 45) & interior & (text[ry:bottom, rx:right] == 0)).astype(np.uint8)
+        if visual_mask is not None:
+            ink[visual_mask[ry:bottom, rx:right] != 0] = 0
         for child in regions:
             if (child is region or child['transform'] is not None
                     or child['shape'].get('shape_type') != 'rounded_rectangle'):
                 continue
             cx, cy, cr, cb = child['bbox']
-            if rx <= cx and ry <= cy and cr <= right and cb <= bottom:
-                ink[cy - ry:cb - ry, cx - rx:cr - rx][child['aligned_mask'] != 0] = 0
+            ix, iy, ir, ib = max(rx, cx), max(ry, cy), min(right, cr), min(bottom, cb)
+            area = max(1, (cr-cx)*(cb-cy))
+            if (max(0, ir-ix)*max(0, ib-iy) >= area*.95
+                    and area < (right-rx)*(bottom-ry)*.8):
+                ink[iy-ry:ib-ry, ix-rx:ir-rx][child['aligned_mask'][iy-cy:ib-cy, ix-cx:ir-cx] != 0] = 0
         count, labels, stats, _ = cv2.connectedComponentsWithStats(ink, 8)
         comps = []
         for label in range(1, count):
@@ -1771,7 +1802,7 @@ def _emit_residual(records, elements, asset_dir, difference, page_size,
         emitted.append(rec)
     emitted_count = 0
     for rec in emitted:
-        if rec['owned'] and rec['w']*rec['h'] < h*w*.0001:
+        if rec['w']*rec['h'] < h*w*.0001:
             continue
         if os.environ.get('LF_DEBUG_RESIDUAL'):
             ra = rec['rgba'][..., 3] != 0
@@ -2126,8 +2157,30 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
         if crop.size and crop.mean() > .15:
             stamp_items.append(item)
     stamp_ids = {id(item) for item in stamp_items}
+    visual_mask = np.zeros((h, w), np.uint8)
+    panel_specs = []
+    panel_seed = ((rgb.min(axis=2) >= 170) & (chroma >= 8) & (chroma <= 75)).astype(np.uint8)
+    contours, _ = cv2.findContours(panel_seed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for contour in contours:
+        px, py, pw, ph = cv2.boundingRect(contour)
+        if not (h*w*.0005 <= pw*ph <= h*w*.03 and .35 <= pw/ph <= 3):
+            continue
+        mask = np.zeros((ph, pw), np.uint8)
+        cv2.drawContours(mask, [contour-np.array([[[px, py]]])], -1, 255, -1)
+        if (mask != 0).mean() < .5 or text[py:py+ph, px:px+pw].any():
+            continue
+        crop = rgb[py:py+ph, px:px+pw]
+        dark = ((crop.min(axis=2) < 170) & (mask != 0)).astype(np.uint8)
+        if dark.mean() < .01:
+            continue
+        panel_specs.append((px, py, pw, ph, mask))
+        regions = [r for r in regions if not (
+            r['bbox'][0] <= px and r['bbox'][1] <= py
+            and r['bbox'][2] >= px+pw and r['bbox'][3] >= py+ph
+            and (r['bbox'][2]-r['bbox'][0])*(r['bbox'][3]-r['bbox'][1]) < pw*ph*1.2)]
+        visual_mask[py:py+ph, px:px+pw] |= mask
     items, text, unit_specs, suppressed_items = _suppress_mixed_unit_text(
-        rgb, regions, [item for item in items if id(item) not in stamp_ids], text)
+        rgb, regions, [item for item in items if id(item) not in stamp_ids], text, visual_mask)
     items += stamp_items
     unit_specs = [spec for spec in unit_specs if not any(
         max(0, min(spec['box'][2], item['box'][0]+item['box'][2])-max(spec['box'][0], item['box'][0]))
@@ -2136,6 +2189,9 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
     text_audit['unit_suppressed'] = len(suppressed_items)
     text_audit['suppressed_items'] = suppressed_items
     _unify_series_styles(items, regions, page=(w, h))
+    for item in items:
+        if 'measured_ink_box' in item:
+            item['box'] = item.pop('measured_ink_box')
     consumed = np.zeros((h, w), np.uint8)
     elements = []
     card_images = 0
@@ -2184,12 +2240,9 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
                     region['native_bbox'] = [round(x+stroke_width/2),round(y+stroke_width/2),
                                              round(right-stroke_width/2),round(bottom-stroke_width/2)]
                     if region['shape']['shape_type'] == 'rounded_rectangle':
-                        top_rows = mask[y:y+max(2,round(stroke_width)),x:right]
-                        starts = [int(np.flatnonzero(row)[0]) for row in top_rows if row.any()]
-                        if starts:
-                            radius = float(max(starts))
-                            region['shape']['corner_ratio'] = min(.5,max(0,radius-stroke_width/2)
-                                / max(1,min(right-x,bottom-y)-stroke_width))
+                        radius = _corner_radius(mask[y:bottom,x:right])
+                        region['shape']['corner_ratio'] = min(.5,max(0,radius-stroke_width/2)
+                            / max(1,min(right-x,bottom-y)-stroke_width))
                 border = (contrast & (frame != 0)) if frames else mask & (cv2.erode(region['mask'], np.ones((9, 9), np.uint8)) == 0)
                 expected[border] = rgb[border]
         consumed[mask] = 255
@@ -2218,7 +2271,13 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
     # suppressed text units and unread series rows emit one unit PNG per slot so
     # "01" is a single movable object and digit ink never reaches the residual
     # pass where it could weld into the icon below.
-    unit_mask = np.zeros((h, w), np.uint8)
+    unit_mask = visual_mask.copy()
+    for index, (px, py, pw, ph, mask) in enumerate(panel_specs, 1):
+        path = asset_dir / f'icon_panel_{index:04d}.png'
+        Image.fromarray(np.dstack((rgb[py:py+ph, px:px+pw], mask))).save(path)
+        elements.append({'object_id': f'icon_panel_{index:04d}', 'route': 'raster_component',
+                         'role': 'visual', 'z_index': 940+index, 'bbox': [px, py, px+pw, py+ph],
+                         'component': {'path': str(path), 'x': px, 'y': py, 'w': pw, 'h': ph}})
     for udx, unit in enumerate(unit_specs, 1):
         host = unit['region']
         rx, ry, rright, rbottom = host['bbox']
@@ -2452,8 +2511,10 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
             print(f'[post-open row{yy}] free_seed={int(((residual[yy]!=0)&(consumed[yy]==0)).sum())} owned_seed={int(((residual[yy]!=0)&(consumed[yy]!=0)).sum())}')
     column_lefts = [r['bbox'][0] for r in regions if r['bbox'][2] - r['bbox'][0] > w * .2]
     cut = int(np.median(column_lefts)) if column_lefts else None
+    cut_mask = np.zeros((h, w), bool)
     if cut is not None:
-        residual[:, max(0, cut - 2):min(w, cut + 3)] = 0
+        cut_mask[:, max(0, cut - 2):min(w, cut + 3)] = consumed[:, max(0, cut - 2):min(w, cut + 3)] != 0
+        residual[cut_mask] = 0
     close = np.ones((max(3, round(h*.005)), max(3, round(w*.003))), np.uint8)
     residual_objects = 0
     records = []
@@ -2463,10 +2524,23 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
         # card-left-edge cut after closing since the kernel can span the 5px gap.
         grouped = cv2.morphologyEx(seed, cv2.MORPH_CLOSE, close)
         if cut is not None:
-            grouped[:, max(0, cut - 2):min(w, cut + 3)] = 0
+            grouped[cut_mask] = 0
         contours, _ = cv2.findContours(grouped, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if owned:
             contours = _split_owned_bridges(contours, difference, consumed, h, w)
+        elif cut is not None:
+            split = []
+            for contour in contours:
+                cx, cy, cw, ch = cv2.boundingRect(contour)
+                if cw >= w*.85 and ch >= h*.75:
+                    for left, right in ((0, cut), (cut, w)):
+                        section = np.zeros_like(grouped)
+                        section[:, left:right] = grouped[:, left:right]
+                        parts, _ = cv2.findContours(section, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        split.extend(parts)
+                else:
+                    split.append(contour)
+            contours = split
         pass_tag = 'owned' if owned else 'free'
         for contour in sorted(contours, key=lambda c: cv2.boundingRect(c)[1]):
             x, y, rw, rh = cv2.boundingRect(contour)
@@ -2544,6 +2618,8 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
             canvas.save(p['path'])
             p.update(x=left,y=top,w=right-left,h=bottom-top)
             parent['bbox']=[left,top,right,bottom]
+            elements.remove(fragment)
+        else:
             elements.remove(fragment)
     elements, visual_parts_merged = _merge_repeated_visuals(elements, asset_dir, (w, h))
     elements, card_raster_dedup = _dedupe_card_rasters(elements)

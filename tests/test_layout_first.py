@@ -1079,6 +1079,96 @@ def test_glow_bridged_owned_components_split_into_separate_objects(tmp_path):
                    for e in covering)
 
 
+def test_flatbg_illustration_does_not_lose_card_cut_columns(tmp_path):
+    from image2editable.layout_first import prepare_layout
+
+    source = Path('E:/PPT/projects/2026-10-01-chunyu092704-cervical-cancer/working/flatfirst/task0/render/flatbg-p02.png')
+    rgb = np.asarray(Image.open(source).convert('RGB')).copy()
+    path = tmp_path/'real-crop.png'
+    Image.fromarray(rgb).save(path)
+    cache = source.parents[2]/'task5f'/'lf'/'p02'/'text_001.json'
+    items = json.loads(cache.read_text(encoding='utf8'))['text_items']
+    slide, _ = prepare_layout(path, tmp_path/'assets', text_items=items, background_mode='source',
+                              label_reader=lambda *a, **k: ([], None))
+    for x, y in ((775, 979), (775, 1677)):
+        covered = False
+        for element in slide['visual_elements']:
+            c = element.get('component')
+            if c and c['x'] <= x < c['x']+c['w'] and c['y'] <= y < c['y']+c['h']:
+                rgba = np.asarray(Image.open(c['path']).convert('RGBA'))
+                covered |= rgba[y-c['y'], x-c['x'], 3] > 0
+        assert covered, (x, y)
+    assert not any(e.get('component') and e['component']['w']*e['component']['h'] < rgb.shape[0]*rgb.shape[1]*.0001
+                   for e in slide['visual_elements'])
+
+
+def test_illustration_beside_card_is_not_cut_at_card_left(tmp_path):
+    from image2editable.layout_first import prepare_layout
+
+    rgb = np.full((600, 1000, 3), 255, np.uint8)
+    cv2.ellipse(rgb, (350, 400), (300, 190), 0, 0, 360, (180, 80, 70), -1)
+    cv2.ellipse(rgb, (350, 400), (240, 130), 0, 0, 360, (70, 90, 180), -1)
+    cv2.rectangle(rgb, (350, 35), (950, 180), (220, 235, 250), -1)
+    path = tmp_path/'illustration.png'
+    Image.fromarray(rgb).save(path)
+    slide, _ = prepare_layout(path, tmp_path/'assets', text_items=[], label_reader=lambda *a, **k: ([], None))
+    visuals = [e['component'] for e in slide['visual_elements'] if e.get('component')]
+    assert any(c['x'] < 348 and c['x']+c['w'] > 353 and c['y'] <= 400 < c['y']+c['h'] for c in visuals)
+
+
+def test_micro_free_residual_does_not_emit_independent_object(tmp_path):
+    from image2editable.layout_first import _emit_residual
+
+    rgba = np.full((22, 15, 4), 255, np.uint8)
+    elements = []
+    count = _emit_residual([{'rgba': rgba, 'x': 50, 'y': 50, 'w': 15, 'h': 22, 'owned': False}],
+                           elements, tmp_path, np.full((2160, 3840), 100, np.uint8),
+                           (2160, 3840), np.zeros((2160, 3840), np.uint8), [])
+    assert count == 0
+
+
+def test_label_size_uses_measured_glyph_height(monkeypatch):
+    from image2editable.layout_first import refine_layout_text
+    from scripts.font_match import resolve_font
+    from PIL import ImageDraw
+
+    image = Image.new('RGB', (1200, 220), 'white')
+    font = resolve_font('Microsoft YaHei', True, size=80)
+    ImageDraw.Draw(image).text((30, 20), '课堂提问：', font=font, fill=(0, 55, 182))
+    ImageDraw.Draw(image).text((500, 20), '正文', font=font, fill=(50, 50, 50))
+    monkeypatch.setattr('scripts.font_match.match_text_face', lambda *a, **k:
+                        {'font': 'Microsoft YaHei', 'bold': True, 'font_size_px': 30})
+    item = {'text': '课堂提问：正文', 'box': [20, 10, 700, 140], 'font_size': 14,
+            'words': [{'text': '课堂提问：', 'box': [0, 0, .65, 1]},
+                      {'text': '正文', 'box': [.68, 0, .32, 1]}]}
+    result, _ = refine_layout_text(np.asarray(image), [item])
+    assert abs(result[0]['font_size'] - 80*960/1200) < 2
+    assert result[0]['box_kind'] == 'ink'
+
+
+def test_round_corner_fit_uses_whole_profile_not_first_row():
+    from image2editable.layout_first import _corner_radius, _rounded_rectangle
+
+    mask = _rounded_rectangle(600, 1500, 85).astype(np.uint8)
+    mask[0, 70:1430] = 1
+    assert abs(_corner_radius(mask)-85) <= 1
+
+
+def test_recovered_fullwidth_punctuation_preserves_cjk_advance(tmp_path):
+    from image2editable.layout_first import _recover_text_gaps, _text_mask
+
+    rgb = np.full((160, 600, 3), 255, np.uint8)
+    cv2.putText(rgb, '?', (240, 85), cv2.FONT_HERSHEY_SIMPLEX, 1, (30, 30, 30), 2)
+    items = [{'text': '癌', 'box': [60, 55, 150, 40],
+              'words': [{'text': '癌', 'box': [0, 0, 1, 1]}]}]
+    def reader(path, **kwargs):
+        return [{'text': '癌?', 'box': [50, 5, 150, 30], 'confidence': .99,
+                 'words': [{'text': '癌', 'box': [0, 0, .5, 1]},
+                           {'text': '?', 'box': [.5, 0, .5, 1]}]}], None
+    result, _, _ = _recover_text_gaps(rgb, items, _text_mask(items, rgb.shape[:2]), tmp_path, reader)
+    assert result[0]['text'] == '癌？'
+
+
 def test_card_edge_sliver_is_not_an_independent_unit(tmp_path):
     from image2editable.layout_first import _dedupe_card_rasters
 
@@ -1101,7 +1191,7 @@ def test_tail_punctuation_context_merges_without_repeating_glyph(tmp_path):
     def reader(path,**kwargs):
         return [{'text':'癌?','box':[50,5,60,30],'confidence':.99}],None
     result,_,_=_recover_text_gaps(rgb,items,_text_mask(items,rgb.shape[:2]),tmp_path,reader)
-    assert [v['text'] for v in result]==['癌?']
+    assert [v['text'] for v in result]==['癌？']
 
 
 def test_tiny_owned_residual_does_not_emit_independent_object(tmp_path):
@@ -1727,6 +1817,62 @@ def test_row_chain_box_stops_at_element_gaps():
     box, members = _row_chain_box(comps, [(100, 100, 160, 220)])
     assert box[2] - 100 <= 120 * 5, \
         f'chain welded a whole row of separate elements: {box}'
+
+
+def test_three_pill_rows_at_page_bottom_do_not_seed_outer_units(tmp_path):
+    from image2editable.layout_first import _suppress_mixed_unit_text
+
+    rgb = np.full((720, 1200, 3), 255, np.uint8)
+    regions = []
+    for y in (20, 260, 500):
+        parent_mask = np.zeros((720, 1200), np.uint8)
+        parent_mask[y:y+220, 201:1180] = 255
+        regions.append({'bbox': [201, y, 1180, y+220], 'transform': None,
+                        'aligned_mask': parent_mask[y:y+220, 201:1180],
+                        'surface': (rgb[y:y+220, 201:1180].copy(),),
+                        'shape': {'shape_type': 'rectangle', 'fill_rgb': [255]*3}})
+        x = 200 if y == 500 else 202
+        mask = np.zeros((720, 1200), np.uint8)
+        cv2.rectangle(mask, (x+35, y+40), (x+245, y+180), 255, -1)
+        cv2.circle(mask, (x+35, y+110), 70, 255, -1)
+        cv2.circle(mask, (x+245, y+110), 70, 255, -1)
+        mask[:, :x] = 0
+        rgb[mask != 0] = [47, 107, 208]
+        regions.append({'bbox': [x, y+40, x+315, y+181], 'transform': None,
+                        'aligned_mask': mask[y+40:y+181, x:x+315],
+                        'surface': (np.full((141, 315, 3), [47, 107, 208], np.uint8),),
+                        'shape': {'shape_type': 'rounded_rectangle', 'fill_rgb': [47, 107, 208]}})
+        cv2.rectangle(rgb, (540, y+70), (650, y+160), (30, 60, 130), -1)
+    _, _, specs, _ = _suppress_mixed_unit_text(rgb, regions, [], np.zeros((720, 1200), np.uint8))
+    assert not any(s['box'][0] < 515 and s['box'][2] > 540 for s in specs)
+
+
+def test_disconnected_icon_on_pale_panel_is_one_faithful_png(tmp_path):
+    from image2editable.layout_first import prepare_layout
+
+    rgb = np.full((800, 1400, 3), 255, np.uint8)
+    for y in (100, 430):
+        cv2.rectangle(rgb, (100, y), (1300, y+300), (249, 249, 249), -1)
+        cv2.rectangle(rgb, (450, y+60), (590, y+240), (223, 237, 251), -1)
+        cv2.line(rgb, (480, y+80), (480, y+110), (155, 170, 191), 8)
+        cv2.ellipse(rgb, (520, y+150), (35, 40), 0, 0, 180, (35, 55, 80), 8)
+        cv2.circle(rgb, (555, y+215), 12, (35, 55, 80), 5)
+    source = tmp_path / 'panels.png'
+    Image.fromarray(rgb).save(source)
+    slide, _ = prepare_layout(source, tmp_path / 'assets', text_items=[])
+    for y in (100, 430):
+        parts = []
+        for e in slide['visual_elements']:
+            c = e.get('component')
+            if c and c['x'] < 590 and c['x']+c['w'] > 450 and c['y'] < y+240 and c['y']+c['h'] > y+60:
+                parts.append(c)
+        assert len(parts) == 1, parts
+        c = parts[0]
+        with Image.open(c['path']) as image:
+            rgba = np.asarray(image.convert('RGBA'))
+        for x, yy in ((480, y+90), (520, y+190), (555, y+203)):
+            assert rgba[yy-c['y'], x-c['x'], 3] == 255
+            assert np.array_equal(rgba[yy-c['y'], x-c['x'], :3], rgb[yy, x])
 
 
 def test_nested_card_surface_never_seeds_outer_unit(tmp_path):
