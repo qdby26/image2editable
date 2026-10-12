@@ -99,6 +99,7 @@ def detect_defects(source, pptx, rendered, *, output_dir, slide_index=0):
         raise ValueError('render and source must have the same dimensions')
     dst = np.asarray(image)
     objects = read_objects(pptx, (width, height), slide_index)
+    background = np.median(np.concatenate((src[0], src[-1], src[:, 0], src[:, -1])), axis=0)
     changed = np.max(abs(src.astype(np.int16)-dst.astype(np.int16)), axis=2) > 40
     text_mask = np.zeros((height, width), bool)
     defects = []
@@ -235,31 +236,35 @@ def detect_defects(source, pptx, rendered, *, output_dir, slide_index=0):
                 break
         else:
             lines.append({'cy': cy, 'h': obj['tight_bbox'][3], 'members': [obj]})
+    chained = set()
+    def _emit_run(chain):
+        Hmax = max(o['tight_bbox'][3] for o in chain)
+        margin = max(2, round(Hmax*.015))
+        for a, b in zip(chain, chain[1:]):
+            gx0 = round(a['tight_bbox'][0] + a['tight_bbox'][2]) + margin
+            gx1 = round(b['tight_bbox'][0]) - margin
+            y0 = round(max(a['tight_bbox'][1], b['tight_bbox'][1]))
+            y1 = round(min(a['tight_bbox'][1] + a['tight_bbox'][3], b['tight_bbox'][1] + b['tight_bbox'][3]))
+            if gx1 <= gx0 or y1 <= y0:
+                continue
+            strip = src[y0:y1, gx0:gx1]
+            if np.mean(np.max(abs(strip.astype(np.int16) - a['_med'].astype(np.int16)), axis=2) <= 60) >= .15:
+                return
+        x0 = min(o['tight_bbox'][0] for o in chain)
+        y0 = min(o['tight_bbox'][1] for o in chain)
+        x1 = max(o['tight_bbox'][0] + o['tight_bbox'][2] for o in chain)
+        y1 = max(o['tight_bbox'][1] + o['tight_bbox'][3] for o in chain)
+        add('fragmented', [x0, y0, x1-x0, y1-y0],
+            sum(int((o['_rgba'][:, :, 3] > 0).sum()) for o in chain), chain,
+            reason='PNG run forms one continuous glyph string (fragmented text unit)')
+        chained.update(o['id'] for o in chain)
     for line in lines:
         members = sorted(line['members'], key=lambda o: o['tight_bbox'][0])
         chain = []
         def flush():
             if len(chain) < 3:
                 return
-            Hmax = max(o['tight_bbox'][3] for o in chain)
-            margin = max(2, round(Hmax*.015))
-            for a, b in zip(chain, chain[1:]):
-                gx0 = round(a['tight_bbox'][0] + a['tight_bbox'][2]) + margin
-                gx1 = round(b['tight_bbox'][0]) - margin
-                y0 = round(max(a['tight_bbox'][1], b['tight_bbox'][1]))
-                y1 = round(min(a['tight_bbox'][1] + a['tight_bbox'][3], b['tight_bbox'][1] + b['tight_bbox'][3]))
-                if gx1 <= gx0 or y1 <= y0:
-                    continue
-                strip = src[y0:y1, gx0:gx1]
-                if np.mean(np.max(abs(strip.astype(np.int16) - a['_med'].astype(np.int16)), axis=2) <= 60) >= .15:
-                    return
-            x0 = min(o['tight_bbox'][0] for o in chain)
-            y0 = min(o['tight_bbox'][1] for o in chain)
-            x1 = max(o['tight_bbox'][0] + o['tight_bbox'][2] for o in chain)
-            y1 = max(o['tight_bbox'][1] + o['tight_bbox'][3] for o in chain)
-            add('fragmented', [x0, y0, x1-x0, y1-y0],
-                sum(int((o['_rgba'][:, :, 3] > 0).sum()) for o in chain), chain,
-                reason='PNG run forms one continuous glyph string (fragmented text unit)')
+            _emit_run(chain)
         for obj in members:
             if not chain:
                 chain.append(obj)
@@ -278,10 +283,308 @@ def detect_defects(source, pptx, rendered, *, output_dir, slide_index=0):
                 flush()
                 chain = [obj]
         flush()
+    # two-piece fragmentation: a wide glyph-run raster plus a short
+    # suffix/prefix glyph ('70%' + '+'). The strict glyph_like aspect
+    # filter would reject a multi-character piece, so this pass uses a
+    # wider pool — but demands an asymmetric pair (short member <0.75*H),
+    # a wide tall member (w>=1.4*h, glyph-run strip, not an icon), solid
+    # fill on both (>=25%) and the same colour/gap/gap-strip tests. A
+    # label next to a same-colour icon stays out: the icon is the tall
+    # member and fails w>=1.4*h; equal-height pairs fail <0.75*H.
+    broad = []
+    for raster in rasters:
+        x, y, w, h = raster['tight_bbox']
+        if h < 24 or raster['id'] in chained:
+            continue
+        rgba = raster['_rgba']
+        solid = rgba[:, :, 3] > 160
+        if np.count_nonzero(solid) < .25*w*h:
+            continue
+        med = raster.get('_med')
+        if med is None:
+            med = np.median(rgba[solid][:, :3], axis=0)
+        broad.append({**raster, '_med': med})
+    broad_lines = []
+    for obj in sorted(broad, key=lambda o: o['tight_bbox'][1]+o['tight_bbox'][3]/2):
+        cy = obj['tight_bbox'][1]+obj['tight_bbox'][3]/2
+        for line in broad_lines:
+            if abs(cy-line['cy']) <= .25*max(line['h'], obj['tight_bbox'][3]):
+                line['members'].append(obj)
+                line['h'] = max(line['h'], obj['tight_bbox'][3])
+                break
+        else:
+            broad_lines.append({'cy': cy, 'h': obj['tight_bbox'][3], 'members': [obj]})
+    reported_pairs = set()
+    for line in broad_lines:
+        members = sorted(line['members'], key=lambda o: o['tight_bbox'][0])
+        for a, b in zip(members, members[1:]):
+            if a['id'] in chained or b['id'] in chained:
+                continue
+            ax, ay, aw, ah = a['tight_bbox']; bx, by, bw, bh = b['tight_bbox']
+            H = max(ah, bh)
+            tall = a if ah >= bh else b
+            if (min(ah, bh) >= .75*H or tall['tight_bbox'][2] < 1.4*tall['tight_bbox'][3]
+                    or bx-(ax+aw) < 0 or bx-(ax+aw) >= .4*H
+                    or abs((ay+ah/2)-(by+bh/2)) > .2*H
+                    or np.max(np.abs(a['_med'].astype(np.int16)-b['_med'].astype(np.int16))) > 60):
+                continue
+            pair = tuple(sorted((a['id'], b['id'])))
+            if pair in reported_pairs:
+                continue
+            reported_pairs.add(pair)
+            _emit_run([a, b])
+    # split_text: a chain of same-baseline text boxes carries one
+    # continuous source string. Three independent signatures, all in
+    # glyph-height units:
+    #   (a) a member box holds a single CJK glyph — char-level splits
+    #       leave single-character boxes ('手'|'卫'|'生规范');
+    #   (b) a tight junction (gap <0.15H incl. overlap) whose strip still
+    #       carries >=10% text-coloured source ink — a glyph crosses the
+    #       box boundary;
+    #   (c) a wider gap (<1.0H) holding a text-coloured ink blob >=0.1H
+    #       tall and >=40px area — a dropped separator like '·'.
+    # Latin/symbol-only stubs (<=4 chars, phantom candidates) never join
+    # chains — they are the phantom_text rule's business.
+    def _phantomish(obj):
+        squashed = ''.join(obj['text'].split())
+        return bool(squashed) and len(squashed) <= 4 and all(
+            ch.isascii() and not ch.isdigit() for ch in squashed)
+    text_rows = []
+    for obj in sorted(texts, key=lambda o: o['bbox'][1]+o['bbox'][3]/2):
+        if _phantomish(obj):
+            continue
+        cy = obj['bbox'][1]+obj['bbox'][3]/2
+        for row in text_rows:
+            if abs(cy-row['cy']) <= .3*max(row['h'], obj['bbox'][3]):
+                row['members'].append(obj)
+                row['h'] = max(row['h'], obj['bbox'][3])
+                row['cy'] = cy
+                break
+        else:
+            text_rows.append({'cy': cy, 'h': obj['bbox'][3], 'members': [obj]})
+    for row in text_rows:
+        members = sorted(row['members'], key=lambda o: o['bbox'][0])
+        chain = []
+        flagged = [False]
+        def flush_text():
+            if len(chain) >= 2 and flagged[0]:
+                x0 = min(o['bbox'][0] for o in chain)
+                y0 = min(o['bbox'][1] for o in chain)
+                x1 = max(o['bbox'][0]+o['bbox'][2] for o in chain)
+                y1 = max(o['bbox'][1]+o['bbox'][3] for o in chain)
+                add('split_text', [x0, y0, x1-x0, y1-y0],
+                    sum(max(1, round(o['bbox'][2]*o['bbox'][3])) for o in chain), chain,
+                    reason='native text boxes split one continuous source string')
+        for a, b in zip(members, members[1:]):
+            ax, ay, aw, ah = a['bbox']; bx, by, bw, bh = b['bbox']
+            H = max(ah, bh)
+            gap = bx-(ax+aw)
+            linked = (-.3*H <= gap < 1.0*H and min(ah, bh) >= .55*H
+                      and abs((ay+ah/2)-(by+bh/2)) <= .3*H)
+            if linked and a['colors'] and b['colors']:
+                linked = np.max(np.abs(np.array(a['colors'][0]).astype(int)
+                                       - np.array(b['colors'][0]).astype(int))) <= 60
+            if not linked:
+                flush_text()
+                chain = []; flagged[0] = False
+                continue
+            if not chain:
+                chain = [a]
+            chain.append(b)
+            single_cjk = any(len(o['text'].strip()) == 1
+                             and '\u4e00' <= o['text'].strip() <= '\u9fff'
+                             for o in (a, b))
+            if single_cjk:
+                flagged[0] = True
+                continue
+            y0 = round(max(ay, by)); y1 = round(min(ay+ah, by+bh))
+            lo, hi = round(ax+aw), round(bx)
+            if y1 <= y0:
+                continue
+            col = np.array((a['colors'] or [(0, 0, 0)])[0]).astype(np.int16)
+            # Gap-ink provenance: ink in the junction is only evidence of a
+            # lost/straddled cluster when it belongs to a component centred
+            # at or right of the junction's left edge. A trailing glyph of
+            # box a ('？' spilling past its declared edge, while the render
+            # keeps it inside the box) leaves tail ink whose component
+            # centroid sits inside box a — boundary slack, not a split.
+            left, right = min(lo, hi), max(lo, hi)
+            margin = round(.35*H)
+            w0 = max(0, left-margin)
+            strip2 = src[y0:y1, w0:right].astype(np.int16)
+            ink2 = np.max(np.abs(strip2-col), axis=2) <= 60
+            n2, lab2, st2, cen2 = cv2.connectedComponentsWithStats(
+                ink2.astype(np.uint8), 8)
+            detached = False
+            for comp in range(1, n2):
+                if not (lab2[:, left-w0:] == comp).any():
+                    continue
+                if cen2[comp][0]+w0 >= left:
+                    detached = True
+                    break
+            if gap < .15*H:
+                if right-left < 8:
+                    left, right = max(0, left-4), min(width, right+4)
+                strip = src[y0:y1, left:right]
+                if strip.size and detached and np.mean(np.max(np.abs(
+                        strip.astype(np.int16)-col), axis=2) <= 60) >= .10:
+                    flagged[0] = True
+            else:
+                strip = src[y0:y1, lo:hi]
+                if strip.size and detached:
+                    ink = np.max(np.abs(strip.astype(np.int16)-col), axis=2) <= 60
+                    _, _, st, _ = cv2.connectedComponentsWithStats(
+                        ink.astype(np.uint8), 8)
+                    if any(s_[3] >= .1*H and s_[4] >= 40 for s_ in st[1:]):
+                        flagged[0] = True
+        flush_text()
+    # phantom_text: a native text box whose content is only latin letters
+    # or symbols (no CJK, no digits — keeps page numbers and '01'-'04'
+    # numbering safe) sitting inside a raster object's region: graphics
+    # OCR'd into glyphs.
+    for obj in texts:
+        content = obj['text'].strip()
+        squashed = ''.join(content.split())
+        if not squashed or len(squashed) > 4:
+            continue
+        if not all(ch.isascii() and not ch.isalnum() or ch.isalpha() and ch.isascii()
+                   for ch in squashed):
+            continue
+        x, y, w, h = obj['bbox']
+        for raster in rasters:
+            rx, ry, rw, rh = raster['bbox']
+            if rx <= x and ry <= y and rx+rw >= x+w and ry+rh >= y+h:
+                add('phantom_text', obj['bbox'], max(1, round(w*h)), [obj, raster],
+                    reason='native glyph inside raster graphic region (OCR artefact)')
+                break
+    # weight_loss: source glyphs are bold but the native text renders at
+    # regular weight. Measured as the 90th-percentile stroke width
+    # (distance transform over the ink mask) plus ink density inside the
+    # text frame; weight_loss = fixable when source exceeds render by
+    # 30% in stroke width and 15% in density.
+    for obj in texts:
+        x, y, r, b = _rect(obj['bbox'], width, height)
+        if r <= x or b <= y or (r-x)*(b-y) < 400:
+            continue
+        src_c = src[y:b, x:r]; dst_c = dst[y:b, x:r]
+        colors = obj['colors'] or [(0, 0, 0)]
+        s_ink = np.zeros(src_c.shape[:2], bool); d_ink = np.zeros(dst_c.shape[:2], bool)
+        for color in colors:
+            s_ink |= np.max(np.abs(src_c.astype(np.int16)-np.array(color)), axis=2) <= 60
+            d_ink |= np.max(np.abs(dst_c.astype(np.int16)-np.array(color)), axis=2) <= 60
+        if np.count_nonzero(s_ink) < 200 or np.count_nonzero(d_ink) < 50:
+            continue
+        s_dt = cv2.distanceTransform(s_ink.astype(np.uint8), cv2.DIST_L2, 5)[s_ink]
+        d_dt = cv2.distanceTransform(d_ink.astype(np.uint8), cv2.DIST_L2, 5)[d_ink]
+        s_p90 = float(np.percentile(s_dt, 90)); d_p90 = float(np.percentile(d_dt, 90))
+        if s_p90 >= 1.3*max(.8, d_p90) and s_ink.mean() >= 1.15*d_ink.mean():
+            add('weight_loss', [x, y, r-x, b-y], int(np.count_nonzero(s_ink)), [obj],
+                'fixable', 'bold source text rendered at regular weight')
+    # broken_border: a source row holds a continuous uniform line
+    # (>=25% page width, >=80% single-colour fill); the render keeps it
+    # only in fragments (>=3 missing x-segments, 10-95% missing) — the
+    # dashed-border defect. Rows band together into one defect.
+    page_bg = background
+    border_rows = []
+    for yy in range(height):
+        nonbg = np.max(np.abs(src[yy].astype(np.int16)-page_bg.astype(np.int16)), axis=1) > 30
+        # longest contiguous non-background run, tolerating <=3px breaks
+        idx = np.nonzero(nonbg)[0]
+        if len(idx) < width*.25:
+            continue
+        best = cur = [idx[0], idx[0]]
+        for xx in idx[1:]:
+            if xx-cur[1] <= 3:
+                cur[1] = xx
+            else:
+                if cur[1]-cur[0] > best[1]-best[0]:
+                    best = cur
+                cur = [xx, xx]
+        if cur[1]-cur[0] > best[1]-best[0]:
+            best = cur
+        if best[1]-best[0] < width*.25:
+            continue
+        seg_s = src[yy, best[0]:best[1]+1]
+        src_line = nonbg[best[0]:best[1]+1]
+        if src_line.mean() < .8:
+            continue
+        # a design border sits on flat context: rows just above and below
+        # the run must be mostly uniform (page background or a card fill —
+        # card interiors may differ from the page background by ~25).
+        # Photographs and illustrations fail the uniformity test.
+        pad = 4
+        ctx_ok = True
+        for cy in (yy-pad, yy+pad):
+            if 0 <= cy < height:
+                row = src[cy, best[0]:best[1]+1]
+                flat = np.max(np.abs(row.astype(np.int16)
+                                     - np.median(row, axis=0).astype(np.int16)), axis=1) <= 15
+                ctx_ok &= flat.mean() >= .7
+        if not ctx_ok:
+            continue
+        # missing = render fell back to page background where the source
+        # carries the line (pale border colours sit too close to bg for a
+        # colour-distance test to separate them).
+        seg_d = dst[yy, best[0]:best[1]+1]
+        missing = src_line & (np.max(np.abs(seg_d.astype(np.int16)
+                                            - page_bg.astype(np.int16)), axis=1) <= 15)
+        frac = missing.sum()/max(1, src_line.sum())
+        if frac <= .10:
+            continue
+        xs = np.nonzero(missing)[0]
+        segs = 0; prev = -10
+        for xx in xs:
+            if xx-prev > 4:
+                segs += 1
+            prev = xx
+        if segs >= 3 or frac >= .9:
+            border_rows.append((yy, best[0], best[1]+1, frac >= .10 and segs >= 3))
+    for i, (yy, x0, x1, seg_ok) in enumerate(border_rows):
+        if i and yy-border_rows[i-1][0] <= 2:
+            continue
+        j = i
+        while j+1 < len(border_rows) and border_rows[j+1][0]-border_rows[j][0] <= 2:
+            j += 1
+        band = border_rows[i:j+1]
+        # a reportable band needs at least one genuinely dashed row; a
+        # lone fully-missing row is a dropped line, which the generic
+        # lost/extra audit already covers.
+        if not any(r[3] for r in band):
+            continue
+        bx0 = min(r[1] for r in band); bx1 = max(r[2] for r in band)
+        box = [bx0, band[0][0], bx1-bx0, band[-1][0]-band[0][0]+1]
+        related = [o for o in objects if _intersection(o['bbox'], box)]
+        add('broken_border', box, sum(r[2]-r[1] for r in band), related,
+            reason='continuous source border rendered as broken segments')
+    # patch: on source pixels that sit on the flat page background, the
+    # render shows a persistent sub-threshold shift — a low-contrast
+    # backdrop rectangle (dominant-backdrop rebuild artefact). Cells of
+    # 40px whose median delta over near-background pixels is >=2.5 are
+    # flagged; regions of >=0.4% page area are reported fixable.
+    near_bg = np.max(np.abs(src.astype(np.int16)-page_bg.astype(np.int16)), axis=2) <= 15
+    delta = np.max(np.abs(src.astype(np.int16)-dst.astype(np.int16)), axis=2).astype(np.float32)
+    cell = 40
+    flagged = np.zeros((height//cell+1, width//cell+1), bool)
+    for cy in range(flagged.shape[0]):
+        for cx in range(flagged.shape[1]):
+            m = near_bg[cy*cell:(cy+1)*cell, cx*cell:(cx+1)*cell]
+            if m.sum() < cell*cell*.5:
+                continue
+            if np.median(delta[cy*cell:(cy+1)*cell, cx*cell:(cx+1)*cell][m]) >= 2.5:
+                flagged[cy, cx] = True
+    flagged = cv2.morphologyEx(flagged.astype(np.uint8), cv2.MORPH_CLOSE,
+                               np.ones((3, 3), np.uint8)) > 0
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(flagged.astype(np.uint8), 8)
+    for index, (x, y, w, h, area) in enumerate(stats[1:], 1):
+        if area*cell*cell < width*height*.004:
+            continue
+        box = [x*cell, y*cell, w*cell, h*cell]
+        related = [o for o in objects if _intersection(o['bbox'], box)]
+        add('patch', box, int(area*cell*cell), related, 'fixable',
+            'low-contrast backdrop rectangle differs from page background')
     mask = changed&~text_mask
     opened = cv2.morphologyEx(mask.astype(np.uint8),cv2.MORPH_OPEN,np.ones((3,3),np.uint8))
     count,labels,stats,_ = cv2.connectedComponentsWithStats(opened,8)
-    background = np.median(np.concatenate((src[0],src[-1],src[:,0],src[:,-1])),axis=0)
     for index,(x,y,w,h,area) in enumerate(stats[1:],1):
         if area<width*height*.00007:
             continue

@@ -18,7 +18,9 @@ from image2editable.fast_defects import detect_defects
 
 COLORS = {'lost': '#e53935', 'extra': '#fb8c00', 'ghost': '#8e24aa',
           'truncated': '#d81b60', 'fragmented': '#3949ab', 'seam': '#00897b',
-          'micro': '#6d4c41'}
+          'micro': '#6d4c41', 'restyle': '#fdd835', 'split_text': '#c0ca33',
+          'phantom_text': '#5e35b1', 'weight_loss': '#039be5',
+          'broken_border': '#f4511e', 'patch': '#7cb342'}
 
 
 def build_deck_review(pages, *, output_dir):
@@ -39,7 +41,7 @@ def build_deck_review(pages, *, output_dir):
         table = []
         for defect in report['defects']:
             x, y, w, h = defect['bbox']
-            color = COLORS[defect['category']]
+            color = COLORS.get(defect['category'], '#000000')
             draw.rectangle((x, y, x+w, y+h), outline=color, width=4)
             draw.text((x, max(0, y-14)), defect['id'], fill=color)
             crop = Path(defect['crop']).relative_to(output.resolve()).as_posix()

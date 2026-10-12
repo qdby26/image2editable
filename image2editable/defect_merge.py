@@ -28,7 +28,23 @@ def merge_defects(source, pptx, defects, *, output_path, slide_index=0):
     src = np.asarray(Image.open(source).convert('RGB'))
     height, width = src.shape[:2]
     objects = read_objects(pptx, (width, height), slide_index)
-    hard = [d for d in defects if d['severity'] == 'hard']
+    # Structural categories are reported but never auto-patched: a source
+    # rectangle pasted over them keeps the same wrong object split, so the
+    # defect would simply re-fire. Skip them instead of emitting an
+    # invalid "repaired" deck.
+    # broken_border joined the skip set after live verification: a 1-2px
+    # source stripe lands subpixel-shifted under the renderer (the border
+    # stays flagged and the stripe bleeds into neighbouring rows). The
+    # underlying issue is a native shape's dash style — outside the reach
+    # of raster patching.
+    structural = {'truncated', 'fragmented', 'split_text', 'phantom_text',
+                  'broken_border'}
+    skipped = {d['category'] for d in defects
+               if d['severity'] == 'hard' and d['category'] in structural}
+    hard = [d for d in defects if d['severity'] == 'hard'
+            and d['category'] not in structural]
+    if not hard:
+        return {'repaired': [], 'skipped': sorted(skipped)}
     plans = []
     for defect in hard:
         ids = set(defect['object_ids'])
@@ -124,4 +140,5 @@ def merge_defects(source, pptx, defects, *, output_path, slide_index=0):
     output.parent.mkdir(parents=True,exist_ok=True)
     with output.open('xb') as handle:
         presentation.save(handle)
-    return {'output':str(output.resolve()),'repairs':records}
+    return {'output':str(output.resolve()),'repairs':records,
+            'skipped':sorted(skipped)}

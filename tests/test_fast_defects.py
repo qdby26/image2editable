@@ -220,6 +220,134 @@ def test_png_native_shape_duplicate_reports_i3(tmp_path):
     assert any(d['reason'].startswith('I3') for d in report['defects'])
 
 
+# ---------------------------------------------------------------------------
+# B-gen-05 fixtures: the Task-9 trial deck (run01) plus v33 two-piece split.
+# ---------------------------------------------------------------------------
+
+TRIAL = Path('E:/PPT/projects/2026-10-12-bgen-trial-deck')
+
+
+def trial_report(page, tmp_path):
+    return detect_defects(TRIAL/f'source/p{page:02d}.png',
+                          TRIAL/'working/run01/out.pptx',
+                          TRIAL/f'working/run01/conv/render_{page:03d}.png',
+                          output_dir=tmp_path, slide_index=page-1)
+
+
+@pytest.mark.parametrize('page,minimum', [(1, 1), (2, 4)])
+def test_run01_native_text_split_into_boxes(page, minimum, tmp_path):
+    # p02 item titles render as '标准预'|'防'|'原'|'则' style adjacent boxes
+    # over one continuous source string (gaps carry source ink); p01's
+    # subtitle lost its '·' between two boxes.
+    report = trial_report(page, tmp_path)
+    matches = [d for d in report['defects'] if d['category'] == 'split_text'
+               and d['severity'] == 'hard']
+    assert len(matches) >= minimum, report['defects']
+
+
+def test_run01_p03_icon_bubbles_are_phantom_text(tmp_path):
+    # The hand-wash icon's soap bubbles were OCR'd into native 'O' glyphs
+    # inside the icon PNG — phantom text, not real copy.
+    report = trial_report(3, tmp_path)
+    matches = [d for d in report['defects'] if d['category'] == 'phantom_text'
+               and d['severity'] == 'hard']
+    assert len(matches) >= 3, report['defects']
+
+
+@pytest.mark.parametrize('page', (2, 5))
+def test_phantom_text_no_false_positives_on_numbers(page, tmp_path):
+    # Page numbers and step digits are legitimate single glyphs — they must
+    # never be reported as phantom text. p03 is the positive fixture
+    # (icon bubbles), so it is excluded here.
+    report = trial_report(page, tmp_path)
+    assert not [d for d in report['defects'] if d['category'] == 'phantom_text'], report['defects']
+
+
+def test_v33_p05_two_piece_glyph_string_is_fragmented(tmp_path):
+    # v33 emits '70%' + '+' as two PNGs — the two-piece form of the same
+    # split a four-piece run showed on v32.
+    run = WORK/'routeb/v33-final-png2-five/p05'
+    report = detect_defects(WORK/'routeb/png2-ascii/p05.png', run/'out.pptx',
+                            run/'render_001.png', output_dir=tmp_path)
+    matches = [d for d in report['defects'] if d['category'] == 'fragmented'
+               and d['severity'] == 'hard']
+    assert matches, report['defects']
+    assert any(d['bbox'][0] <= 200 and d['bbox'][2] > 500 for d in matches), matches
+
+
+def test_run01_p02_item_titles_lose_bold_weight(tmp_path):
+    # Item titles are bold in the source but render at regular weight.
+    report = trial_report(2, tmp_path)
+    matches = [d for d in report['defects'] if d['category'] == 'weight_loss'
+               and d['severity'] == 'fixable']
+    assert len(matches) >= 4, report['defects']
+    assert any(500 <= d['bbox'][1] <= 700 for d in matches), matches
+
+
+def test_run01_p02_card_border_renders_broken(tmp_path):
+    # The third/fourth item cards' top borders come out as dashed segments.
+    report = trial_report(2, tmp_path)
+    matches = [d for d in report['defects'] if d['category'] == 'broken_border'
+               and d['severity'] == 'hard']
+    assert matches, report['defects']
+    assert any(d['bbox'][1] > 1200 and d['bbox'][2] > 2000 for d in matches), matches
+
+
+def test_run01_p05_low_contrast_backdrop_patch(tmp_path):
+    # A brighter low-contrast rectangle sits below the golden-time pill.
+    report = trial_report(5, tmp_path)
+    matches = [d for d in report['defects'] if d['category'] == 'patch'
+               and d['severity'] == 'fixable']
+    assert matches, report['defects']
+    assert any(d['bbox'][1]+d['bbox'][3] > 1800 for d in matches), matches
+
+
+def test_merge_skips_structural_defects(tmp_path):
+    from PIL import Image
+    from pptx import Presentation
+    from image2editable.defect_merge import merge_defects
+
+    source = tmp_path/'source.png'
+    Image.new('RGB', (600, 400), 'white').save(source)
+    deck = Presentation()
+    deck.slides.add_slide(deck.slide_layouts[6])
+    original = tmp_path/'input.pptx'
+    deck.save(original)
+    output = tmp_path/'fixed.pptx'
+    result = merge_defects(source, original, [
+        {'category': 'truncated', 'severity': 'hard', 'bbox': [10, 10, 50, 50], 'object_ids': []},
+        {'category': 'fragmented', 'severity': 'hard', 'bbox': [10, 60, 50, 50], 'object_ids': []},
+        {'category': 'split_text', 'severity': 'hard', 'bbox': [10, 110, 50, 50], 'object_ids': []},
+        {'category': 'phantom_text', 'severity': 'hard', 'bbox': [10, 160, 50, 50], 'object_ids': []},
+    ], output_path=output)
+    assert not output.exists()
+    assert set(result['skipped']) == {'truncated', 'fragmented', 'split_text', 'phantom_text'}
+
+
+def test_merge_broken_border_is_skipped(tmp_path):
+    from PIL import Image
+    from pptx import Presentation
+    from image2editable.defect_merge import merge_defects
+
+    source = tmp_path/'source.png'
+    Image.new('RGB', (600, 400), 'white').save(source)
+    deck = Presentation()
+    deck.slides.add_slide(deck.slide_layouts[6])
+    original = tmp_path/'input.pptx'
+    deck.save(original)
+    output = tmp_path/'fixed.pptx'
+    # Verified on run01/p02: a 1-2px source stripe lands subpixel-shifted
+    # under the renderer — the border stays flagged and the stripe bleeds
+    # into neighbouring rows. The cause is a native shape's dash style,
+    # which raster patching cannot repair, so the category is skipped.
+    result = merge_defects(source, original, [
+        {'category': 'broken_border', 'severity': 'hard',
+         'bbox': [0, 195, 600, 10], 'object_ids': []},
+    ], output_path=output)
+    assert not output.exists()
+    assert result['skipped'] == ['broken_border']
+
+
 def test_nested_group_is_enumerated_once(tmp_path):
     from PIL import Image
     from pptx import Presentation
