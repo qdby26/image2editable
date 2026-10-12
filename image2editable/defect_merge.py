@@ -38,7 +38,7 @@ def merge_defects(source, pptx, defects, *, output_path, slide_index=0):
     # underlying issue is a native shape's dash style — outside the reach
     # of raster patching.
     structural = {'truncated', 'fragmented', 'split_text', 'phantom_text',
-                  'broken_border'}
+                  'broken_border', 'text_mismatch', 'fill_lost'}
     skipped = {d['category'] for d in defects
                if d['severity'] == 'hard' and d['category'] in structural}
     hard = [d for d in defects if d['severity'] == 'hard'

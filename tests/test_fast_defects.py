@@ -381,6 +381,122 @@ def test_merge_broken_border_is_skipped(tmp_path):
     assert result['skipped'] == ['broken_border']
 
 
+# ---------------------------------------------------------------------------
+# B-gen-07 fixtures: generalized per-box source/render ink-structure audit
+# (text_mismatch) plus fill_lost split out of the patch detector.
+# ---------------------------------------------------------------------------
+
+
+def flatbg_report(page, tmp_path):
+    run = WORK/f'routeb/v32-flatbg/p{page:02d}'
+    return detect_defects(WORK/f'flatfirst/task0/render/flatbg-p{page:02d}.png',
+                          run/'out.pptx', run/'render_001.png', output_dir=tmp_path)
+
+
+def test_flatbg_p02_icon_as_text_is_text_mismatch(tmp_path):
+    # 'D目' at [2087,663,181,135]: the book icon was OCR'd into a native
+    # text box. phantom_text only covers <=4-char Latin/symbol content, so
+    # this CJK artefact needs the generic ink-structure audit. Board:
+    # B-gen-07 task 1 — 'D目'/icon-as-glyph is a text_mismatch.
+    report = flatbg_report(2, tmp_path)
+    matches = [d for d in report['defects'] if d['category'] == 'text_mismatch'
+               and d['severity'] == 'hard']
+    assert any(2000 <= d['bbox'][0] <= 2300 and 600 <= d['bbox'][1] <= 850
+               for d in matches), report['defects']
+
+
+def test_flatbg_p04_trailing_comma_is_text_mismatch(tmp_path):
+    # The source line '平素体健，' ends with a comma; the declared text is
+    # '平素体健' — the punctuation never made it into a native box, so no
+    # split_text partner exists. A punctuation-scale source-ink component
+    # at the box's right edge with no render counterpart = text_mismatch.
+    report = flatbg_report(4, tmp_path)
+    matches = [d for d in report['defects'] if d['category'] == 'text_mismatch'
+               and d['severity'] == 'hard']
+    assert any(3150 <= d['bbox'][0] <= 3650 and 350 <= d['bbox'][1] <= 550
+               for d in matches), report['defects']
+
+
+@pytest.mark.parametrize('page', (1, 2, 3, 4, 5))
+def test_v35_png2_has_no_text_mismatch(page, tmp_path):
+    # Accepted pipeline output: every native box's ink structure matches
+    # the source. Shifted-but-present punctuation must NOT flag.
+    run = WORK/f'routeb/v35-png2-five/p{page:02d}'
+    report = detect_defects(WORK/f'routeb/png2-ascii/p{page:02d}.png',
+                            run/'out.pptx', run/'render_001.png', output_dir=tmp_path)
+    assert not [d for d in report['defects'] if d['category'] == 'text_mismatch'], \
+        [d for d in report['defects'] if d['category'] == 'text_mismatch']
+
+
+def test_weight_loss_is_not_text_mismatch(tmp_path):
+    # Bold->regular rendering keeps glyph structure: weight_loss stays
+    # fixable and must not be double-reported as text_mismatch.
+    report = trial_report(2, tmp_path)
+    wl = [d for d in report['defects'] if d['category'] == 'weight_loss']
+    assert wl, report['defects']
+    for w in wl:
+        wx, wy, ww, wh = w['bbox']
+        for t in report['defects']:
+            if t['category'] != 'text_mismatch':
+                continue
+            tx, ty, tw, th = t['bbox']
+            inter = max(0, min(wx+ww, tx+tw)-max(wx, tx)) * \
+                    max(0, min(wy+wh, ty+th)-max(wy, ty))
+            assert inter <= .5*ww*wh, (w, t)
+
+
+def test_flatbg_p02_icon_underlays_are_fill_lost(tmp_path):
+    # The icon backing squares fall back to the page background — a lost
+    # fill, hard, not a fixable patch.
+    report = flatbg_report(2, tmp_path)
+    matches = [d for d in report['defects'] if d['category'] == 'fill_lost'
+               and d['severity'] == 'hard']
+    assert matches, report['defects']
+
+
+def test_flatbg_p04_case_card_fills_are_fill_lost(tmp_path):
+    # The pale-blue case-card fills collapse into the page background.
+    report = flatbg_report(4, tmp_path)
+    matches = [d for d in report['defects'] if d['category'] == 'fill_lost'
+               and d['severity'] == 'hard']
+    assert matches, report['defects']
+
+
+def test_run01_p05_patch_is_not_fill_lost(tmp_path):
+    # The capsule backdrop patch is ink ADDED on background — the opposite
+    # direction — and must stay patch/fixable.
+    report = trial_report(5, tmp_path)
+    assert not [d for d in report['defects'] if d['category'] == 'fill_lost'], \
+        [d['bbox'] for d in report['defects'] if d['category'] == 'fill_lost']
+    assert any(d['category'] == 'patch' and d['severity'] == 'fixable'
+               for d in report['defects']), report['defects']
+
+
+def test_merge_skips_text_mismatch_and_fill_lost(tmp_path):
+    from PIL import Image
+    from pptx import Presentation
+    from image2editable.defect_merge import merge_defects
+
+    source = tmp_path/'source.png'
+    Image.new('RGB', (600, 400), 'white').save(source)
+    deck = Presentation()
+    deck.slides.add_slide(deck.slide_layouts[6])
+    original = tmp_path/'input.pptx'
+    deck.save(original)
+    output = tmp_path/'fixed.pptx'
+    # text_mismatch = missing/substituted content; fill_lost = a fill
+    # underlay collapsed under native text. Neither can be raster-patched
+    # safely — same reasoning as phantom_text and broken_border.
+    result = merge_defects(source, original, [
+        {'category': 'text_mismatch', 'severity': 'hard',
+         'bbox': [10, 10, 50, 50], 'object_ids': []},
+        {'category': 'fill_lost', 'severity': 'hard',
+         'bbox': [10, 70, 50, 50], 'object_ids': []},
+    ], output_path=output)
+    assert not output.exists()
+    assert set(result['skipped']) == {'text_mismatch', 'fill_lost'}
+
+
 def test_nested_group_is_enumerated_once(tmp_path):
     from PIL import Image
     from pptx import Presentation

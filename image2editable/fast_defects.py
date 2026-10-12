@@ -487,6 +487,94 @@ def detect_defects(source, pptx, rendered, *, output_dir, slide_index=0):
                     reason='narrow digit box duplicates neighbour leading glyph '
                            '(superscript artefact)')
                 break
+    # text_mismatch: generic per-box source/render ink-structure audit,
+    # replacing symptom-specific rules (board B-gen-07). For each native
+    # text box expanded by 0.3*H, ink = pixels differing from the
+    # border-ring background by >30 — this marks glyph ink and icon ink
+    # alike. Two hard signatures:
+    #   (a) structural collapse: either directional ink coverage falls
+    #       below 0.32 — the source holds something the declared text
+    #       cannot explain (an icon OCR'd into 'D目', a superscript
+    #       sliver '1') — or coverage <0.45 combined with >50%
+    #       alien-coloured source ink (an icon palette where declared-
+    #       colour glyph ink should dominate). Accepted pipeline text
+    #       measured >=0.41 in the weaker direction; phantom-flagged
+    #       boxes are skipped to avoid double counting.
+    #   (b) lost edge punctuation: a punctuation-scale source-ink
+    #       component (40px..0.08*H^2, h<=0.5H, w<=0.35H) in the lower
+    #       half of the frame, ending at the box's right edge
+    #       ([edge-6, edge+0.25H]), <20% covered by render ink, and with
+    #       no punctuation-scale render component within 1.0H — a
+    #       trailing '，' the declared text dropped. Punctuation that is
+    #       rendered but shifted by font metrics keeps a matching render
+    #       component nearby (measured up to ~0.85H on accepted pages)
+    #       and is not flagged.
+    for obj in texts:
+        if obj['id'] in phantom_ids:
+            continue
+        x, y, w, h = obj['bbox']
+        H = h
+        pad = round(.3*H)
+        x0, y0 = max(0, round(x-pad)), max(0, round(y-pad))
+        x1, y1 = min(width, round(x+w+pad)), min(height, round(y+h+pad))
+        sc = src[y0:y1, x0:x1]; dc = dst[y0:y1, x0:x1]
+        if not sc.size:
+            continue
+        ring = np.concatenate((sc[0].reshape(-1, 3), sc[-1].reshape(-1, 3),
+                               sc[:, 0].reshape(-1, 3), sc[:, -1].reshape(-1, 3)))
+        local_bg = np.median(ring, axis=0).astype(np.int16)
+        s_ink = np.max(np.abs(sc.astype(np.int16)-local_bg), axis=2) > 30
+        d_ink = np.max(np.abs(dc.astype(np.int16)-local_bg), axis=2) > 30
+        if np.count_nonzero(s_ink) < 100:
+            continue
+        s_dil = cv2.dilate(s_ink.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+        d_dil = cv2.dilate(d_ink.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
+        s_cov = np.count_nonzero(s_ink & d_dil)/np.count_nonzero(s_ink)
+        d_cov = np.count_nonzero(d_ink & s_dil)/max(1, np.count_nonzero(d_ink))
+        weakest = min(s_cov, d_cov)
+        collapsed = weakest < .32
+        if not collapsed and weakest < .45:
+            tcol = np.array((obj['colors'] or [(0, 0, 0)])[0], dtype=np.int16)
+            alien = np.count_nonzero(
+                s_ink & (np.max(np.abs(sc.astype(np.int16)-tcol), axis=2) > 60)
+            )/np.count_nonzero(s_ink)
+            collapsed = alien > .5
+        reasons = []
+        if collapsed:
+            reasons.append('source ink structure not explained by declared text')
+        bx, by, bw, bh = round(x-x0), round(y-y0), round(w), round(h)
+        interior = np.zeros_like(s_ink)
+        interior[by:by+bh, bx:bx+bw] = True
+        nsrc, slabs, sstats, scens = cv2.connectedComponentsWithStats(
+            (s_ink & interior).astype(np.uint8), 8)
+        ndst, _, dstats, dcens = cv2.connectedComponentsWithStats(
+            d_ink.astype(np.uint8), 8)
+        punct_lost = False
+        for i in range(1, nsrc):
+            area, cw, ch = sstats[i, 4], sstats[i, 2], sstats[i, 3]
+            if not (40 <= area <= .08*H*H and ch <= .5*H and cw <= .35*H):
+                continue
+            if scens[i][1] < by+.5*bh:
+                continue
+            if not (bx+bw-6 <= sstats[i, 0]+sstats[i, 2]
+                    <= bx+bw+round(.25*H)):
+                continue
+            if np.count_nonzero((slabs == i) & d_dil)/area >= .2:
+                continue
+            matched = any(
+                20 <= dstats[j, 4] <= .08*H*H and dstats[j, 3] <= .5*H
+                and dstats[j, 2] <= .35*H
+                and np.hypot(dcens[j][0]-scens[i][0],
+                             dcens[j][1]-scens[i][1]) <= 1.0*H
+                for j in range(1, ndst))
+            if not matched:
+                punct_lost = True
+                break
+        if punct_lost:
+            reasons.append('edge punctuation in source not rendered')
+        if reasons:
+            add('text_mismatch', obj['bbox'], int(np.count_nonzero(s_ink)),
+                [obj], reason='; '.join(reasons))
     # weight_loss: source glyphs are bold but the native text renders at
     # regular weight. Measured as the 90th-percentile stroke width
     # (distance transform over the ink mask) plus ink density inside the
@@ -629,8 +717,29 @@ def detect_defects(source, pptx, rendered, *, output_dir, slide_index=0):
             continue
         box = [x*cell, y*cell, w*cell, h*cell]
         related = [o for o in objects if _intersection(o['bbox'], box)]
-        add('patch', box, int(area*cell*cell), related, 'fixable',
-            'low-contrast backdrop rectangle differs from page background')
+        # Direction of the shift decides the category (B-gen-07): when the
+        # source's near-background pixels sat on a distinct light fill
+        # (>=5 off the page background), the render fell back to the page
+        # background AND most of the flagged region now reads as
+        # background, a fill block was lost — hard. Requiring the region
+        # (not just the near-background subset) to read as background
+        # keeps cosmetic white-on-icon shifts (run01 p01: 49% background)
+        # out — real card/underlay fills measure 70-90%. The opposite
+        # direction (render adds a tint over flat background) stays a
+        # fixable patch; a two-sided recolour also remains fixable.
+        src_med = np.median(src[sel], axis=0).astype(np.int16)
+        dst_med = np.median(dst[sel], axis=0).astype(np.int16)
+        region = dst[cellmask]
+        bg_share = np.mean(np.max(np.abs(
+            region.astype(np.int16)-page_bg.astype(np.int16)), axis=1) <= 6)
+        if (np.max(np.abs(src_med-page_bg.astype(np.int16))) >= 5
+                and np.max(np.abs(dst_med-page_bg.astype(np.int16))) <= 4
+                and bg_share >= .6):
+            add('fill_lost', box, int(area*cell*cell), related, 'hard',
+                'source fill block collapsed to page background')
+        else:
+            add('patch', box, int(area*cell*cell), related, 'fixable',
+                'low-contrast backdrop rectangle differs from page background')
     mask = changed&~text_mask
     opened = cv2.morphologyEx(mask.astype(np.uint8),cv2.MORPH_OPEN,np.ones((3,3),np.uint8))
     count,labels,stats,_ = cv2.connectedComponentsWithStats(opened,8)
