@@ -11,6 +11,92 @@ from pptx import Presentation
 from image2editable import cli
 
 
+@pytest.mark.parametrize('read_prefix', [False, True])
+def test_unhosted_percent_plus_is_one_raster_unit(tmp_path, read_prefix):
+    from image2editable.layout_first import prepare_layout
+
+    rgb = np.full((600, 1200, 3), 255, np.uint8)
+    cv2.putText(rgb, '70%', (80, 350), cv2.FONT_HERSHEY_SIMPLEX, 4, (20, 65, 180), 10)
+    cv2.putText(rgb, '+', (350, 350), cv2.FONT_HERSHEY_SIMPLEX, 3, (20, 65, 180), 10)
+    source = tmp_path/'percent.png'
+    Image.fromarray(rgb).save(source)
+    items = [{'text': '70', 'box': [80, 260, 160, 96], 'color': '#1441b4'}] if read_prefix else []
+    def reader(path, **kwargs):
+        if 'glyph-input' not in Path(path).name:
+            return [], None
+        return [{'text': '70%+', 'confidence': .99}], None
+    slide, _ = prepare_layout(source, tmp_path/'assets', text_items=items,
+                              label_reader=reader)
+    parts = [e['component'] for e in slide['visual_elements'] if e.get('component')
+             and e['component']['y'] < 360 and e['component']['y']+e['component']['h'] > 260]
+    assert len(parts) == 1, parts
+    assert not slide['text_items']
+    c = parts[0]
+    assert c['x'] < 100 and c['x']+c['w'] > 410
+
+
+@pytest.mark.parametrize('bar_x', [435, 465])
+def test_free_glyph_unit_does_not_absorb_neighboring_divider(tmp_path, bar_x):
+    from image2editable.layout_first import prepare_layout
+
+    rgb = np.full((600, 1200, 3), 255, np.uint8)
+    cv2.putText(rgb, '70%', (80, 350), cv2.FONT_HERSHEY_SIMPLEX, 4, (20, 65, 180), 10)
+    cv2.putText(rgb, '+', (350, 350), cv2.FONT_HERSHEY_SIMPLEX, 3, (20, 65, 180), 10)
+    rgb[270:385, bar_x:bar_x+4] = (180, 180, 180)
+    source = tmp_path/'percent-divider.png'
+    Image.fromarray(rgb).save(source)
+    def reader(path, **kwargs):
+        return ([{'text': '70%+', 'confidence': .99}], None) if 'glyph-input' in Path(path).name else ([], None)
+    slide, _ = prepare_layout(source, tmp_path/'assets', text_items=[], label_reader=reader)
+    unit = next(e for e in slide['visual_elements'] if e['object_id'].startswith('unit_'))
+    comp = unit['component']
+    rgba = np.asarray(Image.open(comp['path']).convert('RGBA'))
+    gray = (rgba[:, :, :3].max(axis=2) == rgba[:, :, :3].min(axis=2)) & (rgba[:, :, 0] == 180)
+    assert not (gray & (rgba[:, :, 3] > 0)).any()
+    coverage = np.zeros(rgb.shape[:2], np.uint8)
+    for element in slide['visual_elements']:
+        if element is unit or not element.get('component'):
+            continue
+        c = element['component']
+        alpha = np.asarray(Image.open(c['path']).convert('RGBA'))[:, :, 3]
+        coverage[c['y']:c['y']+c['h'], c['x']:c['x']+c['w']] |= alpha
+    assert (coverage[270:385, bar_x:bar_x+4] > 0).all()
+
+
+@pytest.mark.parametrize('contained', [False, True])
+def test_confirmed_glyph_unit_rejects_foreign_residual_sliver(tmp_path, contained):
+    from image2editable.layout_first import _emit_residual
+
+    rgb = np.full((120, 350, 3), 255, np.uint8)
+    cv2.putText(rgb, '70%+', (0, 90), cv2.FONT_HERSHEY_SIMPLEX, 2, (20, 65, 180), 5)
+    alpha = (rgb.min(axis=2) < 255).astype(np.uint8)*255
+    path = tmp_path/'unit_0001.png'
+    Image.fromarray(np.dstack((rgb, alpha))).save(path)
+    unit = {'object_id': 'unit_0001', 'route': 'raster_component', 'role': 'visual',
+            'residual_merge': False, 'component': {'path': str(path), 'x': 80, 'y': 260, 'w': 350, 'h': 120}}
+    before = path.read_bytes()
+    bar = np.full((115, 4, 4), (180, 180, 180, 255), np.uint8)
+    records = [{'x': 420 if contained else 440, 'y': 270, 'w': 4, 'h': 115, 'rgba': bar, 'owned': False}]
+    elements = [unit]
+    blank = np.zeros((1200, 2400), np.uint8)
+    _emit_residual(records, elements, tmp_path, blank, blank.shape, blank, [])
+    assert path.read_bytes() == before
+    assert len(elements) == 2
+    np.testing.assert_array_equal(np.asarray(Image.open(elements[1]['component']['path'])), bar)
+
+
+def test_three_parallel_arrows_are_not_confirmed_as_text(tmp_path):
+    from image2editable.layout_first import _free_glyph_units
+
+    rgb = np.full((600, 1200, 3), 255, np.uint8)
+    for x in (80, 160, 240):
+        cv2.fillPoly(rgb, [np.array([[x, 200], [x+30, 200], [x+65, 240],
+                                    [x+30, 280], [x, 280], [x+35, 240]])], (20, 65, 180))
+    blank = np.zeros((600, 1200), np.uint8)
+    _, _, units, _ = _free_glyph_units(rgb, [], [], blank, blank)
+    assert units == []
+
+
 def test_nested_cards_move_with_outer_card_in_both_modes(tmp_path):
     from image2editable.layout_first import _group_layout
     for mode in ('native', 'png'):

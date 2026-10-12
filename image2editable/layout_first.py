@@ -1141,6 +1141,80 @@ def _row_chain_box(comps, seed_boxes):
     return tuple(int(v) for v in box), members
 
 
+def _free_glyph_units(rgb, regions, items, text, visual_mask, asset_dir=None, reader=None):
+    h, w = text.shape
+    background = np.median(np.concatenate((rgb[0], rgb[-1], rgb[:, 0], rgb[:, -1])), axis=0)
+    ink = (np.max(np.abs(rgb.astype(np.int16)-background), axis=2) > 45).astype(np.uint8)
+    for region in regions:
+        x, y, r, b = region['bbox']
+        ink[y:b, x:r] = 0
+    ink[visual_mask != 0] = 0
+    kernel = np.ones((max(3, round(h*.005)), max(3, round(w*.003))), np.uint8)
+    grouped = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, kernel)
+    contours, _ = cv2.findContours(grouped, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    comps = []
+    for contour in contours:
+        x, y, cw, ch = cv2.boundingRect(contour)
+        if ch < max(12, h*.02) or not .2 <= cw/ch <= 2 or cw*ch > h*w*.03:
+            continue
+        pixels = rgb[y:y+ch, x:x+cw][ink[y:y+ch, x:x+cw] != 0]
+        if len(pixels):
+            mask = np.zeros((ch, cw), np.uint8)
+            cv2.drawContours(mask, [contour-(x, y)], -1, 255, cv2.FILLED)
+            comps.append({'bbox': (x, y, x+cw, y+ch), 'color': np.median(pixels, axis=0), 'mask': mask})
+    comps.sort(key=lambda c: c['bbox'][0])
+    chains = []
+    for comp in comps:
+        x, y, r, b = comp['bbox']
+        for chain in chains:
+            X, Y = min(c['bbox'][0] for c in chain), min(c['bbox'][1] for c in chain)
+            R, B = max(c['bbox'][2] for c in chain), max(c['bbox'][3] for c in chain)
+            chain_heights = [c['bbox'][3] - c['bbox'][1] for c in chain]
+            height = max(chain_heights)
+            if (-height <= x-R < height*.4
+                    and min(b, B)-max(y, Y) >= min(b-y, B-Y)*.3
+                    and np.max(np.abs(comp['color']-chain[-1]['color'])) <= 40
+                    and (x <= R or ink[max(y, Y):min(b, B), R:x].mean() < .15)):
+                chain.append(comp)
+                break
+        else:
+            chains.append([comp])
+    specs = []
+    dropped = []
+    surface = np.broadcast_to(background.astype(np.uint8), rgb.shape)
+    host = {'bbox': [0, 0, w, h], 'surface': (surface,), 'aligned_mask': np.full((h, w), 255, np.uint8)}
+    for chain in chains:
+        if len(chain) < 3:
+            continue
+        x, y = min(c['bbox'][0] for c in chain), min(c['bbox'][1] for c in chain)
+        r, b = max(c['bbox'][2] for c in chain), max(c['bbox'][3] for c in chain)
+        overlaps = [it for it in items if min(r, it['box'][0]+it['box'][2]) > max(x, it['box'][0])
+                    and min(b, it['box'][1]+it['box'][3]) > max(y, it['box'][1])]
+        if any(it['box'][2] > it['box'][3]*6 or it['box'][0] < x-8
+               or it['box'][0]+it['box'][2] > r+8 for it in overlaps):
+            continue
+        if overlaps and all(any(it['box'][0] <= (c['bbox'][0]+c['bbox'][2])/2 <= it['box'][0]+it['box'][2]
+                               and it['box'][1] <= (c['bbox'][1]+c['bbox'][3])/2 <= it['box'][1]+it['box'][3]
+                               for it in overlaps) for c in chain):
+            continue
+        if reader is None or asset_dir is None:
+            continue
+        path = asset_dir / f'glyph-input-{len(specs)+1:02d}-{x}-{y}.png'
+        pad = max(4, round((b-y)*.15))
+        Image.fromarray(rgb[max(0,y-pad):min(h,b+pad), max(0,x-pad):min(w,r+pad)]).save(path)
+        found, _ = reader(path, style_reference_width=w, recognition_only=True)
+        recognized = ''.join(it.get('text', '').strip() for it in found if it.get('confidence', 0) >= .9)
+        if len(recognized) < 2 or not any(c.isalnum() for c in recognized):
+            continue
+        dropped.extend(overlaps)
+        specs.append({'region': host, 'color': tuple(map(int, chain[0]['color'])), 'members': chain,
+                      'items': overlaps, 'reason': 'free-glyph-row', 'box': (x, y, r, b)})
+    ids = {id(it) for it in dropped}
+    kept = [it for it in items if id(it) not in ids]
+    text = _text_mask(kept, (h, w))
+    return kept, text, specs, [{'text': it['text'], 'reason': 'free-glyph-row'} for it in dropped]
+
+
 def _release_boxed_decorations(rgb, items, regions, text):
     # the text mask covers each item's whole padded box, so a badge frame or
     # underline painted through the box is deleted with the glyphs. Free
@@ -1703,7 +1777,8 @@ def _emit_residual(records, elements, asset_dir, difference, page_size,
     frag_area = h * w * .0003
     merge_gap = max(frag, round(h * .015))
     targets = [e for e in elements
-               if e.get('route') == 'raster_component' and e.get('component')]
+               if e.get('route') == 'raster_component' and e.get('component')
+               and e.get('residual_merge', True)]
 
     def _overlay(canvas, rec, ux0, uy0):
         sub = canvas[rec['y'] - uy0:rec['y'] - uy0 + rec['h'],
@@ -2181,6 +2256,12 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
         visual_mask[py:py+ph, px:px+pw] |= mask
     items, text, unit_specs, suppressed_items = _suppress_mixed_unit_text(
         rgb, regions, [item for item in items if id(item) not in stamp_ids], text, visual_mask)
+    free_items, free_text, free_specs, free_suppressed = _free_glyph_units(
+        rgb, regions, items, text, visual_mask, asset_dir, label_reader)
+    if free_specs:
+        items, text = free_items, free_text
+        unit_specs += free_specs
+        suppressed_items += free_suppressed
     items += stamp_items
     unit_specs = [spec for spec in unit_specs if not any(
         max(0, min(spec['box'][2], item['box'][0]+item['box'][2])-max(spec['box'][0], item['box'][0]))
@@ -2314,6 +2395,8 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
             # fades (halo) belong to no comp and stay, member comps keep their
             # own anti-aliased edges via the 3px seam.
             alpha[(dev > 45) & (keep == 0)] = 0
+            if unit['reason'] == 'free-glyph-row':
+                alpha[keep == 0] = 0
         alpha[host['aligned_mask'][uy0 - ry:uy1 - ry, ux0 - rx:ux1 - rx] == 0] = 0
         ys, xs = np.nonzero(alpha)
         if not len(xs):
@@ -2325,6 +2408,7 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
         Image.fromarray(patch).save(path)
         elements.append({'object_id': f'unit_{udx:04d}', 'route': 'raster_component',
                          'role': 'visual', 'z_index': 950 + udx,
+                         'residual_merge': unit['reason'] != 'free-glyph-row',
                          'bbox': [ux0 + bx0, uy0 + by0, ux0 + bx1, uy0 + by1],
                          'component': {'path': str(path), 'x': ux0 + bx0, 'y': uy0 + by0,
                                        'w': bx1 - bx0, 'h': by1 - by0}})
@@ -2523,6 +2607,7 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
         # without bridging the >=30px gaps between separate cards; reapply the
         # card-left-edge cut after closing since the kernel can span the 5px gap.
         grouped = cv2.morphologyEx(seed, cv2.MORPH_CLOSE, close)
+        grouped |= seed & cv2.dilate(grouped, np.ones((3, 3), np.uint8))
         if cut is not None:
             grouped[cut_mask] = 0
         contours, _ = cv2.findContours(grouped, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
