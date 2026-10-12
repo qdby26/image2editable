@@ -73,6 +73,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     convert_parser = subparsers.add_parser("convert")
     _add_image_options(convert_parser)
+    convert_parser.add_argument('--layout-first', action='store_true',
+                                help='Reconstruct complete simple layout objects before raster extraction')
+    convert_parser.add_argument('--card-mode', choices=('native', 'png'), default='native',
+                                help='Card representation for --layout-first')
+    convert_parser.add_argument('--layout-text-cache', default=None,
+                                help='Optional source-hash-bound OCR JSON for --layout-first')
+    convert_parser.add_argument('--layout-background', default=None,
+                                help='Optional clean background image, matching source dimensions')
+    convert_parser.add_argument('--layout-background-mode', choices=('flat', 'source'), default='flat',
+                                help='Explicit source backdrop preservation for nonuniform backgrounds')
 
     prepare_parser = subparsers.add_parser("prepare")
     _add_image_options(prepare_parser)
@@ -234,6 +244,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 1
             _print_json(receipt)
             return 0
+
+    if args.command == 'convert' and args.layout_first:
+        from image2editable.layout_first import convert_layout
+
+        if args.output_format != 'pptx' or not args.output or not args.run_dir:
+            raise ValueError('layout-first requires PPTX, --output and --run-dir')
+        with redirect_stdout(sys.stderr):
+            summary = convert_layout(
+                args.sources, output_path=args.output, run_dir=args.run_dir,
+                lang=args.lang, slide_size=args.slide_size,
+                card_mode=args.card_mode, text_cache=args.layout_text_cache,
+                background=args.layout_background, background_mode=args.layout_background_mode,
+            )
+        _print_json(summary)
+        return 0
+    if args.command == 'convert' and (args.layout_text_cache or args.layout_background or args.card_mode != 'native'
+                                      or args.layout_background_mode != 'flat'):
+        raise ValueError('layout options require --layout-first')
 
     from image2editable import runtime
 

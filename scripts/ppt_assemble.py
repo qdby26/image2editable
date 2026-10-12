@@ -443,6 +443,13 @@ def assemble_pptx_multi(
                 content_offset_y if use_canvas else 0,
             )
 
+        if data.get('object_groups'):
+            indexed = {shape.name.removeprefix('image2editable:'): shape for shape in slide.shapes}
+            for group_id, ids in data['object_groups'].items():
+                group = slide.shapes.add_group_shape([indexed[object_id] for object_id in ids])
+                group.name = f'image2editable:{group_id}'
+                indexed[group_id] = group
+
         logger.info("Slide %d: bg + %d components + %d text boxes.",
                     idx + 1, len(data["components"]), len(data["text_items"]))
 
@@ -811,6 +818,21 @@ def _add_native_shape(
                 shape._element.spPr.find(qn("a:ln")),
                 payload.get("stroke_opacity", 1.0),
             )
+    style = shape._element.find(qn('p:style'))
+    if style is not None:
+        shape._element.remove(style)
+    shape._element.spPr.append(OxmlElement('a:effectLst'))
+    shape.rotation = payload.get('rotation', 0)
+    if shape_type == 'rounded_rectangle' and 'corner_ratio' in payload:
+        shape.adjustments[0] = payload['corner_ratio']
+    if 'dash' in payload:
+        from pptx.enum.dml import MSO_LINE_DASH_STYLE
+        shape.line.dash_style = MSO_LINE_DASH_STYLE.DASH if payload['dash'] == 'dash' else MSO_LINE_DASH_STYLE.SOLID
+    if 'gradient' in payload:
+        shape.fill.gradient()
+        shape.fill.gradient_angle = payload['gradient']['angle']
+        for stop, color in zip(shape.fill.gradient_stops, payload['gradient']['colors']):
+            stop.color.rgb = RGBColor(*color)
     shape.name = f"image2editable:{element['object_id']}"
 
 
@@ -894,6 +916,9 @@ def _add_textbox(
     )
     box.rotation = rotation
     tf = box.text_frame
+    if 'layout_object_id' in item:
+        from pptx.enum.text import MSO_AUTO_SIZE
+        tf.auto_size = MSO_AUTO_SIZE.NONE
     tf.word_wrap = False
     tf.margin_left = 0
     tf.margin_right = 0
@@ -1003,6 +1028,10 @@ def _add_textbox(
     from pptx.enum.text import PP_ALIGN
     align_map = {0: PP_ALIGN.LEFT, 1: PP_ALIGN.CENTER, 2: PP_ALIGN.RIGHT}
     p.alignment = PP_ALIGN.LEFT if item.get("box_kind") == "ink" else align_map.get(item.get("align", 1), PP_ALIGN.CENTER)
+    if 'rotation_degrees' in item:
+        box.rotation = item['rotation_degrees']
+    if 'layout_object_id' in item:
+        box.name = f"image2editable:{item['layout_object_id']}"
     return box
 
 
@@ -1020,7 +1049,9 @@ def _add_positioned_text(
     logical_width, logical_height = (height, width) if rotation in {90, 270} else (width, height)
     cosine, sine = math.cos(math.radians(rotation)), math.sin(math.radians(rotation))
     group = slide.shapes.add_group_shape()
-    for run in item["runs"]:
+    if 'layout_object_id' in item:
+        group.name = f"image2editable:{item['layout_object_id']}"
+    for index, run in enumerate(item["runs"], 1):
         rx, ry, rw, rh = run["box"]
         dx = (rx + rw / 2 - 0.5) * logical_width
         dy = (ry + rh / 2 - 0.5) * logical_height
@@ -1029,6 +1060,8 @@ def _add_positioned_text(
         run_width, run_height = rw * logical_width, rh * logical_height
         child_item = {key: value for key, value in item.items() if key not in {"runs", "words"}}
         child_item.update(run)
+        if 'layout_object_id' in item:
+            child_item['layout_object_id'] = f"{item['layout_object_id']}:run_{index:04d}"
         child_item.update({
             "box": [center_x - run_width / 2, center_y - run_height / 2, run_width, run_height],
             "rotation": 0,
