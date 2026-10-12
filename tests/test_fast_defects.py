@@ -36,7 +36,7 @@ def test_real_defect_category(relative, expected, tmp_path):
         assert Path(defect['crop']).is_file()
 
 
-@pytest.mark.parametrize('page', (1, 3, 4, 5))
+@pytest.mark.parametrize('page', (1, 3, 4))
 def test_accepted_page_has_no_hard_defects(page, tmp_path):
     run = WORK/'routeb/v30d-final-five'/f'p{page:02d}'
     report = detect_defects(source_for(run), run/'out.pptx', run/'render_001.png', output_dir=tmp_path)
@@ -48,6 +48,7 @@ def test_accepted_page_has_no_hard_defects(page, tmp_path):
     # leaf-level audit finds verified latent defects (pixel evidence in the
     # B-gen-02 report). These are real defects, not false positives.
     (2, 'ghost'),   # unit_0004 PNG alpha covers card_0005 roundRect >50% both ways
+    (5, 'fragmented'),  # "70%+" emitted as four per-glyph PNGs (present since v30d)
 ])
 def test_accepted_page_latent_defects(page, expected, tmp_path):
     run = WORK/'routeb/v30d-final-five'/f'p{page:02d}'
@@ -62,7 +63,11 @@ def test_recolored_glyph_is_restyle_not_lost(tmp_path):
     source = WORK/'routeb/png2-ascii/p05.png'
     report = detect_defects(source, run/'out.pptx', run/'render_001.png', output_dir=tmp_path)
     assert any(d['category'] == 'restyle' and d['severity'] == 'fixable' for d in report['defects']), report
-    assert not [d for d in report['defects'] if d['severity'] == 'hard'], report
+    # the same "70%+" per-glyph split exists on v31 p05 (orch: present since
+    # v30d) — it is a real fragmented defect, so the page legitimately keeps
+    # exactly that one hard item.
+    hard = [d for d in report['defects'] if d['severity'] == 'hard']
+    assert [d['category'] for d in hard] == ['fragmented'], report
 
 
 @pytest.mark.parametrize('relative', ['routeb/v29d-png2-five/p02', 'flatfirst/task5/v01e/cold/p02'])
@@ -98,6 +103,29 @@ def test_v31_p02_keeps_three_hard_defects(tmp_path):
     hard = [d for d in report['defects'] if d['severity'] == 'hard']
     assert len(hard) == 3, report
     assert any(d['category'] == 'ghost' for d in hard), report
+
+
+def test_v32_p05_glyph_string_is_fragmented(tmp_path):
+    # "70%+" was emitted as four per-glyph PNGs (7, 0, %, +): adjacent,
+    # same ink colour, same line height, small inter-glyph gaps — one text
+    # unit split apart, which the board classifies as fragmented/hard.
+    run = WORK/'routeb/v32-png2-five/p05'
+    source = WORK/'routeb/png2-ascii/p05.png'
+    report = detect_defects(source, run/'out.pptx', run/'render_001.png', output_dir=tmp_path)
+    matches = [d for d in report['defects'] if d['category'] == 'fragmented' and d['severity'] == 'hard']
+    assert matches, report
+    assert any(d['bbox'][0] <= 200 and d['bbox'][2] > 600 for d in matches), matches
+
+
+@pytest.mark.parametrize('page', ('p02', 'p03'))
+def test_no_fragmented_false_positives(page, tmp_path):
+    # p03 "01-04" digits sit on four separate cards (gaps far wider than the
+    # glyph-height threshold); p02 emblems stack vertically — neither is a
+    # split text unit.
+    run = WORK/f'routeb/v32-png2-five/{page}'
+    source = WORK/f'routeb/png2-ascii/{page}.png'
+    report = detect_defects(source, run/'out.pptx', run/'render_001.png', output_dir=tmp_path)
+    assert not [d for d in report['defects'] if d['category'] == 'fragmented'], report
 
 
 def test_deck_review_artifacts(tmp_path):

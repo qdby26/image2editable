@@ -204,6 +204,80 @@ def detect_defects(source, pptx, rendered, *, output_dir, slide_index=0):
             overlap = np.count_nonzero(a&b)
             if overlap>.5*np.count_nonzero(raster['_rgba'][:,:,3]) and overlap>.5*np.count_nonzero(other['_rgba'][:,:,3]):
                 add('ghost',[left,top,right-left,bottom-top],overlap,[raster,other],reason='I3 mutual raster alpha coverage exceeds 50%')
+    # fragmented: >=3 PNGs behaving as one text unit — a row of glyph-like
+    # rasters sharing ink colour, line height and tiny gaps, with background
+    # (not ink) between the pieces in the source image. All thresholds are
+    # expressed in units of the glyph height H = run line height:
+    # gap < 0.4*H (inter-letter spacing), height >= 0.55*H (mixed-case and
+    # symbol glyphs like '+' are shorter), centre offset <= 0.2*H (shared
+    # baseline), median opaque-colour channel diff <= 60, member h/w >= 0.5
+    # (glyph-like aspect, rules out hairline strips), gap-strip ink < 15%
+    # (pieces cover a run of glyphs, not a sliced graphic).
+    glyph_like = []
+    for raster in rasters:
+        x, y, w, h = raster['tight_bbox']
+        if h < .5*w or h < 12:
+            continue
+        rgba = raster['_rgba']
+        solid = rgba[:, :, 3] > 160
+        if not solid.any():
+            continue
+        glyph_like.append({**raster, '_med': np.median(rgba[solid][:, :3], axis=0)})
+    glyph_like.sort(key=lambda o: o['tight_bbox'][1] + o['tight_bbox'][3]/2)
+    lines = []
+    for obj in glyph_like:
+        cy = obj['tight_bbox'][1] + obj['tight_bbox'][3]/2
+        for line in lines:
+            if abs(cy-line['cy']) <= .25*max(line['h'], obj['tight_bbox'][3]):
+                line['members'].append(obj)
+                line['cy'] = cy
+                line['h'] = max(line['h'], obj['tight_bbox'][3])
+                break
+        else:
+            lines.append({'cy': cy, 'h': obj['tight_bbox'][3], 'members': [obj]})
+    for line in lines:
+        members = sorted(line['members'], key=lambda o: o['tight_bbox'][0])
+        chain = []
+        def flush():
+            if len(chain) < 3:
+                return
+            Hmax = max(o['tight_bbox'][3] for o in chain)
+            margin = max(2, round(Hmax*.015))
+            for a, b in zip(chain, chain[1:]):
+                gx0 = round(a['tight_bbox'][0] + a['tight_bbox'][2]) + margin
+                gx1 = round(b['tight_bbox'][0]) - margin
+                y0 = round(max(a['tight_bbox'][1], b['tight_bbox'][1]))
+                y1 = round(min(a['tight_bbox'][1] + a['tight_bbox'][3], b['tight_bbox'][1] + b['tight_bbox'][3]))
+                if gx1 <= gx0 or y1 <= y0:
+                    continue
+                strip = src[y0:y1, gx0:gx1]
+                if np.mean(np.max(abs(strip.astype(np.int16) - a['_med'].astype(np.int16)), axis=2) <= 60) >= .15:
+                    return
+            x0 = min(o['tight_bbox'][0] for o in chain)
+            y0 = min(o['tight_bbox'][1] for o in chain)
+            x1 = max(o['tight_bbox'][0] + o['tight_bbox'][2] for o in chain)
+            y1 = max(o['tight_bbox'][1] + o['tight_bbox'][3] for o in chain)
+            add('fragmented', [x0, y0, x1-x0, y1-y0],
+                sum(int((o['_rgba'][:, :, 3] > 0).sum()) for o in chain), chain,
+                reason='PNG run forms one continuous glyph string (fragmented text unit)')
+        for obj in members:
+            if not chain:
+                chain.append(obj)
+                continue
+            prev = chain[-1]
+            ax, ay, aw, ah = prev['tight_bbox']
+            bx, by, bw, bh = obj['tight_bbox']
+            H = max(ah, bh)
+            linked = (min(ah, bh) >= .55*H
+                      and abs((ay+ah/2)-(by+bh/2)) <= .2*H
+                      and 0 <= bx-(ax+aw) < .4*H
+                      and np.max(np.abs(prev['_med'].astype(np.int16)-obj['_med'].astype(np.int16))) <= 60)
+            if linked:
+                chain.append(obj)
+            else:
+                flush()
+                chain = [obj]
+        flush()
     mask = changed&~text_mask
     opened = cv2.morphologyEx(mask.astype(np.uint8),cv2.MORPH_OPEN,np.ones((3,3),np.uint8))
     count,labels,stats,_ = cv2.connectedComponentsWithStats(opened,8)
