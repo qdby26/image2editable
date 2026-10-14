@@ -619,7 +619,7 @@ def detect_defects(source, pptx, rendered, *, output_dir, slide_index=0):
                     return True
             return False
 
-        def _zone_units(mask, c0, c1):
+        def _zone_units(mask, c0, c1, cent_in=True):
             # Connected components — adjacent-but-separate marks ('。，')
             # stay apart, vertically stacked dots ('：') merge into one unit
             # when their x-ranges overlap >=60%. The extraction band extends
@@ -637,7 +637,7 @@ def detect_defects(source, pptx, rendered, *, output_dir, slide_index=0):
                 if st[i, 4] < 15:
                     continue
                 cx_ = b0+st[i, 0]+st[i, 2]/2
-                if not (c0 <= cx_ <= c1):
+                if cent_in and not (c0 <= cx_ <= c1):
                     continue
                 comps.append({'x0': b0+st[i, 0], 'x1': b0+st[i, 0]+st[i, 2]-1,
                               'y0': row0+st[i, 1], 'y1': row0+st[i, 1]+st[i, 3]-1,
@@ -705,6 +705,10 @@ def detect_defects(source, pptx, rendered, *, output_dir, slide_index=0):
             sall = _zone_units(esi, c0, c1)
             sruns = [r for r in sall if _punct(r) and not r['sliver']]
             dall = _zone_units(edi, c0, c1)
+            # Enclosure pool keeps every band component — the '素' body
+            # whose centroid sits outside the zone still swallows its own
+            # detached bottom stroke.
+            dall_raw = _zone_units(edi, c0, c1, cent_in=False)
             dcands = [r for r in dall if _punct(r) and not r['sliver']]
             # Order-aligned one-to-one matching: the i-th source mark pairs
             # with the i-th pairable render mark in reading order. Pure
@@ -788,12 +792,13 @@ def detect_defects(source, pptx, rendered, *, output_dir, slide_index=0):
             for di_ in dcands:
                 if id(di_) in used_d or _inside_other(di_['ibox']):
                     continue
-                # A punct-scale unit abutting a tall unit is presumed to be
-                # a glyph fragment split off by antialiasing — either a thin
-                # sliver or a dense solid bar (a glyph's lone vertical
-                # stroke renders as fill>=0.55, unlike a '：' at ~0.34).
-                # A chunky '。' beside its glyph stays a real mark (the
-                # run01 '佩戴。' extra-comma case).
+                # A punct-scale unit that is a glyph fragment is not an
+                # extra mark. Two fragment shapes: (a) a thin sliver or
+                # dense vertical bar abutting a tall unit; (b) a unit whose
+                # x-range is fully enclosed by a taller unit's — a sub-
+                # glyph stroke like the bottom hook of '素' split into its
+                # own component. A free-standing mark (the run01 '佩戴。'
+                # extra comma, the run02 bubble) clears both.
                 _frag = di_['w'] <= .12*H or (
                     di_['h'] > .45*H
                     and di_['area'] >= .55*di_['w']*di_['h'])
@@ -802,7 +807,11 @@ def detect_defects(source, pptx, rendered, *, output_dir, slide_index=0):
                     min(abs(di_['x0']-t['x1']), abs(t['x0']-di_['x1']))
                     <= .15*H
                     for t in dall if t is not di_)
-                if near_tall or _pcov(di_, edi, sfree) >= .4:
+                enclosed = any(
+                    t['x0'] <= di_['x0'] and di_['x1'] <= t['x1']
+                    and t['h'] > di_['h']
+                    for t in dall_raw if t is not di_)
+                if near_tall or enclosed or _pcov(di_, edi, sfree) >= .4:
                     continue
                 rx0, ry_, rw_, rh_ = di_['ibox']
                 if np.count_nonzero(

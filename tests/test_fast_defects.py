@@ -657,3 +657,40 @@ def test_nested_group_is_enumerated_once(tmp_path):
 
 
 
+
+# ---------------------------------------------------------------------------
+# B-gen-09 fixtures: sub-glyph stroke fragments must not report extra_glyph,
+# and G4 ghost must keep firing on wide ink items covering neighbour boxes.
+# ---------------------------------------------------------------------------
+
+
+def test_flatbg_p04_su_glyph_stroke_is_not_extra_glyph(tmp_path):
+    # '素' renders its bottom hook as a component detached from the glyph
+    # body: dst splits it into pieces at [3339,459,23,16]/[3386,459,14,12]
+    # where src has one [3354,457,23,16]. These are sub-glyph strokes —
+    # fully enclosed in the glyph's x-range — not extra marks. B-any-07
+    # second pair of eyes + crop evidence; flagged since v32.
+    report = flatbg_report(4, tmp_path)
+    offenders = [d for d in report['defects']
+                 if d['category'] == 'extra_glyph'
+                 and 3250 <= d['bbox'][0] <= 3450
+                 and 400 <= d['bbox'][1] <= 550]
+    assert not offenders, offenders
+
+
+def test_v37_p05_wide_ink_item_overlap_is_ghost(tmp_path):
+    # v37 p05 carries the '”，' ink item whose box [1692,705] is far wider
+    # than its glyph ink and sits over both neighbouring same-line text
+    # boxes — a G4 zero-overlap violation. Regression pin for B-any-08's
+    # G4 tightening: whatever the layout fix does, this frozen fixture
+    # must keep reporting two hard ghosts.
+    run = WORK/'routeb/v37-png2-five/p05'
+    report = detect_defects(WORK/'routeb/png2-ascii/p05.png',
+                            run/'out.pptx', run/'render_001.png',
+                            output_dir=tmp_path)
+    ghosts = [d for d in report['defects'] if d['category'] == 'ghost'
+              and d['severity'] == 'hard']
+    assert any(1650 <= d['bbox'][0] <= 1750 and 650 <= d['bbox'][1] <= 800
+               for d in ghosts), ghosts
+    assert any(2520 <= d['bbox'][0] <= 2620 and 650 <= d['bbox'][1] <= 800
+               for d in ghosts), ghosts
