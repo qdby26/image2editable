@@ -136,15 +136,22 @@ def test_bany07_closing_punctuation_follows_host_prefix(tmp_path):
         tail = host['text'].rstrip()
         def reader(path, **kwargs):
             pixels = np.asarray(Image.open(path).convert('RGB'))
+            if pixels.shape[1] > 500:
+                # wide below-line windows read the next line's real text, not
+                # the tail fragment — only the narrow tail crop sees it
+                return [], None
             box = list(cv2.boundingRect((pixels.min(axis=2) < 160).astype(np.uint8)))
             return [{'text': fragment, 'box': box, 'confidence': .99}], None
         refined, _, _ = _recover_text_gaps(rgb, [host], _text_mask([host], rgb.shape[:2]),
                                           tmp_path, reader)
         if host_text == '头号高危分子':
-            # the open-quote twin-mark+comma pattern resolves before OCR: a
-            # separate ink-positioned '”，' item, never a duplicate text run
+            # the twin-mark+comma pattern resolves before OCR: the straight
+            # closer '"' merges into the host flow (its marks live inside the
+            # host box, so any standalone item would overlap G4) and '，'
+            # becomes an ink item clipped past the host edge
             assert len(refined) == 2
-            punct = next(item for item in refined if item['text'] == '”，')
+            assert refined[0]['text'].endswith('"')
+            punct = next(item for item in refined if item['text'] == '，')
             assert punct['box_kind'] == 'ink'
         else:
             # punctuation either merges into the host text or lands as an
@@ -158,21 +165,120 @@ def test_bany07_closing_punctuation_follows_host_prefix(tmp_path):
                 assert punct['box_kind'] == 'ink'
 
 
-def test_bany07_unmatched_quote_tail_recovers_closing_punctuation(tmp_path):
+def test_bany08_quote_tail_splits_straight_quote_and_ink_comma(tmp_path):
     from image2editable.layout_first import _recover_text_gaps, _text_mask
     source, items = _bany06_fixture('png2', 5)
     rgb = np.asarray(Image.open(source).convert('RGB'))
     host = next(item for item in items if item['text'].rstrip().endswith('头号高危分子'))
-    # OCR never returns the bare closing-quote tail; the unclosed '"' plus the
-    # twin-mark+comma ink pattern yields an ink-positioned '”，' item instead —
-    # flow-appending it would render the marks ~40px off the source position.
+    # OCR never returns the bare tail; the unclosed '"' plus the
+    # twin-mark+comma ink pattern splits: the source's straight closer '"'
+    # joins the host flow (the marks sit inside the host box — any separate
+    # item's frame would overlap it and trip G4), while '，' lands as an
+    # ink item clipped just past the host's right edge.
     refined, _, _ = _recover_text_gaps(rgb, [host], _text_mask([host], rgb.shape[:2]),
                                       tmp_path, lambda *a, **k: ([], None))
     assert len(refined) == 2
-    punct = next(item for item in refined if item['text'] == '”，')
+    assert refined[0]['text'].endswith('"')
+    punct = next(item for item in refined if item['text'] == '，')
     assert punct['box_kind'] == 'ink'
-    px, py = punct['box'][0] + punct['box'][2] / 2, punct['box'][1] + punct['box'][3] / 2
-    assert 2585 <= px <= 2626 and 719 <= py <= 774
+    x, y, w, h = refined[0]['box']
+    px, pw = punct['box'][0], punct['box'][2]
+    overlap = max(0, min(x + w, px + pw) - px)
+    assert overlap <= .3 * min(h, punct['box'][3])
+    assert 2600 <= px + pw / 2 <= 2650 and 750 <= punct['box'][1] <= 780
+
+
+def test_bany08_straddling_mark_survives_text_mask_cleaning():
+    from image2editable.layout_first import _preserve_straddling_marks
+    # run03 p04: the ring '◯' at [3088,1156,20,19] dips its left arc under the
+    # right edge of '接触血液体液时佩戴。' (frame ends 3095).  Box-shaped
+    # cleaning repainted the arc and the surviving right half rendered as a
+    # stray comma; mostly-outside ink is a neighbour mark, not a glyph.
+    zone = np.full((60, 120, 3), 235, np.uint8)
+    text = np.zeros((60, 120), np.uint8)
+    text[:, 84:] = 255                       # sentence box ends mid-ring
+    cv2.circle(zone, (80, 30), 10, (40, 40, 120), 3)   # ring ink x70..90
+    cv2.rectangle(zone, (98, 22), (106, 38), (40, 40, 120), -1)  # '。' ink
+    ys, xs = np.indices(zone.shape[:2])
+    ring = (xs - 80) ** 2 + (ys - 30) ** 2 <= 196
+    cleaning = (text != 0) & np.full((60, 120), 255, np.uint8).astype(bool)
+    kept = _preserve_straddling_marks(cleaning.copy(), zone, text)
+    ring_comp = ring & (zone.max(axis=2) < 160)
+    glyph_comp = (zone.max(axis=2) < 160) & ~ring_comp
+    # the ring survives whole; the glyph fully inside the box still cleans
+    assert not np.any(kept & ring_comp)
+    assert np.all(kept[glyph_comp])
+
+
+def test_bany08_enclosed_weak_interior_fills_at_full_alpha(tmp_path):
+    from image2editable.layout_first import prepare_layout
+    # run03 p01 fill_lost [1760,480,320,280]: the white cross inside the
+    # shield emblem scores dev~7 against the near-white page so the soft
+    # alpha ramp left it at ~15% opacity and the render washed out.
+    # Weak pixels fully enclosed by opaque ink are part of the object and
+    # must come back at full alpha with their source colour.
+    source, items = _bany06_fixture('run01', 1)
+    slide, _ = prepare_layout(source, tmp_path / 'assets', text_items=items,
+                              background_mode='source',
+                              label_reader=lambda *a, **k: ([], None))
+    pics = [e for e in slide['visual_elements']
+            if e['route'] == 'raster_component' and e.get('component')]
+    cx, cy = 1920, 620                          # inside the white cross
+    target = [e for e in pics
+              if e['component']['x'] <= cx < e['component']['x'] + e['component']['w']
+              and e['component']['y'] <= cy < e['component']['y'] + e['component']['h']]
+    assert target, [e['component'] for e in pics]
+    rgba = np.asarray(Image.open(target[0]['component']['path']))
+    local = rgba[cy - target[0]['component']['y'],
+                 cx - target[0]['component']['x']]
+    assert local[3] > 200, f'cross alpha {local[3]}'
+    assert local[:3].min() > 240, f'cross rgb {local[:3]}'
+
+
+def test_bany08_subtle_fill_block_emits_native_shape(tmp_path):
+    from image2editable.layout_first import prepare_layout
+    # Cluster C-1: a uniform block within 5..20 of the backdrop (icon
+    # underlay, pale case card, white chip on a tinted page) sits under the
+    # >20 residual floor and collapses into the flat background.  It must
+    # emit as a native fill shape instead.
+    rgb = np.full((900, 1500, 3), (247, 250, 255), np.uint8)
+    cv2.rectangle(rgb, (300, 300), (900, 700), (235, 243, 253), -1)
+    source = tmp_path / 'card.png'
+    Image.fromarray(rgb).save(source)
+    slide, _ = prepare_layout(source, tmp_path / 'assets', text_items=[],
+                              label_reader=lambda *a, **k: ([], None))
+    blocks = [e for e in slide['visual_elements']
+              if e['route'] == 'native_shape' and e.get('shape', {}).get('fill_rgb')]
+    hit = next((e for e in blocks
+                if e['bbox'][0] <= 320 and e['bbox'][2] >= 880
+                and e['bbox'][1] <= 320 and e['bbox'][3] >= 680
+                and max(abs(a - b) for a, b in zip(
+                        e['shape']['fill_rgb'], (235, 243, 253))) <= 8), None)
+    assert hit is not None, [(e['bbox'], e['shape'].get('fill_rgb')) for e in blocks]
+
+
+def test_bany08_card_edge_centres_on_border_strip():
+    from image2editable.layout_first import _border_band_centre
+    # run03 p02: the source border is an ~8px gradient strip peaking inside
+    # the mask while the mask edge overshoots ~3px; centring the stroke on
+    # the mask edge rendered the line a couple px low and the detector saw
+    # broken segments.  The shape edge must track the measured band centre.
+    cover = np.zeros(900, bool)
+    cover[699:707] = True                            # strip straddling edge 706
+    centre, thick = _border_band_centre(cover, 706, 10)
+    assert abs(centre - 702.5) <= .5 and thick == 8
+    inward = np.zeros(900, bool)
+    inward[696:702] = True                           # strip ending before edge
+    centre, thick = _border_band_centre(inward, 706, 10)
+    assert abs(centre - 698.5) <= .5 and thick == 6
+    outward = np.zeros(900, bool)
+    outward[708:716] = True                          # strip just past the edge
+    centre, thick = _border_band_centre(outward, 706, 10)
+    assert abs(centre - 711.5) <= .5 and thick == 8
+    assert _border_band_centre(np.zeros(900, bool), 300, 10) is None
+    far = np.zeros(900, bool)
+    far[200:210] = True                              # distant ink is not a band
+    assert _border_band_centre(far, 706, 10) is None
 
 
 def test_bany07_sparse_residual_over_text_is_dropped(tmp_path):

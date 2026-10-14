@@ -971,11 +971,19 @@ def _add_textbox(
         ink_left, ink_top, ink_right, ink_bottom = bounds
         scale = font_size / 72000
         ascent, descent = measured_font.getmetrics()
-        # A tight ink box locates visible strokes, not the font's advance box.
+        # A tight ink box locates visible strokes, not the font's advance box:
+        # the frame hugs the ink (word_wrap is off so glyphs draw past the
+        # frame edge freely). The pen origin keeps the same offset so the ink
+        # stays centred on the target box; only the frame rect shrinks —
+        # an advance-wide frame spills over neighbouring text boxes.
+        ink_w = max(1e-4, (ink_right - ink_left) * scale)
+        ink_h = max(1e-4, (ink_bottom - ink_top) * scale)
+        line_h = (ascent + descent) * scale
         box.left = Inches(left + width / 2 - (ink_left + ink_right + 2 * offset[0]) * scale / 2)
-        box.top = Inches(top + height / 2 - (ink_top + ink_bottom + 2 * offset[1]) * scale / 2)
-        box.width = Inches(max(measured_font.getlength(run.text), ink_right + offset[0]) * scale)
-        box.height = Inches((ascent + descent) * scale)
+        box.top = Inches(top + height / 2 - (ink_top + ink_bottom + 2 * offset[1]) * scale / 2
+                         + (line_h - ink_h) / 2)
+        box.width = Inches(ink_w)
+        box.height = Inches(ink_h)
     character_spacing = item.get("character_spacing_pt", 0.0)
     if (
         type(character_spacing) not in {int, float}

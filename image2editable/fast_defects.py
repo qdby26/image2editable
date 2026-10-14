@@ -718,14 +718,36 @@ def detect_defects(source, pptx, rendered, *, output_dir, slide_index=0):
             # the wrong position — or get suppressed entirely).
             used_s, used_d = set(), set()
             for si_ in sorted(sruns, key=lambda r: r['cx']):
+                first = near = None
                 for di_ in sorted(dcands, key=lambda r: r['cx']):
                     if id(di_) in used_d:
                         continue
                     if abs(si_['cx']-di_['cx']) <= 1.0*H and \
                             min(si_['y1'], di_['y1'])-max(si_['y0'], di_['y0']) \
                             >= .4*min(si_['h'], di_['h']):
-                        used_s.add(id(si_)); used_d.add(id(di_))
-                        break
+                        if first is None:
+                            first = di_
+                        # A render mark within .3H carrying a similar-sized
+                        # component is a near-exact re-render (the raster
+                        # ring sits 1px off its source mark while the
+                        # flow-shifted '。' sits .6H away) — it beats reading
+                        # order.  A size-mismatched sliver (a clipped ring
+                        # arc reads 40% of the ring's area) must NOT win, so
+                        # a genuinely stray mark keeps flagging.
+                        similar = (min(si_['area'], di_['area'])
+                                   >= .5 * max(si_['area'], di_['area'])
+                                   and min(si_['w'], di_['w'])
+                                   >= .6 * max(si_['w'], di_['w'])
+                                   and min(si_['h'], di_['h'])
+                                   >= .6 * max(si_['h'], di_['h']))
+                        if similar and abs(si_['cx'] - di_['cx']) <= .3 * H \
+                                and (near is None
+                                     or abs(si_['cx'] - di_['cx'])
+                                     < abs(si_['cx'] - near['cx'])):
+                            near = di_
+                pick = near if near is not None else first
+                if pick is not None:
+                    used_s.add(id(si_)); used_d.add(id(pick))
             # Coverage semantics: a source mark "rendered" when ANY render
             # ink covers it (covAny) — the mark may come back merged into a
             # differently-shaped unit, as the v35 bullet bars do. Inside the
@@ -811,7 +833,20 @@ def detect_defects(source, pptx, rendered, *, output_dir, slide_index=0):
                     t['x0'] <= di_['x0'] and di_['x1'] <= t['x1']
                     and t['h'] > di_['h']
                     for t in dall_raw if t is not di_)
-                if near_tall or enclosed or _pcov(di_, edi, sfree) >= .4:
+                # A render mark that lands within .4H of a same-sized source
+                # unit is a position-shifted counterpart, not an extra glyph:
+                # the pairing pool only spans punct-scale source units, so a
+                # colon whose merged dots run past .2H wide never pairs, yet
+                # the mark is plainly that object displaced by font metrics.
+                shifted = any(
+                    abs(su['cx'] - di_['cx']) <= .4 * H
+                    and min(su['area'], di_['area'])
+                        >= .5 * max(su['area'], di_['area'])
+                    and min(su['w'], di_['w']) >= .6 * max(su['w'], di_['w'])
+                    and min(su['h'], di_['h']) >= .6 * max(su['h'], di_['h'])
+                    for su in sall)
+                if near_tall or enclosed or shifted \
+                        or _pcov(di_, edi, sfree) >= .4:
                     continue
                 rx0, ry_, rw_, rh_ = di_['ibox']
                 if np.count_nonzero(

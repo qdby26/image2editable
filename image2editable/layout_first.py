@@ -843,6 +843,16 @@ def _group_layout(elements, items, asset_dir, page_size, card_mode):
     def depth(group_id):
         return 1+depth(ancestors[group_id]) if group_id in ancestors else 0
     groups = dict(sorted(groups.items(), key=lambda pair: -depth(pair[0])))
+    visual_z = {element['object_id']: element.get('z_index', 0) for element in elements}
+    text_z = {item['layout_object_id']: 1_000_000+index for index, item in enumerate(items)}
+    def member_rank(object_id):
+        if object_id in visual_z:
+            return visual_z[object_id]
+        if object_id in text_z:
+            return text_z[object_id]
+        return 2_000_000+sorted(groups).index(object_id) if object_id in groups else 3_000_000
+    for ids in groups.values():
+        ids.sort(key=member_rank)
     return elements, groups
 
 
@@ -1001,7 +1011,7 @@ def _recover_text_gaps(rgb, items, text, asset_dir, reader, *, punctuation_only=
     ordered = sorted(items, key=lambda item: item['box'][0])
     for first in ordered:
         x, y, w, h = first['box']
-        if first.get('rotation') or first.get('rotation_degrees') or first['text'].rstrip().endswith(('，', ',', '。', '？', '?', '！', '!', '；', ';', '·', '：', ':')):
+        if first.get('rotation') or first.get('rotation_degrees') or first['text'].rstrip().endswith(('，', ',', '。', '？', '?', '！', '!', '；', ';', '·', '：', ':', '"', '”')):
             continue
         neighbors = [item for item in ordered if item is not first
                      and item['box'][0] > x+w
@@ -1079,15 +1089,31 @@ def _recover_text_gaps(rgb, items, text, asset_dir, reader, *, punctuation_only=
             py0 = min(top + s[1] for s in consumed)
             px1 = max(bx0 + s[0] + s[2] for s in consumed)
             py1 = max(top + s[1] + s[3] for s in consumed)
-            # flow-appended punctuation renders at the line's end position,
-            # ~40px off the source ink; an ink item lands its glyphs on the
-            # measured marks instead (same mechanism as the middle dot).
+            if pair_at is not None and comma is not None:
+                # The closer pair sits inside the host box's own bounds, so an
+                # independent '”，' item can never stop overlapping the host
+                # frame — G4 counts frame rects. Instead the closer joins the
+                # host text (flow lands it right after the last glyph, ~at the
+                # marks) and only the comma becomes an ink item.  Its
+                # ink-aligned frame keeps the glyph's left bearing, though, so
+                # it can still dip back under the host edge: pull the host box
+                # in to just past the closer pair's ink so the emitted frames
+                # end up cleanly disjoint.  Left-aligned unwrapped text does
+                # not move when its box narrows.
+                first['text'] += '"' if tail_text.count('"') % 2 == 1 else '”'
+                quote_right = max(bx0 + s[0] + s[2]
+                                  for s in (upper[pair_at], upper[pair_at + 1]))
+                first['box'][2] = min(first['box'][2],
+                                      float(quote_right + 3) - first['box'][0])
             punct_item = {key: first[key]
                           for key in ('color', 'font', 'bold', 'italic', 'font_size')
                           if key in first}
-            punct_item.update(text=suffix,
-                              box=[float(px0), float(py0),
-                                   float(px1 - px0), float(py1 - py0)],
+            right = first['box'][0] + first['box'][2]
+            cx0 = max(px0 if pair_at is None else bx0 + comma[0], right + .5)
+            cx1 = max(cx0 + 1, px1 if pair_at is None else bx0 + comma[0] + comma[2])
+            punct_item.update(text='，' if pair_at is not None else suffix,
+                              box=[float(cx0), float(top + comma[1]),
+                                   float(cx1 - cx0), float(comma[3])],
                               box_kind='ink')
             recovered.append(punct_item)
             text |= _text_mask([punct_item], text.shape)
@@ -1132,7 +1158,7 @@ def _recover_text_gaps(rgb, items, text, asset_dir, reader, *, punctuation_only=
         x, y, w, h = first['box']
         if first.get('rotation') or first.get('rotation_degrees'):
             continue
-        ends_punct = first['text'].rstrip().endswith(('，', ',', '。', '？', '?', '！', '!', '；', ';', '·', '：', ':'))
+        ends_punct = first['text'].rstrip().endswith(('，', ',', '。', '？', '?', '！', '!', '；', ';', '·', '：', ':', '"', '”'))
         tail = {'box': [min(rgb.shape[1], x+w+4*h), y, 1, h]}
         for second in ordered + [tail]:
             sx, sy, sw, sh = second['box']
@@ -1288,7 +1314,7 @@ def _recover_text_gaps(rgb, items, text, asset_dir, reader, *, punctuation_only=
     # lone tail commas deferred above fire only when the OCR windows did not
     # fold the mark into the host text or claim its pixels otherwise
     for first, cand, bx0, btop in deferred_tail:
-        if first['text'].rstrip().endswith(('，', ',', '。', '？', '?', '！', '!', '；', ';', '：', ':', '·')):
+        if first['text'].rstrip().endswith(('，', ',', '。', '？', '?', '！', '!', '；', ';', '：', ':', '·', '"', '”')):
             continue
         cx, cy, cw, ch = (bx0 + cand[0], btop + cand[1], cand[2], cand[3])
         if np.mean(text[cy:cy + ch, cx:cx + cw] != 0) > .5:
@@ -2025,6 +2051,58 @@ def _dedupe_card_rasters(elements):
     return [e for e in elements if id(e) not in ids], len(dropped)
 
 
+def _border_band_centre(cover, edge, cap):
+    """Centre of the contiguous covered run straddling a mask edge.
+
+    The drawn stroke centres on the shape edge, so the shape edge must land on
+    the middle of the border-ink band — the mask edge can sit a few px off it
+    (antialiased skirt) or even inside it (band poking outside the mask).  The
+    run is followed at most ``cap`` px past the edge both ways; returns None
+    when no covered row/col touches the edge, so callers keep their fallback.
+    """
+    lo, hi = max(0, edge - cap), min(len(cover) - 1, edge + cap)
+    near = [r for r in range(lo, hi + 1) if cover[r]]
+    if not near:
+        return None
+    a = b = min(near, key=lambda r: abs(r - edge))
+    while a - 1 >= edge - cap and cover[a - 1]:
+        a -= 1
+    while b + 1 <= edge + cap and cover[b + 1]:
+        b += 1
+    centre = (a + b) / 2
+    return (centre, b - a + 1) if abs(centre - edge) <= cap else None
+
+
+def _preserve_straddling_marks(cleaning, rgb_zone, local_text):
+    """Un-clean closed ink components that straddle the text-mask edge.
+
+    The text mask follows OCR boxes, so a mark whose ink intrudes into a
+    frame's padding (the ring whose left arc dips under a sentence's right
+    edge) would lose exactly the intruding slice to surface repainting and
+    render as a stray arc.  A component carrying an interior hole is a
+    closed mark — clipping it at the mask edge leaves a dangling arc that
+    reads as a glyph — so it survives whole while under a fifth of its ink
+    is inside the box.  Open strokes (a dash tip under a frame edge) clip
+    cleanly and are never preserved: their in-box ink would count as a
+    raster re-print over a live text box (I1).
+    """
+    if not np.any(cleaning):
+        return cleaning
+    dark = (rgb_zone.max(axis=2) < 160).astype(np.uint8)
+    count, labels = cv2.connectedComponents(dark, 8)
+    for lab in range(1, count):
+        comp = labels == lab
+        if not np.any(comp & cleaning):
+            continue
+        inside = np.count_nonzero(comp & (local_text != 0))
+        _, hier = cv2.findContours(comp.astype(np.uint8), cv2.RETR_CCOMP,
+                                 cv2.CHAIN_APPROX_SIMPLE)
+        holed = hier is not None and np.any(hier[0, :, 3] >= 0)
+        if holed and inside < np.count_nonzero(comp) * .8:
+            cleaning = cleaning & ~comp
+    return cleaning
+
+
 def _emit_residual(records, elements, asset_dir, difference, page_size,
                    text, items):
     """Emit residual records as object_NNNN.png elements, merging as needed.
@@ -2600,15 +2678,54 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
                         if ray.any():
                             widths.append(int(ray.sum()))
                 region['shape']['line_width'] = float(np.median(widths)) if widths else max(1, min(right-x, bottom-y)*.025)
+                stroke_width = region['shape']['line_width']
+                # The drawn stroke centres on the shape edge, so the edge must
+                # sit on the *measured* centre of the border ink band — the
+                # mask edge overshoots it by antialiasing and the band can even
+                # poke a couple px outside the mask.  Measure per side over the
+                # central 60% span; fall back to the mask edge minus half the
+                # stroke width when a side carries no stroke-coloured ink.
+                reach = max(4, int(round(stroke_width)))
+                ring_kernel = np.ones((2 * reach + 1,) * 2, np.uint8)
+                zone = ((mask | (cv2.dilate(region['mask'], ring_kernel) != 0))
+                        & (cv2.erode(region['mask'], ring_kernel) == 0))
+                band = zone & (np.max(np.abs(rgb.astype(np.int16)
+                                           - stroke.astype(np.int16)), axis=2) <= 35)
+                cx0, cx1 = round(x + (right - x) * .2), round(x + (right - x) * .8)
+                cy0, cy1 = round(y + (bottom - y) * .2), round(y + (bottom - y) * .8)
+                native = [x, y, right, bottom]
                 if frames:
-                    stroke_width = region['shape']['line_width']
-                    region['native_bbox'] = [round(x+stroke_width/2),round(y+stroke_width/2),
-                                             round(right-stroke_width/2),round(bottom-stroke_width/2)]
-                    if region['shape']['shape_type'] == 'rounded_rectangle':
+                    native = [round(x + stroke_width / 2), round(y + stroke_width / 2),
+                              round(right - stroke_width / 2), round(bottom - stroke_width / 2)]
+                cap = reach * 2
+                row_cover = band[:, cx0:cx1].mean(axis=1) > .3
+                col_cover = band[cy0:cy1].mean(axis=0) > .3
+                for pos, measured in (
+                        (1, _border_band_centre(row_cover, y, cap)),
+                        (3, _border_band_centre(row_cover, bottom, cap)),
+                        (0, _border_band_centre(col_cover, x, cap)),
+                        (2, _border_band_centre(col_cover, right, cap))):
+                    if measured is not None:
+                        centre, thick = measured
+                        native[pos] = round(centre)
+                        # the ray probe only counts the band's strong rows;
+                        # a soft border fades over ~6px and the fade rows read
+                        # as dropped line segments — size the stroke for the
+                        # full covered band, not its solid core.
+                        stroke_width = max(stroke_width, float(thick))
+                        region['shape']['line_width'] = stroke_width
+                if native != [x, y, right, bottom] or frames:
+                    region['native_bbox'] = native
+                    if frames and region['shape']['shape_type'] == 'rounded_rectangle':
                         radius = _corner_radius(mask[y:bottom,x:right])
                         region['shape']['corner_ratio'] = min(.5,max(0,radius-stroke_width/2)
                             / max(1,min(right-x,bottom-y)-stroke_width))
                 border = (contrast & (frame != 0)) if frames else mask & (cv2.erode(region['mask'], np.ones((9, 9), np.uint8)) == 0)
+                # stroke-coloured ink just outside the mask belongs to the same
+                # border the native stroke redraws; keep it out of the residual
+                # pass so it cannot come back as a fragmented strip.
+                outside = band & (region['mask'] == 0)
+                expected[outside] = rgb[outside]
                 expected[border] = rgb[border]
         consumed[mask] = 255
         if card_mode == 'native':
@@ -2616,10 +2733,16 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
                              'z_index': index, 'bbox': region.get('native_bbox',region['bbox']), 'shape': region['shape']})
         else:
             local_x, local_y, lw, lh = cv2.boundingRect(region['mask'])
-            cleaned = rgb.copy()
-            clean_mask = mask & ((text != 0) | (np.max(np.abs(rgb.astype(int)-expected.astype(int)), axis=2) > 16))
-            cleaned[clean_mask] = expected[clean_mask]
-            rgba = np.dstack((cleaned[local_y:local_y+lh, local_x:local_x+lw],
+            ly, lx = slice(local_y, local_y + lh), slice(local_x, local_x + lw)
+            cleaned = rgb[ly, lx].copy()
+            zone_text = text[ly, lx]
+            kill = _preserve_straddling_marks(zone_text != 0,
+                                              rgb[ly, lx], zone_text)
+            dev = np.max(np.abs(rgb[ly, lx].astype(int)
+                                - expected[ly, lx].astype(int)), axis=2)
+            clean_mask = mask[ly, lx] & (kill | (dev > 16))
+            cleaned[clean_mask] = expected[ly, lx][clean_mask]
+            rgba = np.dstack((cleaned,
                               region['mask'][local_y:local_y+lh, local_x:local_x+lw]))
             path = asset_dir / f'card_{index:04d}.png'
             Image.fromarray(rgba).save(path)
@@ -2863,6 +2986,65 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
         text, released2 = _release_boxed_decorations(rgb, items, regions, text)
         released |= released2
     difference = np.max(np.abs(rgb.astype(np.int16)-expected.astype(np.int16)), axis=2)
+    # Subtle fill blocks: uniform areas whose colour sits between the backdrop
+    # and the residual floor (5 < dev <= 20) — pale icon underlays, light case
+    # cards, white chips on a tinted page.  They never reach the >20 residual
+    # seed and would collapse into the flat background, so each coherent block
+    # emits as a native fill shape drawn immediately above its containing
+    # element (or just over the backdrop) and below all content.
+    subtle = ((difference > 5) & (difference <= 20) & (text == 0)
+              & (emblem_mask == 0) & (unit_mask == 0)).astype(np.uint8)
+    painted = [e for e in elements
+               if e['route'] == 'native_shape' and e.get('shape', {}).get('fill_rgb')]
+    for contour in sorted(cv2.findContours(subtle, cv2.RETR_EXTERNAL,
+                                           cv2.CHAIN_APPROX_SIMPLE)[0],
+                          key=cv2.contourArea, reverse=True):
+        area = cv2.contourArea(contour)
+        if area < h * w * .0008 or area > h * w * .45:
+            continue
+        x, y, rw, rh = cv2.boundingRect(contour)
+        if min(rw, rh) < max(16, round(h * .008)) or area < rw * rh * .55:
+            continue                       # thin strips and blobby shapes
+        mask = np.zeros((h, w), np.uint8)
+        cv2.drawContours(mask, [contour], -1, 255, -1)
+        zone = mask != 0
+        if np.count_nonzero(zone & (subtle == 0)) > np.count_nonzero(zone) * .55:
+            continue                       # mostly non-fill inside the contour
+        px = rgb[zone & (subtle != 0)]
+        if not len(px):
+            continue
+        fill = np.median(px, axis=0)
+        spread = (np.percentile(px, 90, axis=0)
+                  - np.percentile(px, 10, axis=0)).max()
+        if spread > 12:
+            continue                       # gradient or shadow, not a flat fill
+        box = [x, y, x + rw, y + rh]
+        host_z = 0.0
+        for e in elements:
+            eb = e.get('bbox')
+            if not eb:
+                continue
+            inter = (max(0, min(box[2], eb[2]) - max(box[0], eb[0]))
+                     * max(0, min(box[3], eb[3]) - max(box[1], eb[1])))
+            if inter >= .9 * rw * rh:
+                host_z = max(host_z, e.get('z_index', 0))
+            elif (inter >= .6 * rw * rh and e['route'] == 'native_shape'
+                    and e.get('shape', {}).get('fill_rgb') is not None
+                    and max(abs(a - b) for a, b in zip(e['shape']['fill_rgb'], fill)) <= 14):
+                host_z = None            # a sibling shape already paints it
+                break
+        if host_z is None:
+            continue
+        corner = _corner_radius(mask[y:y + rh, x:x + rw])
+        shape = {'shape_type': 'rounded_rectangle' if corner >= min(rw, rh) * .03
+                 else 'rectangle',
+                 'fill_rgb': fill.astype(int).tolist(), 'stroke_rgb': None,
+                 'rotation': 0}
+        if shape['shape_type'] == 'rounded_rectangle':
+            shape['corner_ratio'] = min(.5, corner / min(rw, rh))
+        elements.append({'object_id': f'fill_{len(elements):04d}',
+                         'route': 'native_shape', 'role': 'card',
+                         'z_index': host_z + .01, 'bbox': box, 'shape': shape})
     residual = (difference > 20).astype(np.uint8)
     residual[(emblem_mask | unit_mask) != 0] = 0
     if os.environ.get('LF_DEBUG_RESIDUAL'):
@@ -2886,6 +3068,15 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
     close = np.ones((max(3, round(h*.005)), max(3, round(w*.003))), np.uint8)
     residual_objects = 0
     records = []
+    # item boxes act as walls for the enclosed-hole fill below: inter-glyph
+    # counter-space inside a box is weak alpha surrounded by ink, but it is
+    # page background under live text, not object interior.
+    item_zone = np.zeros((h, w), np.uint8)
+    for it in items:
+        ix, iy, iw, ih = (round(v) for v in it['box'])
+        if iw > 0 and ih > 0:
+            item_zone[max(0, iy):min(h, iy + ih),
+                      max(0, ix):min(w, ix + iw)] = 1
     for owned, seed in ((False, residual & (consumed == 0)), (True, residual & (consumed != 0))):
         # small CLOSE merges fragments of one object (icon balls, photo halves)
         # without bridging the >=30px gaps between separate cards; reapply the
@@ -2935,6 +3126,8 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
                     hull = cv2.convexHull(contour - np.array([[[x, y]]]))
                     cv2.fillConvexPoly(opaque, hull, 255)
                 cleaning = (local_text != 0) & (opaque != 0)
+                cleaning = _preserve_straddling_marks(cleaning, patch_rgb,
+                                                      local_text)
                 if surface is not None:
                     patch_rgb[cleaning] = surface[0][cleaning]
                 elif np.any(cleaning):
@@ -2945,7 +3138,24 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
                 # translucent instead of hard-cut into opaque rectangles.
                 dev = difference[y:bottom, x:right].astype(np.float32)
                 alpha = np.clip((dev - 8) * 255.0 / 40, 0, 255).astype(np.uint8)
-                alpha[local_text != 0] = 0
+                kill = _preserve_straddling_marks(local_text != 0,
+                                                  patch_rgb, local_text)
+                alpha[kill] = 0
+                # Enclosed weak pixels belong to the object: a white cross on
+                # a near-white page scores dev<=~14 and would render as a
+                # washed-out hole inside an otherwise solid emblem.  Any weak
+                # component fully surrounded by opaque pixels is repainted
+                # with its own source colour at full alpha; border-connected
+                # softness (AA fringes, glows) keeps its ramp.  Item boxes
+                # are excluded so inter-glyph counter-space is not filled.
+                weak = ((alpha < 200) & (local_text == 0)
+                        & (item_zone[y:bottom, x:right] == 0)).astype(np.uint8)
+                wn, wlab = cv2.connectedComponents(weak, 8)
+                edge_ids = set(wlab[0]) | set(wlab[-1]) \
+                    | set(wlab[:, 0]) | set(wlab[:, -1])
+                enclosed = np.isin(wlab, [i for i in range(1, wn)
+                                          if i not in edge_ids])
+                alpha[enclosed] = 255
             ys, xs = np.nonzero(alpha)
             if len(xs) == 0:
                 continue
@@ -2963,6 +3173,25 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
     residual_objects += _emit_residual(records, elements, asset_dir, difference,
                                        (h, w), text, items)
     residual_candidates = residual_objects
+    # A subtle fill is invisible where emitted raster art already paints the
+    # same surface (png-mode cards carry their own pale face) — the shape then
+    # only double-covers the PNG and trips I3.  Drop fills whose area is
+    # mostly covered by opaque residual pixels.
+    opaque_zone = np.zeros((h, w), bool)
+    for e in elements:
+        c = e.get('component')
+        if c is None:
+            continue
+        with Image.open(c['path']) as image:
+            a = np.asarray(image.convert('RGBA'))[:, :, 3]
+        opaque_zone[c['y']:c['y'] + c['h'], c['x']:c['x'] + c['w']] |= a > 128
+    for e in list(elements):
+        if not e['object_id'].startswith('fill_'):
+            continue
+        fx0, fy0, fx1, fy1 = (round(v) for v in e['bbox'])
+        area = max(1, (fy1 - fy0) * (fx1 - fx0))
+        if np.count_nonzero(opaque_zone[fy0:fy1, fx0:fx1]) > .55 * area:
+            elements.remove(e)
     for fragment in list(elements):
         c = fragment.get('component')
         if not c or not fragment['object_id'].startswith('unit_') or c['w']*c['h'] >= h*w*.0001:

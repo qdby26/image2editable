@@ -694,3 +694,51 @@ def test_v37_p05_wide_ink_item_overlap_is_ghost(tmp_path):
                for d in ghosts), ghosts
     assert any(2520 <= d['bbox'][0] <= 2620 and 650 <= d['bbox'][1] <= 800
                for d in ghosts), ghosts
+
+
+def test_bany08_shifted_colon_is_not_extra_glyph(tmp_path):
+    # v38 png2-p04 '病例：' — the rendered colon shifts ~18px left of its
+    # source position.  The source unit never reaches the pairing pool
+    # (its merged dots run 15px wide, past the .2H tall-thin bar) and the
+    # shift leaves it outside the coverage suppression too.  It is the
+    # same mark displaced by font metrics, not an extra glyph.
+    run = WORK/'routeb/v38-png2-five/p04'
+    report = detect_defects(WORK/'routeb/png2-ascii/p04.png',
+                            run/'out.pptx', run/'render_001.png',
+                            output_dir=tmp_path)
+    extras = [d for d in report['defects'] if d['category'] == 'extra_glyph']
+    assert not any(d['bbox'] == [2242, 421, 11, 35] for d in extras), extras
+
+
+def test_bany08_edge_punct_prefers_near_exact_render_mark(tmp_path):
+    # B-any-08: the '佩戴。' ring case — source keeps one punct-scale unit
+    # (the '◯' mark) because '戴。' merges into a single tall component,
+    # while the render shows the flow-shifted '。' PLUS the raster ring.
+    # Order-aligned greedy pairing gave the source ring to the render '。'
+    # and then flagged the true ring as extra.  A <=.3H near-exact match
+    # must win over reading order.
+    import numpy as np
+    from PIL import Image
+    from pptx import Presentation
+    W, Hh = 800, 300
+    src_img = np.full((Hh, W, 3), 255, np.uint8)
+    dst_img = src_img.copy()
+    cv2 = pytest.importorskip('cv2')
+    # source: big merged '戴。' body + detached ring just past the box edge
+    cv2.rectangle(src_img, (400, 140), (460, 200), (40, 50, 90), -1)
+    cv2.circle(src_img, (480, 190), 10, (60, 70, 110), 2)
+    # render: '。' shifted into the box interior + same-position ring
+    cv2.rectangle(dst_img, (430, 182), (445, 196), (60, 70, 110), -1)
+    cv2.circle(dst_img, (480, 190), 10, (60, 70, 110), 2)
+    src = tmp_path / 'src.png'; dst = tmp_path / 'dst.png'
+    Image.fromarray(src_img).save(src); Image.fromarray(dst_img).save(dst)
+    deck = Presentation()
+    slide = deck.slides.add_slide(deck.slide_layouts[6])
+    sx, sy = deck.slide_width / W, deck.slide_height / Hh
+    tb = slide.shapes.add_textbox(round(100 * sx), round(100 * sy),
+                                round(370 * sx), round(120 * sy))
+    tb.text = 'X'
+    pptx = tmp_path / 'deck.pptx'; deck.save(pptx)
+    report = detect_defects(src, pptx, dst, output_dir=tmp_path / 'audit')
+    extras = [d for d in report['defects'] if d['category'] == 'extra_glyph']
+    assert not extras, extras
