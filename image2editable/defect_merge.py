@@ -37,8 +37,12 @@ def merge_defects(source, pptx, defects, *, output_path, slide_index=0):
     # stays flagged and the stripe bleeds into neighbouring rows). The
     # underlying issue is a native shape's dash style — outside the reach
     # of raster patching.
+    # ghost_text needs the background image rebuilt without the baked
+    # glyphs; extra_glyph needs the responsible object regenerated — both
+    # are layout/native-object work, not raster patches.
     structural = {'truncated', 'fragmented', 'split_text', 'phantom_text',
-                  'broken_border', 'text_mismatch', 'fill_lost'}
+                  'broken_border', 'text_mismatch', 'fill_lost',
+                  'ghost_text', 'extra_glyph'}
     skipped = {d['category'] for d in defects
                if d['severity'] == 'hard' and d['category'] in structural}
     hard = [d for d in defects if d['severity'] == 'hard'

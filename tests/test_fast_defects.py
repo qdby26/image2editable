@@ -36,7 +36,7 @@ def test_real_defect_category(relative, expected, tmp_path):
         assert Path(defect['crop']).is_file()
 
 
-@pytest.mark.parametrize('page', (1, 3, 4))
+@pytest.mark.parametrize('page', (1, 3))
 def test_accepted_page_has_no_hard_defects(page, tmp_path):
     run = WORK/'routeb/v30d-final-five'/f'p{page:02d}'
     report = detect_defects(source_for(run), run/'out.pptx', run/'render_001.png', output_dir=tmp_path)
@@ -49,6 +49,10 @@ def test_accepted_page_has_no_hard_defects(page, tmp_path):
     # B-gen-02 report). These are real defects, not false positives.
     (2, 'ghost'),   # unit_0004 PNG alpha covers card_0005 roundRect >50% both ways
     (5, 'fragmented'),  # "70%+" emitted as four per-glyph PNGs (present since v30d)
+    # B-gen-08: p04 '温，' — the trailing comma after '温' is in the source
+    # image (~x3552) but never renders on v30d. True positive, pixel-
+    # verified: dst ink coverage of the source comma is 0.
+    (4, 'text_mismatch'),
 ])
 def test_accepted_page_latent_defects(page, expected, tmp_path):
     run = WORK/'routeb/v30d-final-five'/f'p{page:02d}'
@@ -64,10 +68,16 @@ def test_recolored_glyph_is_restyle_not_lost(tmp_path):
     report = detect_defects(source, run/'out.pptx', run/'render_001.png', output_dir=tmp_path)
     assert any(d['category'] == 'restyle' and d['severity'] == 'fixable' for d in report['defects']), report
     # the same "70%+" per-glyph split exists on v31 p05 (orch: present since
-    # v30d) — it is a real fragmented defect, so the page legitimately keeps
-    # exactly that one hard item.
+    # v30d). B-gen-08 also flags the two punctuation losses the png2 source
+    # carries ('，七成' swallow at ~[2616,760] and '（癌前病变），' at
+    # ~[3698,1465]) — v31 drops them exactly like v35/v36.
     hard = [d for d in report['defects'] if d['severity'] == 'hard']
-    assert [d['category'] for d in hard] == ['fragmented'], report
+    assert [d['category'] for d in hard].count('fragmented') == 1, report
+    mm = [d for d in hard if d['category'] == 'text_mismatch']
+    assert any(2590 <= d['bbox'][0] <= 2720 and 700 <= d['bbox'][1] <= 810
+               for d in mm), mm
+    assert any(3660 <= d['bbox'][0] <= 3740 and 1420 <= d['bbox'][1] <= 1510
+               for d in mm), mm
 
 
 @pytest.mark.parametrize('relative', ['routeb/v29d-png2-five/p02', 'flatfirst/task5/v01e/cold/p02'])
@@ -417,15 +427,33 @@ def test_flatbg_p04_trailing_comma_is_text_mismatch(tmp_path):
                for d in matches), report['defects']
 
 
-@pytest.mark.parametrize('page', (1, 2, 3, 4, 5))
+@pytest.mark.parametrize('page', (1, 2, 3))
 def test_v35_png2_has_no_text_mismatch(page, tmp_path):
-    # Accepted pipeline output: every native box's ink structure matches
-    # the source. Shifted-but-present punctuation must NOT flag.
+    # Every native box's ink structure matches the source on the truly
+    # clean pages. Shifted-but-present punctuation must NOT flag — p02's
+    # trailing commas render ~0.4H left of the source marks and still
+    # match. p04/p05 are excluded: p04 loses the '/' separator after
+    # '出血' and p05 loses the two board commas (verified below).
     run = WORK/f'routeb/v35-png2-five/p{page:02d}'
     report = detect_defects(WORK/f'routeb/png2-ascii/p{page:02d}.png',
                             run/'out.pptx', run/'render_001.png', output_dir=tmp_path)
     assert not [d for d in report['defects'] if d['category'] == 'text_mismatch'], \
         [d for d in report['defects'] if d['category'] == 'text_mismatch']
+
+
+def test_v35_png2_p04_dropped_slash_is_text_mismatch(tmp_path):
+    # The '/' separator after '出血' never renders — zero dst ink at the
+    # source mark [3552,879] and nothing punct-scale within a line height.
+    # Pixel-verified as a real loss (trailing commas elsewhere on p02
+    # render shifted ~0.4H left and DO match — they stay clean).
+    report = detect_defects(WORK/'routeb/png2-ascii/p04.png',
+                            WORK/'routeb/v35-png2-five/p04/out.pptx',
+                            WORK/'routeb/v35-png2-five/p04/render_001.png',
+                            output_dir=tmp_path)
+    mm = [d for d in report['defects'] if d['category'] == 'text_mismatch'
+          and d['severity'] == 'hard']
+    assert any(3520 <= d['bbox'][0] <= 3620 and 850 <= d['bbox'][1] <= 910
+               for d in mm), [d['bbox'] for d in mm]
 
 
 def test_weight_loss_is_not_text_mismatch(tmp_path):
@@ -495,6 +523,116 @@ def test_merge_skips_text_mismatch_and_fill_lost(tmp_path):
     ], output_path=output)
     assert not output.exists()
     assert set(result['skipped']) == {'text_mismatch', 'fill_lost'}
+
+
+# ---------------------------------------------------------------------------
+# B-gen-08 fixtures: ghost_text (source text baked into the background AND
+# rendered natively), the punctuation-loss audit extended to swallowed
+# inline commas, and extra_glyph (rendered marks absent from the source).
+# ---------------------------------------------------------------------------
+
+
+def vpng2_report(ver, page, tmp_path):
+    folder = 'v33-final-png2-five' if ver == 'v33' else f'{ver}-png2-five'
+    run = WORK/f'routeb/{folder}/p{page:02d}'
+    return detect_defects(WORK/f'routeb/png2-ascii/p{page:02d}.png',
+                          run/'out.pptx', run/'render_001.png',
+                          output_dir=tmp_path)
+
+
+def trial2_report(page, tmp_path):
+    return detect_defects(TRIAL/f'source/p{page:02d}.png',
+                          TRIAL/'working/run02/out.pptx',
+                          TRIAL/f'working/run02/conv/render_{page:03d}.png',
+                          output_dir=tmp_path, slide_index=page-1)
+
+
+@pytest.mark.parametrize('ver', ('v35', 'v36'))
+def test_p01_subtitle_is_ghost_text(ver, tmp_path):
+    # '《妇产科学》 本科教学课件' [2153,447,1158,136] is baked into the
+    # background image AND rendered as a native text box — the render
+    # carries ~1.47x the source ink with thicker strokes (double shadow).
+    # v33 renders the same frame cleanly at ~0.92.
+    report = vpng2_report(ver, 1, tmp_path)
+    matches = [d for d in report['defects'] if d['category'] == 'ghost_text'
+               and d['severity'] == 'hard']
+    assert any(1900 <= d['bbox'][0] <= 2400 and 350 <= d['bbox'][1] <= 700
+               for d in matches), report['defects']
+
+
+@pytest.mark.parametrize('ver,page', [('v33', 1), ('v33', 3), ('v35', 3), ('v36', 3)])
+def test_no_ghost_text_on_clean_frames(ver, page, tmp_path):
+    # v33's subtitle renders once (no bake); the p01 capsule texts and the
+    # p03 badge are native text on flat fills — no doubled ink.
+    report = vpng2_report(ver, page, tmp_path)
+    assert not [d for d in report['defects'] if d['category'] == 'ghost_text'], \
+        [d['bbox'] for d in report['defects'] if d['category'] == 'ghost_text']
+
+
+@pytest.mark.parametrize('ver', ('v35', 'v36'))
+def test_p05_swallowed_and_trailing_commas_are_text_mismatch(ver, tmp_path):
+    # '…高危分子"，七成…' — the comma sitting between the two declared
+    # text runs never renders; '（癌前病变），' loses its trailing comma
+    # past the box edge. Both are punctuation-scale source marks with no
+    # render counterpart (board B-gen-08 task 2).
+    report = vpng2_report(ver, 5, tmp_path)
+    mm = [d for d in report['defects'] if d['category'] == 'text_mismatch'
+          and d['severity'] == 'hard']
+    assert any(2590 <= d['bbox'][0] <= 2720 and 720 <= d['bbox'][1] <= 800
+               for d in mm), mm
+    assert any(3600 <= d['bbox'][0] <= 3750 and 1400 <= d['bbox'][1] <= 1500
+               for d in mm), mm
+
+
+@pytest.mark.parametrize('run', ('run01', 'run02'))
+def test_p04_extra_punct_after_peidai_is_extra_glyph(run, tmp_path):
+    # '接触血液体液时佩戴。' [2526,1107,569,75] renders a stray '，'-like
+    # mark right after '。' — present in the render, absent from the
+    # source. phantom_text does not apply (the glyph is not a native box).
+    report = detect_defects(TRIAL/f'source/p{4:02d}.png',
+                          TRIAL/f'working/{run}/out.pptx',
+                          TRIAL/f'working/{run}/conv/render_004.png',
+                          output_dir=tmp_path, slide_index=3)
+    eg = [d for d in report['defects'] if d['category'] == 'extra_glyph'
+          and d['severity'] == 'hard']
+    assert any(3040 <= d['bbox'][0] <= 3200 and 1050 <= d['bbox'][1] <= 1250
+               for d in eg), report['defects']
+
+
+def test_run02_p05_gray_bubble_is_extra_glyph(tmp_path):
+    # '黄金处置时间：' [1304,1633,559,116] is followed by a small grey
+    # bubble artefact at ~x1825-1858 y1703-1730 — rendered ink the source
+    # lacks, wedged between the rendered '：' and '暴'.
+    report = trial2_report(5, tmp_path)
+    eg = [d for d in report['defects'] if d['category'] == 'extra_glyph'
+          and d['severity'] == 'hard']
+    assert any(1780 <= d['bbox'][0] <= 1900 and 1650 <= d['bbox'][1] <= 1780
+               for d in eg), report['defects']
+
+
+def test_merge_skips_ghost_text_and_extra_glyph(tmp_path):
+    from PIL import Image
+    from pptx import Presentation
+    from image2editable.defect_merge import merge_defects
+
+    source = tmp_path/'source.png'
+    Image.new('RGB', (600, 400), 'white').save(source)
+    deck = Presentation()
+    deck.slides.add_slide(deck.slide_layouts[6])
+    original = tmp_path/'input.pptx'
+    deck.save(original)
+    output = tmp_path/'fixed.pptx'
+    # ghost_text needs the background rebuilt (baked text); extra_glyph
+    # needs the responsible object regenerated. Raster patching cannot
+    # repair either — structural skip, same as phantom_text.
+    result = merge_defects(source, original, [
+        {'category': 'ghost_text', 'severity': 'hard',
+         'bbox': [10, 10, 50, 50], 'object_ids': []},
+        {'category': 'extra_glyph', 'severity': 'hard',
+         'bbox': [10, 70, 50, 50], 'object_ids': []},
+    ], output_path=output)
+    assert not output.exists()
+    assert set(result['skipped']) == {'ghost_text', 'extra_glyph'}
 
 
 def test_nested_group_is_enumerated_once(tmp_path):

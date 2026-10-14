@@ -500,15 +500,14 @@ def detect_defects(source, pptx, rendered, *, output_dir, slide_index=0):
     #       colour glyph ink should dominate). Accepted pipeline text
     #       measured >=0.41 in the weaker direction; phantom-flagged
     #       boxes are skipped to avoid double counting.
-    #   (b) lost edge punctuation: a punctuation-scale source-ink
-    #       component (40px..0.08*H^2, h<=0.5H, w<=0.35H) in the lower
-    #       half of the frame, ending at the box's right edge
-    #       ([edge-6, edge+0.25H]), <20% covered by render ink, and with
-    #       no punctuation-scale render component within 1.0H — a
-    #       trailing '，' the declared text dropped. Punctuation that is
-    #       rendered but shifted by font metrics keeps a matching render
-    #       component nearby (measured up to ~0.85H on accepted pages)
-    #       and is not flagged.
+    #   (b) lost edge punctuation / stray render glyphs: punctuation-scale
+    #       ink column-runs in each box's edge zones, matched one-to-one
+    #       between source and render. Unmatched source runs are lost
+    #       punctuation (text_mismatch); unmatched render runs are extra
+    #       glyphs (extra_glyph). Shifted-but-rendered punctuation keeps a
+    #       matching partner within 1.0H (measured ~0.85H on accepted
+    #       pages) and is not flagged.
+    punct_flagged = np.zeros((height, width), bool)
     for obj in texts:
         if obj['id'] in phantom_ids:
             continue
@@ -545,33 +544,278 @@ def detect_defects(source, pptx, rendered, *, output_dir, slide_index=0):
         bx, by, bw, bh = round(x-x0), round(y-y0), round(w), round(h)
         interior = np.zeros_like(s_ink)
         interior[by:by+bh, bx:bx+bw] = True
-        nsrc, slabs, sstats, scens = cv2.connectedComponentsWithStats(
-            (s_ink & interior).astype(np.uint8), 8)
-        ndst, _, dstats, dcens = cv2.connectedComponentsWithStats(
-            d_ink.astype(np.uint8), 8)
-        punct_lost = False
-        for i in range(1, nsrc):
-            area, cw, ch = sstats[i, 4], sstats[i, 2], sstats[i, 3]
-            if not (40 <= area <= .08*H*H and ch <= .5*H and cw <= .35*H):
-                continue
-            if scens[i][1] < by+.5*bh:
-                continue
-            if not (bx+bw-6 <= sstats[i, 0]+sstats[i, 2]
-                    <= bx+bw+round(.25*H)):
-                continue
-            if np.count_nonzero((slabs == i) & d_dil)/area >= .2:
-                continue
-            matched = any(
-                20 <= dstats[j, 4] <= .08*H*H and dstats[j, 3] <= .5*H
-                and dstats[j, 2] <= .35*H
-                and np.hypot(dcens[j][0]-scens[i][0],
-                             dcens[j][1]-scens[i][1]) <= 1.0*H
-                for j in range(1, ndst))
-            if not matched:
-                punct_lost = True
-                break
-        if punct_lost:
-            reasons.append('edge punctuation in source not rendered')
+        # ghost_text: the native box renders on top of source text that is
+        # still baked into the background — the same glyphs draw twice
+        # (double shadow / over-thick strokes; the orchestration probe
+        # orch_g5r14/baked.py compared the background image only, which
+        # cannot see the doubled ink — the signature here reads the FINAL
+        # render). On the render: interior render ink >=1.3x source ink,
+        # the source pattern is still covered (s_cov_i — same text, not
+        # different content), yet >=18% of render ink has no source
+        # counterpart (d_cov_i low). Clean frames measure 1.00-1.03; the
+        # clean v33 subtitle measures 0.92; the defective v35/v36 p01
+        # subtitle measures ~1.47 with stroke p90 6.0->7.2. The raster-
+        # underlay gate keeps a genuinely bolder render (weight gain,
+        # e.g. v35 p04 '近2个月每次' at 1.48x) out — doubled ink must
+        # literally sit on a baked raster.
+        s_in = np.count_nonzero(s_ink & interior)
+        d_in = np.count_nonzero(d_ink & interior)
+        if s_in >= 500 and d_in >= 1.3*s_in:
+            s_cov_i = np.count_nonzero(s_ink & interior & d_dil)/s_in
+            d_cov_i = np.count_nonzero(d_ink & interior & s_dil)/d_in
+            baked = any(_intersection(r['bbox'], obj['bbox'])
+                        >= .6*w*h for r in rasters)
+            if s_cov_i >= .5 and d_cov_i <= .82 and baked:
+                add('ghost_text', obj['bbox'], int(d_in-s_in), [obj],
+                    reason='native text rendered over baked source text '
+                           '(doubled ink, thickened strokes)')
+        # Edge punctuation audit (B-gen-08). Punct-scale ink UNITS (merged
+        # connected components) in each box's two edge zones are aligned
+        # one-to-one in reading order. Zones: left = [x-1.0H, x+0.35H],
+        # right = [x+w-0.25H, x+w+1.0H]. A unit counts as punctuation when
+        # its ink span is punct-scale (h<=0.5H, w<=0.35H, 40..0.10*H^2) or
+        # a tall-thin vertical ('：'). Reporting gates — applied only after
+        # matching, so pairing pools stay complete: a source unit is lost
+        # punctuation (text_mismatch) when unmatched AND not owned by a
+        # neighbouring box AND not covered by render ink AND edge-adjacent
+        # when inside the box AND not pairable with any render mark within
+        # a wider 1.5H window (shifted-but-rendered marks stay silent).
+        # An unmatched render unit is an extra_glyph unless it abuts a
+        # tall unit as a thin sliver/dense bar (glyph fragment) or sits
+        # over source ink not already claimed by a pairing.
+        ex0 = max(0, round(x-1.1*H)); ex1 = min(width, round(x+w+1.1*H))
+        ey0 = max(0, round(y-.15*H)); ey1 = min(height, round(y+h+.15*H))
+        esc = src[ey0:ey1, ex0:ex1]; edc = dst[ey0:ey1, ex0:ex1]
+        ering = np.concatenate((esc[0].reshape(-1, 3), esc[-1].reshape(-1, 3),
+                                esc[:, 0].reshape(-1, 3), esc[:, -1].reshape(-1, 3)))
+        ebg = np.median(ering, axis=0).astype(np.int16)
+        esi = np.max(np.abs(esc.astype(np.int16)-ebg), axis=2) > 30
+        edi = np.max(np.abs(edc.astype(np.int16)-ebg), axis=2) > 30
+        row0, row1 = round(y-ey0), round(y+h-ey0)
+        # the render line sits lower than the declared box — a rendered
+        # trailing comma routinely hangs ~0.3-0.5H below the box bottom —
+        # so the audit band extends half a line height downward.
+        row1 = min(edi.shape[0], row1+round(.5*H))
+        bx_e = round(x)-ex0
+        bw_e = round(w)
+        others = [o['bbox'] for o in texts if o is not obj]
+        edi_dil = cv2.dilate(edi.astype(np.uint8),
+                             np.ones((5, 5), np.uint8)).astype(bool)
+        esi_dil = cv2.dilate(esi.astype(np.uint8),
+                             np.ones((5, 5), np.uint8)).astype(bool)
+
+        def _inside_other(ibox):
+            # >=60% of the mark's own area sits inside a neighbouring text
+            # box — a centroid test wrongly disowns edge marks that merely
+            # clip a neighbour's bbox corner (the swallowed p05 comma lands
+            # 47% inside the box below but belongs to its own line).
+            ax0, ay0_, aw, ah = ibox
+            ax0 += ex0; ay0_ += ey0
+            area = max(1, aw*ah)
+            for ox, oy, ow, oh in others:
+                ix = max(0, min(ax0+aw, ox+ow)-max(ax0, ox))
+                iy = max(0, min(ay0_+ah, oy+oh)-max(ay0_, oy))
+                if ix*iy >= .6*area:
+                    return True
+            return False
+
+        def _zone_units(mask, c0, c1):
+            # Connected components — adjacent-but-separate marks ('。，')
+            # stay apart, vertically stacked dots ('：') merge into one unit
+            # when their x-ranges overlap >=60%. The extraction band extends
+            # 0.3H beyond the zone so a glyph clipped by the zone boundary
+            # yields its full component (a '息' sliced at the zone edge would
+            # otherwise masquerade as a 7px punct-scale sliver); only units
+            # whose centroid lands inside the zone are kept.
+            ext = round(.3*H)
+            b0 = max(0, c0-ext); b1 = min(mask.shape[1], c1+ext)
+            band = mask[row0:row1, b0:b1]
+            n, lab, st, _ = cv2.connectedComponentsWithStats(
+                band.astype(np.uint8), 8)
+            comps = []
+            for i in range(1, n):
+                if st[i, 4] < 15:
+                    continue
+                cx_ = b0+st[i, 0]+st[i, 2]/2
+                if not (c0 <= cx_ <= c1):
+                    continue
+                comps.append({'x0': b0+st[i, 0], 'x1': b0+st[i, 0]+st[i, 2]-1,
+                              'y0': row0+st[i, 1], 'y1': row0+st[i, 1]+st[i, 3]-1,
+                              'w': st[i, 2], 'h': st[i, 3], 'area': st[i, 4]})
+            comps.sort(key=lambda r: r['x0'])
+            merged = []
+            for r in comps:
+                if merged:
+                    t = merged[-1]
+                    ov = min(r['x1'], t['x1'])-max(r['x0'], t['x0'])+1
+                    if ov >= .6*min(r['w'], t['w']):
+                        t['x0'] = min(t['x0'], r['x0']); t['x1'] = max(t['x1'], r['x1'])
+                        t['y0'] = min(t['y0'], r['y0']); t['y1'] = max(t['y1'], r['y1'])
+                        t['w'] = t['x1']-t['x0']+1; t['h'] = t['y1']-t['y0']+1
+                        t['area'] += r['area']
+                        continue
+                merged.append(dict(r))
+            # per-column ink span over the zone — a column taller than half
+            # a line belongs to a glyph body, not a mark
+            colh = np.zeros(band.shape[1], dtype=np.int16)
+            for i in range(band.shape[1]):
+                ys = np.nonzero(band[:, i])[0]
+                if len(ys):
+                    colh[i] = ys.max()-ys.min()+1
+            for r in merged:
+                r['cx'] = (r['x0']+r['x1'])/2
+                r['cy'] = (r['y0']+r['y1'])/2
+                r['ibox'] = (r['x0'], r['y0'], r['w'], r['h'])
+                lx = np.nonzero(
+                    colh[max(0, r['x0']-round(.15*H)):r['x0']] > .5*H)[0]
+                rx = np.nonzero(
+                    colh[r['x1']+1:r['x1']+1+round(.15*H)] > .5*H)[0]
+                r['sliver'] = bool(len(lx) and len(rx))
+            return merged
+
+        def _punct(r):
+            # low marks (，。、·"'") OR tall-thin verticals (：；！|) — a
+            # colon legitimately spans ~0.55H in an 81px frame. The
+            # verticals need w>=0.08H: below that they are stroke slivers
+            # (a 6px-wide strip of a title glyph), not marks.
+            return ((r['h'] <= .5*H and r['w'] <= .35*H
+                     and 40 <= r['area'] <= .10*H*H)
+                    or (r['h'] <= .7*H and .08*H <= r['w'] <= .2*H
+                        and 40 <= r['area'] <= .06*H*H))
+
+        # A shifted-but-rendered mark can drift past the audit zone when
+        # font-metric shift accumulates along the line (the p05 '"' moved
+        # ~1.3H). Suppression therefore consults a wider render pool than
+        # the reporting zones themselves.
+        dall_wide = [u for u in _zone_units(
+            edi, round(bx_e-.5*H), round(bx_e+bw_e+.5*H))
+            if _punct(u) and not u['sliver']]
+
+        # Zones reach a full line height on BOTH sides: render-side
+        # punctuation routinely sits 0.5-0.7H inside the box edge (font
+        # metrics shift — the accepted pages show up to ~0.85H), so the
+        # render pool must reach just as deep or shifted commas look lost.
+        # Matching pools keep EVERY punct-scale unit — a comma rendered
+        # inside the next box's bbox still explains its source. The
+        # inside-another-box and margin/coverage gates apply only at
+        # reporting time, so neighbours are not double-charged.
+        for c0, c1, side in ((round(bx_e-1.0*H), round(bx_e+1.0*H), 'left'),
+                             (round(bx_e+bw_e-1.0*H), round(bx_e+bw_e+1.0*H),
+                              'right')):
+            sall = _zone_units(esi, c0, c1)
+            sruns = [r for r in sall if _punct(r) and not r['sliver']]
+            dall = _zone_units(edi, c0, c1)
+            dcands = [r for r in dall if _punct(r) and not r['sliver']]
+            # Order-aligned one-to-one matching: the i-th source mark pairs
+            # with the i-th pairable render mark in reading order. Pure
+            # nearest-distance matching grabs the wrong unit when an EXTRA
+            # mark inserts between two real ones (the '。，' case: src '。'
+            # would steal the inserted '，' and the surplus would surface at
+            # the wrong position — or get suppressed entirely).
+            used_s, used_d = set(), set()
+            for si_ in sorted(sruns, key=lambda r: r['cx']):
+                for di_ in sorted(dcands, key=lambda r: r['cx']):
+                    if id(di_) in used_d:
+                        continue
+                    if abs(si_['cx']-di_['cx']) <= 1.0*H and \
+                            min(si_['y1'], di_['y1'])-max(si_['y0'], di_['y0']) \
+                            >= .4*min(si_['h'], di_['h']):
+                        used_s.add(id(si_)); used_d.add(id(di_))
+                        break
+            # Coverage semantics: a source mark "rendered" when ANY render
+            # ink covers it (covAny) — the mark may come back merged into a
+            # differently-shaped unit, as the v35 bullet bars do. Inside the
+            # box only edge-adjacent marks are audited (deep-interior slivers
+            # are glyph fragments); outside the box a stricter coverage bar
+            # applies. A render mark is "explained" only by UNMATCHED source
+            # punct ink — a mark overlapping an already-paired source mark
+            # (the extra '，' beside a rendered '。') is genuinely extra.
+            def _units_mask(mask, units):
+                m = np.zeros_like(mask)
+                for u in units:
+                    ux, uy, uw, uh = u['ibox']
+                    m[uy:uy+uh, ux:ux+uw] |= mask[uy:uy+uh, ux:ux+uw]
+                return cv2.dilate(m.astype(np.uint8),
+                                  np.ones((5, 5), np.uint8)).astype(bool)
+            spunct = _units_mask(esi, [r for r in sruns
+                                       if id(r) not in used_s])
+            # Render-side suppression: ink covered by source ink EXCLUDING
+            # punct-scale source units that were already consumed by a
+            # pairing — a render sliver lying over source glyph mass is a
+            # glyph fragment, but a mark whose only source overlap is an
+            # already-claimed mark (the extra '，' beside a paired '。') is
+            # genuinely extra.
+            smatched = _units_mask(esi, [r for r in sruns
+                                         if id(r) in used_s])
+            sfree = esi_dil & ~smatched
+
+            def _pcov(r, own, m):
+                rx0, ry_, rw_, rh_ = r['ibox']
+                sel = own[ry_:ry_+rh_, rx0:rx0+rw_]
+                return np.count_nonzero(sel & m[ry_:ry_+rh_, rx0:rx0+rw_]) \
+                    / max(1, np.count_nonzero(sel))
+
+            def _pairable(si_, di_, rad=1.0*H):
+                return (abs(si_['cx']-di_['cx']) <= rad
+                        and min(si_['y1'], di_['y1'])-max(si_['y0'], di_['y0'])
+                            >= .4*min(si_['h'], di_['h']))
+            for si_ in sruns:
+                if id(si_) in used_s or _inside_other(si_['ibox']):
+                    continue
+                inside = si_['x0'] >= bx_e and si_['x1'] <= bx_e+bw_e
+                if inside:
+                    edge = si_['x0']-bx_e if side == 'left' \
+                        else bx_e+bw_e-si_['x1']
+                    if edge > .35*H \
+                            or _pcov(si_, esi, edi_dil) >= .3:
+                        continue
+                elif _pcov(si_, esi, edi_dil) >= .5:
+                    continue
+                if any(_pairable(si_, di_, 1.5*H) for di_ in dall_wide):
+                    continue
+                rx0, ry_, rw_, rh_ = si_['ibox']
+                if np.count_nonzero(
+                        punct_flagged[ry_+ey0:ry_+ey0+rh_,
+                                      rx0+ex0:rx0+ex0+rw_]) > .5*si_['area']:
+                    continue
+                box = [rx0+ex0, ry_+ey0, rw_, rh_]
+                text_mask[max(0, box[1]-2):min(height, box[1]+box[3]+2),
+                          max(0, box[0]-2):min(width, box[0]+box[2]+2)] = True
+                punct_flagged[box[1]:box[1]+box[3], box[0]:box[0]+box[2]] = \
+                    esi[ry_:ry_+rh_, rx0:rx0+rw_]
+                add('text_mismatch', box, si_['area'], [obj],
+                    reason='edge punctuation in source not rendered')
+            for di_ in dcands:
+                if id(di_) in used_d or _inside_other(di_['ibox']):
+                    continue
+                # A punct-scale unit abutting a tall unit is presumed to be
+                # a glyph fragment split off by antialiasing — either a thin
+                # sliver or a dense solid bar (a glyph's lone vertical
+                # stroke renders as fill>=0.55, unlike a '：' at ~0.34).
+                # A chunky '。' beside its glyph stays a real mark (the
+                # run01 '佩戴。' extra-comma case).
+                _frag = di_['w'] <= .12*H or (
+                    di_['h'] > .45*H
+                    and di_['area'] >= .55*di_['w']*di_['h'])
+                near_tall = _frag and any(
+                    t['h'] > .5*H and
+                    min(abs(di_['x0']-t['x1']), abs(t['x0']-di_['x1']))
+                    <= .15*H
+                    for t in dall if t is not di_)
+                if near_tall or _pcov(di_, edi, sfree) >= .4:
+                    continue
+                rx0, ry_, rw_, rh_ = di_['ibox']
+                if np.count_nonzero(
+                        punct_flagged[ry_+ey0:ry_+ey0+rh_,
+                                      rx0+ex0:rx0+ex0+rw_]) > .5*di_['area']:
+                    continue
+                box = [rx0+ex0, ry_+ey0, rw_, rh_]
+                text_mask[max(0, box[1]-2):min(height, box[1]+box[3]+2),
+                          max(0, box[0]-2):min(width, box[0]+box[2]+2)] = True
+                punct_flagged[box[1]:box[1]+box[3], box[0]:box[0]+box[2]] = \
+                    edi[ry_:ry_+rh_, rx0:rx0+rw_]
+                add('extra_glyph', box, di_['area'], [obj],
+                    reason='rendered glyph absent from source near text edge')
         if reasons:
             add('text_mismatch', obj['bbox'], int(np.count_nonzero(s_ink)),
                 [obj], reason='; '.join(reasons))
