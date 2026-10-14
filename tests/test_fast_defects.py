@@ -40,7 +40,15 @@ def test_real_defect_category(relative, expected, tmp_path):
 def test_accepted_page_has_no_hard_defects(page, tmp_path):
     run = WORK/'routeb/v30d-final-five'/f'p{page:02d}'
     report = detect_defects(source_for(run), run/'out.pptx', run/'render_001.png', output_dir=tmp_path)
-    assert not [d for d in report['defects'] if d['severity'] == 'hard'], report
+    hard = [d for d in report['defects'] if d['severity'] == 'hard']
+    if page == 3:
+        # The pale-blue circle top-right never rendered in v30d — a
+        # tolerated miss at acceptance, now correctly reported as
+        # fill_lost by the B-gen-10 source-block scan.
+        assert [(d['category'], d['bbox']) for d in hard] == [
+            ('fill_lost', [3544, 82, 234, 141])], report['defects']
+    else:
+        assert not hard, report
 
 
 @pytest.mark.parametrize('page,expected', [
@@ -111,7 +119,10 @@ def test_v31_p02_keeps_three_hard_defects(tmp_path):
     source = WORK/'routeb/png2-ascii/p02.png'
     report = detect_defects(source, run/'out.pptx', run/'render_001.png', output_dir=tmp_path)
     hard = [d for d in report['defects'] if d['severity'] == 'hard']
-    assert len(hard) == 3, report
+    # Three extra fill_lost at x2028 y584/1098/1608: the icon card
+    # backings never rendered in v31 (v38 restores them) — real losses
+    # the B-gen-10 block scan now reports.
+    assert len(hard) == 6, report
     assert any(d['category'] == 'ghost' for d in hard), report
 
 
@@ -710,13 +721,13 @@ def test_bany08_shifted_colon_is_not_extra_glyph(tmp_path):
     assert not any(d['bbox'] == [2242, 421, 11, 35] for d in extras), extras
 
 
-def test_bany08_edge_punct_prefers_near_exact_render_mark(tmp_path):
-    # B-any-08: the '佩戴。' ring case — source keeps one punct-scale unit
-    # (the '◯' mark) because '戴。' merges into a single tall component,
-    # while the render shows the flow-shifted '。' PLUS the raster ring.
-    # Order-aligned greedy pairing gave the source ring to the render '。'
-    # and then flagged the true ring as extra.  A <=.3H near-exact match
-    # must win over reading order.
+def test_bany08_edge_punct_ring_is_extra_glyph(tmp_path):
+    # The '佩戴。' ring case, corrected (B-gen-10): the ring at the source
+    # '。' position is the PNG's baked copy of the period — with the native
+    # '。' rendered beside it the slide shows '。。', a real defect that
+    # must flag so the engine removes the leftover. B-any-08's original
+    # version of this test asserted silence; that was the misdiagnosis the
+    # board rejected (a same-size shifted-suppression rule hid it).
     import numpy as np
     from PIL import Image
     from pptx import Presentation
@@ -736,9 +747,106 @@ def test_bany08_edge_punct_prefers_near_exact_render_mark(tmp_path):
     slide = deck.slides.add_slide(deck.slide_layouts[6])
     sx, sy = deck.slide_width / W, deck.slide_height / Hh
     tb = slide.shapes.add_textbox(round(100 * sx), round(100 * sy),
-                                round(370 * sx), round(120 * sy))
+                                    round(370 * sx), round(120 * sy))
     tb.text = 'X'
     pptx = tmp_path / 'deck.pptx'; deck.save(pptx)
     report = detect_defects(src, pptx, dst, output_dir=tmp_path / 'audit')
     extras = [d for d in report['defects'] if d['category'] == 'extra_glyph']
-    assert not extras, extras
+    assert any(d['bbox'][0] >= 460 for d in extras), extras
+
+# ---------------------------------------------------------------------------
+# B-gen-10 fixtures: run04 p04 '。。' — the preserved raster period must
+# keep flagging as extra_glyph; near-pick/shifted suppression must not
+# hide a doubled mark sitting on top of its own source.
+# ---------------------------------------------------------------------------
+
+
+def test_run04_p04_doubled_period_is_extra_glyph(tmp_path):
+    # '佩戴。' renders the native '。' at ~3042 while the PNG keeps the
+    # source '。' baked at ~3089 — two circles, one extra. The baked mark
+    # lies exactly on the source '。' it duplicates, so any suppression
+    # that compares a render mark to a same-size source unit within .4H
+    # (the b5ca9ef 'shifted' gate) hides it — reverted.
+    report = detect_defects(TRIAL/'source/p04.png',
+                            TRIAL/'working/run04/out.pptx',
+                            TRIAL/'working/run04/conv/render_004.png',
+                            output_dir=tmp_path, slide_index=3)
+    eg = [d for d in report['defects'] if d['category'] == 'extra_glyph'
+          and d['severity'] == 'hard']
+    assert any(3060 <= d['bbox'][0] <= 3120 and 1130 <= d['bbox'][1] <= 1180
+               for d in eg), [d['bbox'] for d in report['defects']]
+
+# ---------------------------------------------------------------------------
+# B-gen-10 fill_shape fixtures: a native fill's rendered silhouette must
+# match the source colour block (band IoU); flatbg p03 card outline loss
+# is a fill_lost case.
+# ---------------------------------------------------------------------------
+
+
+def _hits(report, cat, x0, y0, x1, y1, sev=None):
+    out = []
+    for d in report['defects']:
+        if d['category'] != cat:
+            continue
+        if sev and d['severity'] != sev:
+            continue
+        bx, by, bw, bh = d['bbox']
+        if bx < x1 and bx+bw > x0 and by < y1 and by+bh > y0:
+            out.append(d)
+    return out
+
+
+def test_v38_png2_p03_topright_circle_is_fill_shape(tmp_path):
+    # The pale-blue circle at top-right renders as a capsule plus a square
+    # block (v38 subtle-fill rebuild emits rects/roundRects only).
+    run = WORK/'routeb/v38-png2-five/p03'
+    report = detect_defects(WORK/'routeb/png2-ascii/p03.png',
+                            run/'out.pptx', run/'render_001.png',
+                            output_dir=tmp_path)
+    assert _hits(report, 'fill_shape', 3480, 20, 3840, 340, 'hard'), \
+        [d['bbox'] for d in report['defects']]
+
+
+def test_v38_png2_p03_icon_ellipse_underlays_are_fill_shape(tmp_path):
+    # Icon underlay ellipses render as a pill (01) and a rectangle (02).
+    run = WORK/'routeb/v38-png2-five/p03'
+    report = detect_defects(WORK/'routeb/png2-ascii/p03.png',
+                            run/'out.pptx', run/'render_001.png',
+                            output_dir=tmp_path)
+    assert _hits(report, 'fill_shape', 300, 1100, 820, 1260, 'hard'), \
+        [d['bbox'] for d in report['defects']]
+
+
+def test_v38_flatbg_p05_arrow_labels_are_fill_shape(tmp_path):
+    # Nav labels 02/03/04 are pentagon arrows in the source; the render
+    # emits rounded capsules. All three must flag.
+    report = detect_defects(WORK/'flatfirst/task0/render/flatbg-p05.png',
+                            WORK/'routeb/v38-flatbg/p05/out.pptx',
+                            WORK/'routeb/v38-flatbg/p05/render_001.png',
+                            output_dir=tmp_path)
+    for x0, x1 in ((2350, 2900), (2830, 3310), (3240, 3800)):
+        assert _hits(report, 'fill_shape', x0, 20, x1, 200, 'hard'), \
+            (x0, [d['bbox'] for d in report['defects']])
+
+
+def test_v38_flatbg_p05_round_cards_are_not_fill_shape(tmp_path):
+    # The big case cards ARE rounded rectangles in source and render —
+    # corner-radius differences within tolerance must not flag.
+    report = detect_defects(WORK/'flatfirst/task0/render/flatbg-p05.png',
+                            WORK/'routeb/v38-flatbg/p05/out.pptx',
+                            WORK/'routeb/v38-flatbg/p05/render_001.png',
+                            output_dir=tmp_path)
+    assert not _hits(report, 'fill_shape', 1600, 250, 3800, 1700), \
+        _hits(report, 'fill_shape', 1600, 250, 3800, 1700)
+
+
+def test_v38_flatbg_p03_card_fills_are_fill_lost(tmp_path):
+    # Card fills (234,245,254) vs page (247,250,255): the render sinks the
+    # cards into the shifted page background — outlines gone. Reported as
+    # fill_lost, distinct from the page-wide patch it also carries.
+    report = detect_defects(WORK/'flatfirst/task0/render/flatbg-p03.png',
+                            WORK/'routeb/v38-flatbg/p03/out.pptx',
+                            WORK/'routeb/v38-flatbg/p03/render_001.png',
+                            output_dir=tmp_path)
+    hits = _hits(report, 'fill_lost', 100, 450, 3760, 1750, 'hard')
+    assert len(hits) >= 2, [d['bbox'] for d in report['defects']]

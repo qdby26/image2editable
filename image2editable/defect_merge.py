@@ -42,7 +42,7 @@ def merge_defects(source, pptx, defects, *, output_path, slide_index=0):
     # are layout/native-object work, not raster patches.
     structural = {'truncated', 'fragmented', 'split_text', 'phantom_text',
                   'broken_border', 'text_mismatch', 'fill_lost',
-                  'ghost_text', 'extra_glyph'}
+                  'ghost_text', 'extra_glyph', 'fill_shape'}
     skipped = {d['category'] for d in defects
                if d['severity'] == 'hard' and d['category'] in structural}
     hard = [d for d in defects if d['severity'] == 'hard'

@@ -718,36 +718,14 @@ def detect_defects(source, pptx, rendered, *, output_dir, slide_index=0):
             # the wrong position — or get suppressed entirely).
             used_s, used_d = set(), set()
             for si_ in sorted(sruns, key=lambda r: r['cx']):
-                first = near = None
                 for di_ in sorted(dcands, key=lambda r: r['cx']):
                     if id(di_) in used_d:
                         continue
                     if abs(si_['cx']-di_['cx']) <= 1.0*H and \
                             min(si_['y1'], di_['y1'])-max(si_['y0'], di_['y0']) \
                             >= .4*min(si_['h'], di_['h']):
-                        if first is None:
-                            first = di_
-                        # A render mark within .3H carrying a similar-sized
-                        # component is a near-exact re-render (the raster
-                        # ring sits 1px off its source mark while the
-                        # flow-shifted '。' sits .6H away) — it beats reading
-                        # order.  A size-mismatched sliver (a clipped ring
-                        # arc reads 40% of the ring's area) must NOT win, so
-                        # a genuinely stray mark keeps flagging.
-                        similar = (min(si_['area'], di_['area'])
-                                   >= .5 * max(si_['area'], di_['area'])
-                                   and min(si_['w'], di_['w'])
-                                   >= .6 * max(si_['w'], di_['w'])
-                                   and min(si_['h'], di_['h'])
-                                   >= .6 * max(si_['h'], di_['h']))
-                        if similar and abs(si_['cx'] - di_['cx']) <= .3 * H \
-                                and (near is None
-                                     or abs(si_['cx'] - di_['cx'])
-                                     < abs(si_['cx'] - near['cx'])):
-                            near = di_
-                pick = near if near is not None else first
-                if pick is not None:
-                    used_s.add(id(si_)); used_d.add(id(pick))
+                        used_s.add(id(si_)); used_d.add(id(di_))
+                        break
             # Coverage semantics: a source mark "rendered" when ANY render
             # ink covers it (covAny) — the mark may come back merged into a
             # differently-shaped unit, as the v35 bullet bars do. Inside the
@@ -833,13 +811,17 @@ def detect_defects(source, pptx, rendered, *, output_dir, slide_index=0):
                     t['x0'] <= di_['x0'] and di_['x1'] <= t['x1']
                     and t['h'] > di_['h']
                     for t in dall_raw if t is not di_)
-                # A render mark that lands within .4H of a same-sized source
-                # unit is a position-shifted counterpart, not an extra glyph:
-                # the pairing pool only spans punct-scale source units, so a
-                # colon whose merged dots run past .2H wide never pairs, yet
-                # the mark is plainly that object displaced by font metrics.
+                # A render mark matched by an UNPAIRED same-size source
+                # unit nearby is a shifted counterpart, not an extra
+                # glyph: the two sides classify marginal marks ('：' dots
+                # ~.25H wide, a detached '次' radical) differently, so
+                # the source unit never enters the pairing pool. The
+                # source unit must be unclaimed — in the run04 '。。'
+                # case the source '。' is already paired to the native
+                # render, leaving the baked copy genuinely unexplained.
                 shifted = any(
-                    abs(su['cx'] - di_['cx']) <= .4 * H
+                    id(su) not in used_s
+                    and abs(su['cx'] - di_['cx']) <= .4*H
                     and min(su['area'], di_['area'])
                         >= .5 * max(su['area'], di_['area'])
                     and min(su['w'], di_['w']) >= .6 * max(su['w'], di_['w'])
@@ -889,6 +871,63 @@ def detect_defects(source, pptx, rendered, *, output_dir, slide_index=0):
         if s_p90 >= 1.3*max(.8, d_p90) and s_ink.mean() >= 1.15*d_ink.mean():
             add('weight_loss', [x, y, r-x, b-y], int(np.count_nonzero(s_ink)), [obj],
                 'fixable', 'bold source text rendered at regular weight')
+    # fill_shape (B-gen-10): a native fill must reproduce the source
+    # colour block's silhouette, not just its tint. Pixels in the padded
+    # box are classified nearer-fill vs nearer-local-background on both
+    # source and render; masks are then compared per edge band (thickness
+    # 0.5*min(w,h)) because an ellipse, pentagon or circle differs from a
+    # capsule mostly at the outline — global IoU stays too close (.89
+    # capsule-vs-arrow vs .88 on a correct card) to separate the cases.
+    # Threshold .70: worst legit band seen on accepted pages is .78
+    # (page-edge strip); the flagged fixtures measure .44-.69. Shapes
+    # touching the page edge are skipped — a clipped shape has no
+    # reliable outline context. A fill that vanished entirely (render
+    # mask ~empty) belongs to fill_lost, so a near-empty render mask or
+    # fill~=background contrast <6 skips this audit.
+    for obj in [o for o in objects if o['kind'] == 'shape']:
+        x, y, r, b = _rect(obj['bbox'], width, height)
+        w_, h_ = r-x, b-y
+        if w_ < 20 or h_ < 20:
+            continue
+        if x <= 2 or y <= 2 or r >= width-2 or b >= height-2:
+            continue
+        pad = round(max(w_, h_)*.2)
+        x0, y0 = max(0, x-pad), max(0, y-pad)
+        x1, y1 = min(width, r+pad), min(height, b+pad)
+        dsub = dst[y0:y1, x0:x1].astype(np.int16)
+        ssub = src[y0:y1, x0:x1].astype(np.int16)
+        inner = dsub[y-y0+round(h_*.25):y-y0+round(h_*.75),
+                     x-x0+round(w_*.25):x-x0+round(w_*.75)]
+        fill = np.median(inner.reshape(-1, 3), axis=0)
+        pr = max(1, pad//3)
+        ring = np.concatenate(
+            (dsub[:pr].reshape(-1, 3), dsub[-pr:].reshape(-1, 3)))
+        lbg = np.median(ring, axis=0)
+        if np.max(np.abs(fill-lbg)) < 6:
+            continue
+        dmask = np.max(np.abs(dsub-fill), axis=2) \
+            < np.max(np.abs(dsub-lbg), axis=2)
+        smask = np.max(np.abs(ssub-fill), axis=2) \
+            < np.max(np.abs(ssub-lbg), axis=2)
+        if np.count_nonzero(dmask) < 200 or np.count_nonzero(smask) < 200:
+            continue
+        t = round(min(w_, h_)*.5)
+        ox, oy = x-x0, y-y0
+        worst = 1.0
+        for ys, xs in ((slice(oy, oy+h_), slice(ox, ox+t)),
+                       (slice(oy, oy+h_), slice(ox+w_-t, ox+w_)),
+                       (slice(oy, oy+t), slice(ox, ox+w_)),
+                       (slice(oy+h_-t, oy+h_), slice(ox, ox+w_))):
+            a_, b_ = smask[ys, xs], dmask[ys, xs]
+            union = np.count_nonzero(a_ | b_)
+            if union:
+                worst = min(worst, np.count_nonzero(a_ & b_)/union)
+        global_iou = np.count_nonzero(smask & dmask) \
+            / max(1, np.count_nonzero(smask | dmask))
+        if worst < .70 and global_iou < .97:
+            add('fill_shape', [x, y, w_, h_],
+                int(np.count_nonzero(smask | dmask)), [obj], 'hard',
+                'native fill silhouette differs from source colour block')
     # broken_border: a source row holds a continuous uniform line
     # (>=25% page width, >=80% single-colour fill); the render keeps it
     # only in fragments (>=3 missing x-segments, 10-95% missing) — the
@@ -1028,6 +1067,65 @@ def detect_defects(source, pptx, rendered, *, output_dir, slide_index=0):
         else:
             add('patch', box, int(area*cell*cell), related, 'fixable',
                 'low-contrast backdrop rectangle differs from page background')
+    # fill_lost (block scan, B-gen-10): subtle source fills whose render
+    # collapsed into the page background. The cell-grid path above misses
+    # them when the page background itself shifted (flatbg p03 cards,
+    # where the whole render drifts blue-grey), because it measures the
+    # render against the SOURCE page background. This scan works from the
+    # source side instead: connected blocks of subtle fill (5..25 off the
+    # page background, 15px opening to drop text/strokes), >=0.2% of the
+    # page, >=60% uniform, whose render pixels read >=60% as the RENDER's
+    # own page background.
+    sdist = np.max(np.abs(src.astype(np.int16)-page_bg.astype(np.int16)), axis=2)
+    subfill = cv2.morphologyEx(((sdist >= 5) & (sdist <= 25)).astype(np.uint8),
+                               cv2.MORPH_OPEN, np.ones((15, 15), np.uint8))
+    fcount, flabels, fstats, _ = cv2.connectedComponentsWithStats(subfill, 8)
+    for index, (fx, fy, fw, fh, fa) in enumerate(fstats[1:], 1):
+        if fa < width*height*.002:
+            continue
+        comp = flabels[fy:fy+fh, fx:fx+fw] == index
+        spx = src[fy:fy+fh, fx:fx+fw][comp]
+        med = np.median(spx, axis=0).astype(np.int16)
+        if np.mean(np.max(np.abs(spx.astype(np.int16)-med), axis=1) <= 6) < .6:
+            continue
+        # A lost fill is a collapsed boundary. The source block must sit
+        # >=4 off its surrounding flat pixels (a real edge — whitespace
+        # blocks measuring 0 there are not fills), and the render edge
+        # must have collapsed to <=5 and <=40% of it. The ring is
+        # restricted to pixels near each image's own page background so
+        # icons/text bordering the block, and rendered fills that overlap
+        # the ring (the flatbg p03 capsule around the circle block), do
+        # not pollute the contrast read.
+        compmask = np.zeros((height, width), np.uint8)
+        compmask[fy:fy+fh, fx:fx+fw][comp] = 1
+        ringmask = cv2.dilate(compmask, np.ones((17, 17), np.uint8)
+                              ).astype(bool) & ~compmask.astype(bool)
+        if not np.count_nonzero(ringmask):
+            continue
+        dst_bg = np.median(np.concatenate(
+            (dst[0], dst[-1], dst[:, 0], dst[:, -1])), axis=0)
+        sring = src[ringmask]
+        dring = dst[ringmask]
+        sflat = sring[np.max(np.abs(sring.astype(np.int16)
+                                     - page_bg.astype(np.int16)), axis=1) <= 10]
+        dflat = dring[np.max(np.abs(dring.astype(np.int16)
+                                     - dst_bg.astype(np.int16)), axis=1) <= 10]
+        if len(sflat) < 200 or len(dflat) < 200:
+            continue
+        s_edge = np.max(np.abs(med - np.median(sflat, axis=0)))
+        d_edge = np.max(np.abs(
+            np.median(dst[fy:fy+fh, fx:fx+fw][comp], axis=0)
+            - np.median(dflat, axis=0)))
+        if s_edge < 4 or d_edge > max(3, .4*s_edge):
+            continue
+        box = [int(fx), int(fy), int(fw), int(fh)]
+        if any(d['category'] == 'fill_lost'
+               and _intersection(d['bbox'], box) >= .5*fw*fh
+               for d in defects):
+            continue
+        related = [o for o in objects if _intersection(o['bbox'], box)]
+        add('fill_lost', box, int(fa), related, 'hard',
+            'source fill block collapsed to page background')
     mask = changed&~text_mask
     opened = cv2.morphologyEx(mask.astype(np.uint8),cv2.MORPH_OPEN,np.ones((3,3),np.uint8))
     count,labels,stats,_ = cv2.connectedComponentsWithStats(opened,8)

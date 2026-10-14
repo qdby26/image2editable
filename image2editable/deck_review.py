@@ -22,7 +22,8 @@ COLORS = {'lost': '#e53935', 'extra': '#fb8c00', 'ghost': '#8e24aa',
           'phantom_text': '#5e35b1', 'weight_loss': '#039be5',
           'broken_border': '#f4511e', 'patch': '#7cb342',
           'text_mismatch': '#c2185b', 'fill_lost': '#546e7a',
-          'ghost_text': '#b71c1c', 'extra_glyph': '#00acc1'}
+          'ghost_text': '#b71c1c', 'extra_glyph': '#00acc1',
+          'fill_shape': '#7b1fa2'}
 
 
 def build_deck_review(pages, *, output_dir):
