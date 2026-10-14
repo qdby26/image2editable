@@ -7,6 +7,7 @@ import os
 import hashlib
 import json
 import math
+import unicodedata
 from pathlib import Path
 import time
 
@@ -54,6 +55,69 @@ def _word_bounds(item):
     x, y, w, h = item['box']
     return [(word['text'], [x+word['box'][0]*w, y+word['box'][1]*h,
                             word['box'][2]*w, word['box'][3]*h]) for word in item['words']]
+
+
+def _reject_visual_text(rgb, items):
+    from PIL import ImageDraw
+    from scripts.font_match import resolve_font, _prepare_target, _ink_similarity
+    from scripts.text_detect import _normalized_ink
+
+    kept, rejected = [], []
+    for item in items:
+        label = ''.join(item['text'].split())
+        color = _parse_color(item)
+        x, y, w, h = map(round, item['box'])
+        if not label or label.isdigit() or len(label) > 3 or color is None or min(color) > 200 or min(w, h) <= 0:
+            kept.append(item)
+            continue
+        pad = round(1.5*h)
+        l, t, r, b = max(0, x-pad), max(0, y-pad), min(rgb.shape[1], x+w+pad), min(rgb.shape[0], y+h+pad)
+        crop = rgb[t:b, l:r]
+        chroma = crop.max(axis=2).astype(int)-crop.min(axis=2).astype(int)
+        backdrop = np.median(np.concatenate((crop[0], crop[-1], crop[:, 0], crop[:, -1])), axis=0)
+        pale = ((crop.min(axis=2) >= 170) & (chroma >= 8) & (chroma <= 75)
+                & (np.max(np.abs(crop.astype(int)-backdrop), axis=2) > 8)).astype(np.uint8)
+        contours, _ = cv2.findContours(pale, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        panel = False
+        for contour in contours:
+            px, py, pw, ph = cv2.boundingRect(contour)
+            center_x, center_y = x-l+w/2, y-t+h/2
+            if (.5 <= pw/max(1, ph) <= 2 and cv2.contourArea(contour) >= w*h*1.2
+                    and px < center_x < px+pw and py < center_y < py+ph
+                    and max(pw, ph) <= 3*h
+                    and pw < crop.shape[1] and ph < crop.shape[0]):
+                panel = True
+                break
+        matching = (np.max(np.abs(crop.astype(int)-color), axis=2) <= 45).astype(np.uint8)
+        contours, _ = cv2.findContours(matching, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        round_ink = any(cv2.contourArea(c) > w*h*.15
+                        and .8 <= cv2.boundingRect(c)[2]/max(1, cv2.boundingRect(c)[3]) <= 1.25
+                        and 4*math.pi*cv2.contourArea(c)/max(1, cv2.arcLength(c, True)**2) > .8
+                        and min(x-l+w, cv2.boundingRect(c)[0]+cv2.boundingRect(c)[2]) > max(x-l, cv2.boundingRect(c)[0])
+                        and min(y-t+h, cv2.boundingRect(c)[1]+cv2.boundingRect(c)[3]) > max(y-t, cv2.boundingRect(c)[1])
+                        for c in contours)
+        if not panel and not round_ink:
+            kept.append(item)
+            continue
+        observed = _prepare_target(rgb[y:y+h, x:x+w])
+        scores = []
+        if observed is not None:
+            for family in dict.fromkeys((item.get('font', 'Microsoft YaHei'), 'Arial')):
+                for bold in (False, True):
+                    face = resolve_font(family, bold, size=128)
+                    if face is None:
+                        continue
+                    left, top, right, bottom = face.getbbox(item['text'])
+                    glyph = Image.new('L', (max(1, right-left+16), max(1, bottom-top+16)))
+                    ImageDraw.Draw(glyph).text((8-left, 8-top), item['text'], font=face, fill=255)
+                    reference = _normalized_ink(np.asarray(glyph, dtype=np.float32))
+                    if reference is not None:
+                        scores.append(_ink_similarity(observed[0], reference))
+        if scores and max(scores) < .75:
+            rejected.append(deepcopy(item))
+        else:
+            kept.append(item)
+    return kept, rejected
 
 
 def refine_layout_text(rgb, text_items):
@@ -160,7 +224,14 @@ def refine_layout_text(rgb, text_items):
         for entry in measured:
             color = np.array([int(entry[2][i:i+2], 16) for i in (1, 3, 5)])
             previous = np.array([int(chunks[-1][0][2][i:i+2], 16) for i in (1, 3, 5)]) if chunks else None
-            if previous is None or np.max(np.abs(color-previous)) > 35:
+            x, y, w, h = map(round, item['box'])
+            crop = rgb[max(0, y):min(rgb.shape[0], y+h), max(0, x):min(rgb.shape[1], x+w)]
+            border = np.concatenate((crop[0], crop[-1], crop[:, 0], crop[:, -1])) if crop.size else np.full((1, 3), 255)
+            bg = np.median(border, axis=0)
+            direction = color-bg
+            prior_direction = previous-bg if previous is not None else direction
+            cosine = float(np.dot(direction, prior_direction)/max(1, np.linalg.norm(direction)*np.linalg.norm(prior_direction)))
+            if previous is None or (np.max(np.abs(color-previous)) > 35 and cosine < .99):
                 chunks.append([])
             chunks[-1].append(entry)
         if len(chunks) == 1:
@@ -226,8 +297,21 @@ def refine_layout_text(rgb, text_items):
             break
         if not swallowed:
             kept.append(item)
+    overlap_dropped = len(result) - len(kept)
+    result = kept
+    kept = []
+    for item in result:
+        ax, ay, aw, ah = item['box']
+        label = item['text'].strip()
+        duplicated_prefix = label.isdigit() and len(label) <= 2 and aw <= .35*ah and any(
+            other is not item and other['text'].lstrip().startswith(label)
+            and 0 <= other['box'][0]-ax-aw <= .3*ah
+            and abs(other['box'][1]-ay) <= .15*ah
+            and .7 <= other['box'][3]/ah <= 1.4 for other in result)
+        if not duplicated_prefix:
+            kept.append(item)
     return kept, {'duplicate_spans_removed': len(removed), 'removed_spans': removed,
-                  'mixed_color_lines': mixed, 'overlap_dropped': len(result) - len(kept)}
+                  'mixed_color_lines': mixed, 'overlap_dropped': overlap_dropped + len(result) - len(kept)}
 
 
 def _text_mask(items, size):
@@ -909,21 +993,153 @@ def _recovered_fragment_runs(rgb, item, reference_width):
     return runs
 
 
-def _recover_text_gaps(rgb, items, text, asset_dir, reader):
+def _recover_text_gaps(rgb, items, text, asset_dir, reader, *, punctuation_only=False):
     recovered, windows, calls = [], [], 0
+    deferred_tail = []
     if reader is None:
         return items, text, {'gap_recovery_calls': 0, 'gap_texts_recovered': 0}
     ordered = sorted(items, key=lambda item: item['box'][0])
     for first in ordered:
         x, y, w, h = first['box']
+        if first.get('rotation') or first.get('rotation_degrees') or first['text'].rstrip().endswith(('，', ',', '。', '？', '?', '！', '!', '；', ';', '·', '：', ':')):
+            continue
+        neighbors = [item for item in ordered if item is not first
+                     and item['box'][0] > x+w
+                     and min(y+h, item['box'][1]+item['box'][3])-max(y, item['box'][1]) > .7*h]
+        left, right = max(0, round(x+w-.15*h)), min(rgb.shape[1], round(x+w+1.2*h))
+        if neighbors:
+            right = min(right, round(min(item['box'][0] for item in neighbors)-.08*h))
+        top, bottom = max(0, round(y-.15*h)), min(rgb.shape[0], round(y+1.3*h))
+        crop = rgb[top:bottom, left:right]
+        if not crop.size:
+            continue
+        gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+        bg = np.median(np.concatenate((gray[0], gray[-1], gray[:, 0], gray[:, -1])))
+        ink = (np.abs(gray.astype(float)-bg) > 45).astype(np.uint8)
+        ink[_text_mask([item for item in items if item is not first], text.shape)[top:bottom, left:right] != 0] = 0
+        _, _, stats, _ = cv2.connectedComponentsWithStats(ink, 8)
+        small = [s for s in stats[1:] if s[4] >= max(3, .001*h*h)
+                 and .04*h <= s[2] <= .4*h and .04*h <= s[3] <= .45*h
+                 and 0 < s[0] and s[0]+s[2] < right-left
+                 and 0 < s[1] and s[1]+s[3] < bottom-top
+                 and left+s[0] >= x+w-.1*h]
+        # closing-quote tail: a host that leaves an open quote unmatched owns
+        # tail ink OCR never returns ("危分子\",": detection strips the closers,
+        # recognition reads nothing). The closer pair renders just left of the
+        # box edge — outside this loop's crop — so scan a self-contained band
+        # straddling x+w: a small twin mark up top plus a low comma comp mean
+        # the missing glyphs are '”，'. Only fire on the full pattern: a lone
+        # comma is better left to the OCR windows below than appended half-way.
+        tail_text = first['text'].rstrip()
+        unmatched = (tail_text.count('“') + tail_text.count('「')
+                     + tail_text.count('『') + tail_text.count('‘')
+                     > tail_text.count('”') + tail_text.count('」')
+                     + tail_text.count('』') + tail_text.count('’')) or tail_text.count('"') % 2 == 1
+        bx0 = max(0, round(x+w-.55*h))
+        bx1 = min(rgb.shape[1], round(x+w+.8*h))
+        bcrop = rgb[top:bottom, bx0:bx1]
+        bink = (np.abs(cv2.cvtColor(bcrop, cv2.COLOR_RGB2GRAY).astype(float)-bg) > 45).astype(np.uint8)
+        bink[_text_mask([item for item in items if item is not first],
+                        text.shape)[top:bottom, bx0:bx1] != 0] = 0
+        _, _, cstats, _ = cv2.connectedComponentsWithStats(bink, 8)
+        comma_cands = [s for s in cstats[1:]
+                       if s[4] >= max(3, .001*h*h)
+                       and s[2] <= .22*h and .08*h <= s[3] <= .45*h
+                       and top+s[1]+s[3] >= y+.7*h
+                       and x+w-.2*h <= bx0+s[0] <= x+w+.75*h]
+        comma = pair_at = None
+        if unmatched:
+            upper = sorted((s for s in cstats[1:]
+                            if s[4] >= max(3, .001*h*h)
+                            and s[2] <= .25*h and s[3] <= .3*h
+                            and top+s[1] <= y+.5*h
+                            and bx0+s[0] >= x+w-.5*h), key=lambda s: s[0])
+            comma = next((s for s in comma_cands if bx0+s[0] <= x+w+.2*h), None)
+            pair_at = next((i for i, a in enumerate(upper[:-1])
+                            if abs(a[1]-upper[i+1][1]) <= .12*h
+                            and abs(a[3]-upper[i+1][3]) <= .18*h
+                            and 0 <= upper[i+1][0]-(a[0]+a[2]) <= .18*h), None)
+        if comma is None and pair_at is None and len(comma_cands) == 1:
+            cand = comma_cands[0]
+            # a lone tall mark past the last word's edge is probably a dropped
+            # tail comma — '。' candidates stay square (filtered), detached
+            # glyph strokes like the '戴' dot sit inside the last word's
+            # bounds. Defer the emission: a gap-window read may still merge
+            # the comma into the host text, which keeps it searchable.
+            word_right = max((bx + bw for _, (bx, by, bw, bh) in _word_bounds(first)),
+                             default=None)
+            clear = (bx0 + cand[0] >= word_right + .05*h if word_right is not None
+                     else bx0 + cand[0] >= x + w - .05*h)
+            if cand[3] >= 1.3*cand[2] and clear:
+                deferred_tail.append((first, cand, bx0, top))
+        suffix = ('”' if pair_at is not None else '') + ('，' if comma is not None else '')
+        if suffix:
+            consumed = ([upper[pair_at], upper[pair_at + 1]] if pair_at is not None else []) + [comma]
+            px0 = min(bx0 + s[0] for s in consumed)
+            py0 = min(top + s[1] for s in consumed)
+            px1 = max(bx0 + s[0] + s[2] for s in consumed)
+            py1 = max(top + s[1] + s[3] for s in consumed)
+            # flow-appended punctuation renders at the line's end position,
+            # ~40px off the source ink; an ink item lands its glyphs on the
+            # measured marks instead (same mechanism as the middle dot).
+            punct_item = {key: first[key]
+                          for key in ('color', 'font', 'bold', 'italic', 'font_size')
+                          if key in first}
+            punct_item.update(text=suffix,
+                              box=[float(px0), float(py0),
+                                   float(px1 - px0), float(py1 - py0)],
+                              box_kind='ink')
+            recovered.append(punct_item)
+            text |= _text_mask([punct_item], text.shape)
+            continue
+        if small:
+            dot = next((bounds for word, bounds in _word_bounds(first) if word == '·'), None)
+            if dot and neighbors:
+                dx, dy, dw, dh = map(round, dot)
+                reference = rgb[dy:dy+dh, dx:dx+dw]
+                reference_ink = (cv2.cvtColor(reference, cv2.COLOR_RGB2GRAY) < bg-45).astype(np.uint8)
+                rx, ry, rw, rh = cv2.boundingRect(reference_ink)
+                for sx, sy, sw, sh, area in small:
+                    if (not rw or not rh or not .75 <= sw/rw <= 1.25 or not .75 <= sh/rh <= 1.25
+                            or abs(top+sy+sh/2-(dy+ry+rh/2)) > .08*h):
+                        continue
+                    original = reference_ink[ry:ry+rh, rx:rx+rw]
+                    candidate = cv2.resize(ink[sy:sy+sh, sx:sx+sw], (rw, rh), interpolation=cv2.INTER_NEAREST)
+                    if np.count_nonzero(original & candidate)/max(1, np.count_nonzero(original | candidate)) < .8:
+                        continue
+                    # a gap-positioned dot cannot ride the host's text flow:
+                    # appended to the run it renders at the flow end instead of
+                    # the source gap. Emit it as an ink-positioned item whose
+                    # glyph ink centers on the source dot bounds.
+                    dot_item = {key: first[key]
+                                for key in ('color', 'font', 'bold', 'italic', 'font_size')
+                                if key in first}
+                    dot_item.update(text='·',
+                                    box=[float(left+sx), float(top+sy), float(sw), float(sh)],
+                                    box_kind='ink')
+                    recovered.append(dot_item)
+                    text |= _text_mask([dot_item], text.shape)
+                    break
+                else:
+                    dot = None
+                if dot:
+                    continue
+            words = [bounds for word, bounds in _word_bounds(first) if any(c.isalnum() for c in word)]
+            context_left = words[-2][0]-.12*h if len(words) >= 2 else x+w-2.5*h
+            windows.append((max(0, round(context_left)), top, right, bottom))
+    punctuation_windows = len(windows)
+    for first in ([] if punctuation_only else ordered):
+        x, y, w, h = first['box']
         if first.get('rotation') or first.get('rotation_degrees'):
             continue
+        ends_punct = first['text'].rstrip().endswith(('，', ',', '。', '？', '?', '！', '!', '；', ';', '·', '：', ':'))
         tail = {'box': [min(rgb.shape[1], x+w+4*h), y, 1, h]}
         for second in ordered + [tail]:
             sx, sy, sw, sh = second['box']
             overlap = max(0, min(y+h, sy+sh)-max(y, sy))
             if (sx <= x+w or overlap < min(h, sh)*.8 or min(h, sh)/max(h, sh) < .7
-                    or second.get('rotation') or second.get('rotation_degrees')):
+                    or second.get('rotation') or second.get('rotation_degrees')
+                    or (second is tail and ends_punct)):
                 continue
             gap = sx-x-w
             if gap < .25*max(h, sh):
@@ -957,7 +1173,7 @@ def _recover_text_gaps(rgb, items, text, asset_dir, reader):
                 if window not in windows:
                     windows.append(window)
             break
-    for first in ordered:
+    for first in ([] if punctuation_only else ordered):
         x, y, w, h = first['box']
         if w < 3*h or first.get('rotation') or first.get('rotation_degrees'):
             continue
@@ -985,24 +1201,50 @@ def _recover_text_gaps(rgb, items, text, asset_dir, reader):
         window = (max(left, left+ink_left-pad), top, min(right, left+ink_right+pad), bottom)
         if window not in windows:
             windows.append(window)
-    for left, top, right, bottom in windows[:4]:
+    for window_index, (left, top, right, bottom) in enumerate(windows[:4]):
         if calls >= 4:
             break
         path = asset_dir / f'text-gap-{calls+1:02d}.png'
         Image.fromarray(rgb[top:bottom, left:right]).save(path)
-        found, _ = reader(path, style_reference_width=rgb.shape[1])
+        # the retry below spends a reader call too; the punctuation window
+        # boundary counts windows, not calls — track the index or a retry
+        # silently demotes later tail windows to detection (p04 '出血，')
+        punctuation_only = window_index < punctuation_windows
+        found, _ = reader(path, style_reference_width=rgb.shape[1],
+                          **({'recognition_only': True} if punctuation_only else {}))
         calls += 1
+        if punctuation_only and not found and calls < 4:
+            # recognition-only misses a bare trailing closer; the detection
+            # path still reads it — retry once inside the per-page budget
+            found, _ = reader(path, style_reference_width=rgb.shape[1])
+            calls += 1
         for item in found:
             tx, ty, tw, th = item['box']
             fragment = item.get('text','').strip()
-            punctuation = fragment.lstrip(''.join(c for c in fragment if c.isalnum()))
-            prefix = fragment[:-len(punctuation)] if punctuation else fragment
-            tail_host = next((v for v in items if prefix and v['text'].rstrip().endswith(prefix)
-                              and abs(v['box'][1]-(top+ty)) < v['box'][3]*.5
-                              and abs(v['box'][0]+v['box'][2]-(left+tx)) < v['box'][3]*1.5),None)
-            if tail_host is not None and punctuation and all(c in '？?！!，,。；;' for c in punctuation):
+            # the suffix may start with a closer the alnum-lstrip prefix
+            # approach cannot isolate ("子”，" -> "子"+"”，"; "变)，" ->
+            # "变)"+","). Slide the split so the longest prefix is a host's
+            # tail and the remainder is pure tail punctuation.
+            tail_host = punctuation = None
+            norm = lambda s: unicodedata.normalize('NFKC', s)
+            for cut in range(len(fragment) - 1, 0, -1):
+                prefix, suffix = fragment[:cut], fragment[cut:]
+                if not all(c in '？?！!，,。；;·：:、’”"\'「」『』》〉）)]（(…～~' for c in suffix):
+                    continue
+                # host text may keep the halfwidth twin of the fragment's
+                # fullwidth closer (")" vs "）"); compare normalized forms.
+                needle = norm(prefix)
+                tail_host = next((v for v in items
+                                  if norm(v['text'].rstrip()).endswith(needle)
+                                  and abs(v['box'][1]-(top+ty)) < v['box'][3]*.5
+                                  and min(abs(v['box'][0]+v['box'][2]-(left+tx)),
+                                          abs(v['box'][0]+v['box'][2]-(left+tx+tw))) < v['box'][3]*1.5),None)
+                if tail_host is not None:
+                    punctuation = suffix
+                    break
+            if tail_host is not None and item.get('confidence', 0) >= .9:
                 if any('\u4e00' <= c <= '\u9fff' for c in tail_host['text']):
-                    punctuation = punctuation.translate(str.maketrans('?!,;', '？！，；'))
+                    punctuation = punctuation.translate(str.maketrans("?!,;:()'\"", '？！，；：（）’”'))
                 tail_host['text'] += punctuation
                 tail_host['box'][2] = max(tail_host['box'][2],left+tx+tw-tail_host['box'][0])
                 text |= _text_mask([tail_host],text.shape)
@@ -1043,6 +1285,21 @@ def _recover_text_gaps(rgb, items, text, asset_dir, reader):
                 updated['runs'] = runs
             recovered.append(updated)
             text |= _text_mask([updated], text.shape)
+    # lone tail commas deferred above fire only when the OCR windows did not
+    # fold the mark into the host text or claim its pixels otherwise
+    for first, cand, bx0, btop in deferred_tail:
+        if first['text'].rstrip().endswith(('，', ',', '。', '？', '?', '！', '!', '；', ';', '：', ':', '·')):
+            continue
+        cx, cy, cw, ch = (bx0 + cand[0], btop + cand[1], cand[2], cand[3])
+        if np.mean(text[cy:cy + ch, cx:cx + cw] != 0) > .5:
+            continue
+        punct_item = {key: first[key]
+                      for key in ('color', 'font', 'bold', 'italic', 'font_size')
+                      if key in first}
+        punct_item.update(text='，', box=[float(cx), float(cy), float(cw), float(ch)],
+                          box_kind='ink')
+        recovered.append(punct_item)
+        text |= _text_mask([punct_item], text.shape)
     return items+recovered, text, {'gap_recovery_calls': calls, 'gap_texts_recovered': len(recovered)}
 
 
@@ -1211,7 +1468,14 @@ def _free_glyph_units(rgb, regions, items, text, visual_mask, asset_dir=None, re
                       'items': overlaps, 'reason': 'free-glyph-row', 'box': (x, y, r, b)})
     ids = {id(it) for it in dropped}
     kept = [it for it in items if id(it) not in ids]
-    text = _text_mask(kept, (h, w))
+    # the incoming mask unions items with stamps/labels/recovered entries; only
+    # the suppressed members' boxes may be cleared — rebuilding from `kept`
+    # alone erased mask coverage owned by text outside this list (png2-p01
+    # subtitle regression: source glyphs survived under the native line).
+    for it in dropped:
+        x, y, iw, ih = map(round, it['box'])
+        pad = max(2, round(ih * .06))
+        text[max(0, y - pad):min(h, y + ih + pad), max(0, x - pad):min(w, x + iw + pad)] = 0
     return kept, text, specs, [{'text': it['text'], 'reason': 'free-glyph-row'} for it in dropped]
 
 
@@ -1879,6 +2143,24 @@ def _emit_residual(records, elements, asset_dir, difference, page_size,
     for rec in emitted:
         if rec['w']*rec['h'] < h*w*.0001:
             continue
+        # a near-empty halo record (edge specks, anti-alias dust, a removed
+        # span's leftover strokes) whose box still clips a live text item only
+        # double-draws the zone: its solid ink is sub-visible while the partial
+        # overlap trips the truncated check. Drop it like any other sub-
+        # threshold sliver — its real content, when present, is rendered by
+        # the card or unit it fringes.
+        solid = rec['rgba'][..., 3] >= 128
+        if solid.mean() < .02 and any(
+                max(0, min(rec['x'] + rec['w'], it['box'][0] + it['box'][2])
+                    - max(rec['x'], it['box'][0]))
+                * max(0, min(rec['y'] + rec['h'], it['box'][1] + it['box'][3])
+                      - max(rec['y'], it['box'][1]))
+                > .02 * it['box'][2] * it['box'][3]
+                for it in items):
+            if os.environ.get('LF_DEBUG_RESIDUAL'):
+                print(f'[emit-drop] sparse-over-text'
+                      f' bbox=({rec["x"]},{rec["y"]},{rec["w"]},{rec["h"]})')
+            continue
         if os.environ.get('LF_DEBUG_RESIDUAL'):
             ra = rec['rgba'][..., 3] != 0
             tz = text[rec['y']:rec['y'] + rec['h'], rec['x']:rec['x'] + rec['w']] != 0
@@ -2123,8 +2405,10 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
     with Image.open(source) as image:
         rgb = np.asarray(image.convert('RGB')).copy()
     h, w = rgb.shape[:2]
-    items, text_audit = refine_layout_text(rgb, text_items)
-    text = _text_mask(items, (h, w)) | _text_mask(text_items, (h, w))
+    accepted, rejected = _reject_visual_text(rgb, text_items)
+    items, text_audit = refine_layout_text(rgb, accepted)
+    text_audit['visual_ocr_rejected'] = rejected
+    text = _text_mask(items, (h, w)) | _text_mask(accepted, (h, w))
     borders = np.concatenate((rgb[0], rgb[-1], rgb[:, 0], rgb[:, -1]))
     bg = np.median(borders, axis=0).astype(np.uint8)
     if background_mode not in {'flat', 'source'}:
@@ -2137,9 +2421,9 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
         items, title_audit = _recover_source_titles(rgb, items, asset_dir, label_reader)
         text_audit.update(title_audit)
         text |= _text_mask(items, (h, w))
-    if not preserve_backdrop:
-        items, text, gap_audit = _recover_text_gaps(rgb, items, text, asset_dir, label_reader)
-        text_audit.update(gap_audit)
+    items, text, gap_audit = _recover_text_gaps(rgb, items, text, asset_dir, label_reader,
+                                               punctuation_only=preserve_backdrop)
+    text_audit.update(gap_audit)
     reconstructed = None
     if background is not None:
         with Image.open(background) as image:
@@ -2575,7 +2859,7 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
         emblem_dropped.add(id(it))
     if emblem_dropped:
         items = [it for it in items if id(it) not in emblem_dropped]
-        text = _text_mask(items, (h, w)) | _text_mask(text_items, (h, w))
+        text = _text_mask(items, (h, w)) | _text_mask(accepted, (h, w))
         text, released2 = _release_boxed_decorations(rgb, items, regions, text)
         released |= released2
     difference = np.max(np.abs(rgb.astype(np.int16)-expected.astype(np.int16)), axis=2)

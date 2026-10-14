@@ -11,6 +11,223 @@ from pptx import Presentation
 from image2editable import cli
 
 
+_BANY06_FIXTURES = Path(__file__).parent / 'fixtures' / 'bany06'
+
+
+def _bany06_fixture(kind, page, suffix=''):
+    tag = f'{kind}-p{page:02d}{suffix}'
+    source = _BANY06_FIXTURES / f'{tag}.png'
+    cache = _BANY06_FIXTURES / f'{tag}.json'
+    if not source.exists():
+        source = _BANY06_FIXTURES / f'{kind}-p{page:02d}.png'
+    return source, json.loads(cache.read_text(encoding='utf8'))['text_items']
+
+
+@pytest.mark.parametrize('kind,page,phantom', [('run01', 3, 'O O'), ('run01', 3, 'O'), ('flatbg', 2, 'D目')])
+def test_bany06_graphic_ocr_is_released_to_visual(kind, page, phantom, tmp_path):
+    from image2editable.layout_first import prepare_layout
+    source, items = _bany06_fixture(kind, page)
+    slide, audit = prepare_layout(source, tmp_path/'assets', text_items=items,
+                                  background_mode='source', label_reader=lambda *a, **k: ([], None))
+    assert all(item['text'] not in ('O', 'O O', 'D目') for item in slide['text_items'])
+    rejected = [item for item in items if item['text'] == phantom]
+    rgb = np.asarray(Image.open(source).convert('RGB'))
+    coverage = np.zeros(rgb.shape[:2], np.uint8)
+    for element in slide['visual_elements']:
+        c = element.get('component')
+        if c:
+            alpha = np.asarray(Image.open(c['path']).convert('RGBA'))[:, :, 3]
+            coverage[c['y']:c['y']+c['h'], c['x']:c['x']+c['w']] |= alpha
+    for item in rejected:
+        x, y, w, h = map(round, item['box'])
+        ink = rgb[y:y+h, x:x+w].min(axis=2) < 160
+        assert (coverage[y:y+h, x:x+w][ink] > 0).mean() > .98
+    if kind == 'run01':
+        assert any(item['text'] == '3' for item in slide['text_items'])
+
+
+def test_bany06_duplicate_narrow_prefix_is_not_native():
+    from image2editable.layout_first import refine_layout_text
+    source, items = _bany06_fixture('flatbg', 5)
+    refined, _ = refine_layout_text(np.asarray(Image.open(source).convert('RGB')), items)
+    assert any(item['text'].strip() == 'HPV' for item in refined)
+    assert all(item['text'].strip() not in ('1', 'HPV 1') for item in refined)
+    assert any('16/18' in item['text'] for item in refined)
+
+
+@pytest.mark.parametrize('line', ['标准预防原则', '职业暴露处置流程', '手卫生规范', '隔离与防护用品'])
+def test_bany06_one_ocr_line_is_not_split_by_ink_shading(line):
+    from image2editable.layout_first import refine_layout_text
+    source, items = _bany06_fixture('run01', 2)
+    item = next(item for item in items if ''.join(item['text'].split()) == line)
+    refined, _ = refine_layout_text(np.asarray(Image.open(source).convert('RGB')), [item])
+    assert len(refined) == 1
+    assert ''.join(refined[0]['text'].split()) == line
+
+
+@pytest.mark.parametrize('kind,page,host,punctuation', [
+    ('flatbg', 4, '平素体健', '，'), ('flatbg', 4, '不好意思就医', '，')])
+def test_bany06_source_punctuation_follows_previous_text(kind, page, host, punctuation, tmp_path):
+    from image2editable.layout_first import _recover_text_gaps, _text_mask
+    source, items = _bany06_fixture(kind, page)
+    rgb = np.asarray(Image.open(source).convert('RGB'))
+    selected = next(item for item in items if item['text'] == host)
+    calls = []
+    def reader(path, **kwargs):
+        calls.append(path)
+        pixels = np.asarray(Image.open(path).convert('RGB'))
+        gray = cv2.cvtColor(pixels, cv2.COLOR_RGB2GRAY)
+        mask = (gray < 160).astype(np.uint8)
+        box = list(cv2.boundingRect(mask))
+        return [{'text': host[-1]+punctuation, 'box': box, 'confidence': .99}], None
+    refined, _, _ = _recover_text_gaps(rgb, [selected], _text_mask([selected], rgb.shape[:2]), tmp_path, reader)
+    assert refined[0]['text'].endswith(punctuation)
+    assert calls
+
+
+def test_bany06_missing_middle_dot_matches_existing_source_dot(tmp_path):
+    from image2editable.layout_first import _recover_text_gaps, _text_mask, _word_bounds
+    source, items = _bany06_fixture('run01', 1)
+    rgb = np.asarray(Image.open(source).convert('RGB'))
+    original_bounds = _word_bounds(items[0])
+    refined, _, _ = _recover_text_gaps(rgb, items, _text_mask(items, rgb.shape[:2]), tmp_path,
+                                      lambda *a, **k: ([], None))
+    json.dumps(refined)
+    # the recovered dot is its own ink-positioned item at the source gap, not
+    # text appended to the host run (inline flow lost the gap offset, B-any-07)
+    assert refined[0]['text'] == '标准预防 · 手卫生'
+    assert _word_bounds(refined[0]) == original_bounds
+    host_right = refined[0]['box'][0] + refined[0]['box'][2]
+    dot = next((item for item in refined if item['text'] == '·'
+                and item['box'][0] > host_right), None)
+    assert dot is not None
+    assert dot.get('box_kind') == 'ink'
+    assert refined[1]['text'] == '隔离防护'
+    assert len(refined) == len(items)+1
+
+
+def test_bany07_free_glyph_units_preserve_non_member_text_mask(tmp_path):
+    from image2editable.layout_first import _free_glyph_units, _text_mask
+    # the incoming mask is a union over items + stamps/labels/recovered entries;
+    # rebuilding it from kept items alone dropped the subtitle band coverage and
+    # left source glyphs under the native text (png2-p01 double image, v34+)
+    rgb = np.full((600, 1200, 3), 255, np.uint8)
+    items = [{'text': '常规文字', 'box': [50, 300, 200, 40]}]
+    other = {'text': '《妇产科学》本科教学课件', 'box': [50, 400, 500, 60]}
+    text = _text_mask(items + [other], rgb.shape[:2])
+    visual_mask = np.zeros(rgb.shape[:2], np.uint8)
+    kept, new_text, _, _ = _free_glyph_units(rgb, [], items, text.copy(), visual_mask)
+    assert kept == items
+    assert (new_text[400:460, 50:550] != 0).all()
+    assert (new_text[300:340, 50:250] != 0).all()
+
+
+def test_bany07_closing_punctuation_follows_host_prefix(tmp_path):
+    from copy import deepcopy
+    from image2editable.layout_first import _recover_text_gaps, _text_mask
+    source, items = _bany06_fixture('png2', 5)
+    rgb = np.asarray(Image.open(source).convert('RGB'))
+    for host_text, fragment, suffix in [('头号高危分子', '子”，', '”，'),
+                                        ('头号高危分子', '危分子",', '”，'),
+                                        ('(癌前病变)', '变)，', '，'),
+                                        ('(癌前病变)', '前病变），', '，')]:
+        host = deepcopy(next(item for item in items
+                             if item['text'].rstrip().endswith(host_text)))
+        tail = host['text'].rstrip()
+        def reader(path, **kwargs):
+            pixels = np.asarray(Image.open(path).convert('RGB'))
+            box = list(cv2.boundingRect((pixels.min(axis=2) < 160).astype(np.uint8)))
+            return [{'text': fragment, 'box': box, 'confidence': .99}], None
+        refined, _, _ = _recover_text_gaps(rgb, [host], _text_mask([host], rgb.shape[:2]),
+                                          tmp_path, reader)
+        if host_text == '头号高危分子':
+            # the open-quote twin-mark+comma pattern resolves before OCR: a
+            # separate ink-positioned '”，' item, never a duplicate text run
+            assert len(refined) == 2
+            punct = next(item for item in refined if item['text'] == '”，')
+            assert punct['box_kind'] == 'ink'
+        else:
+            # punctuation either merges into the host text or lands as an
+            # ink-positioned item at the measured marks; it must never surface
+            # as a duplicate text run reprinting the same glyphs
+            if len(refined) == 1:
+                assert refined[0]['text'] == tail + suffix
+            else:
+                assert len(refined) == 2
+                punct = next(item for item in refined if item['text'] == suffix)
+                assert punct['box_kind'] == 'ink'
+
+
+def test_bany07_unmatched_quote_tail_recovers_closing_punctuation(tmp_path):
+    from image2editable.layout_first import _recover_text_gaps, _text_mask
+    source, items = _bany06_fixture('png2', 5)
+    rgb = np.asarray(Image.open(source).convert('RGB'))
+    host = next(item for item in items if item['text'].rstrip().endswith('头号高危分子'))
+    # OCR never returns the bare closing-quote tail; the unclosed '"' plus the
+    # twin-mark+comma ink pattern yields an ink-positioned '”，' item instead —
+    # flow-appending it would render the marks ~40px off the source position.
+    refined, _, _ = _recover_text_gaps(rgb, [host], _text_mask([host], rgb.shape[:2]),
+                                      tmp_path, lambda *a, **k: ([], None))
+    assert len(refined) == 2
+    punct = next(item for item in refined if item['text'] == '”，')
+    assert punct['box_kind'] == 'ink'
+    px, py = punct['box'][0] + punct['box'][2] / 2, punct['box'][1] + punct['box'][3] / 2
+    assert 2585 <= px <= 2626 and 719 <= py <= 774
+
+
+def test_bany07_sparse_residual_over_text_is_dropped(tmp_path):
+    from image2editable.layout_first import _emit_residual
+    difference = np.full((2160, 3840), 100, np.uint8)
+    text = np.zeros((2160, 3840), np.uint8)
+    items = [{'text': '黄金处置时间：', 'box': [1700, 1650, 300, 90]}]
+    cv2.rectangle(text, (1700, 1650), (2000, 1740), 255, -1)
+
+    def _sparse(width, height, dots=6):
+        rgba = np.zeros((height, width, 4), np.uint8)
+        for i in range(dots):
+            rgba[3 + i * 5 % height, 3 + i * 7 % width] = [80, 120, 200, 255]
+        return rgba
+    elements = []
+    records = [
+        {'rgba': _sparse(560, 100), 'x': 1296, 'y': 1646, 'w': 560, 'h': 100, 'owned': False},
+        {'rgba': _sparse(200, 90), 'x': 3000, 'y': 1646, 'w': 200, 'h': 90, 'owned': False},
+    ]
+    dense = np.zeros((90, 200, 4), np.uint8)
+    dense[10:80, 20:180] = [200, 60, 60, 255]
+    records.append({'rgba': dense, 'x': 1760, 'y': 1660, 'w': 200, 'h': 90, 'owned': False})
+    count = _emit_residual(records, elements, tmp_path, difference, (2160, 3840), text, items)
+    boxes = [(e['component']['x'], e['component']['y']) for e in elements]
+    assert (3000, 1646) in boxes
+    assert (1760, 1660) in boxes
+    assert count == 2
+    assert all(not (e['component']['x'] == 1296 and e['component']['y'] == 1646)
+               for e in elements)
+
+
+def test_bany06_superscript_correction_preserves_native_numbered_labels():
+    from image2editable.layout_first import refine_layout_text
+    rgb = np.full((100, 300, 3), 255, np.uint8)
+    items = [{'text': '1', 'box': [10, 20, 12, 40]},
+             {'text': '16/18型', 'box': [40, 20, 160, 40]}]
+    refined, _ = refine_layout_text(rgb, items)
+    assert [item['text'] for item in refined] == ['1', '16/18型']
+
+
+def test_bany06_middle_comma_uses_real_same_line_neighbors(tmp_path):
+    from image2editable.layout_first import _recover_text_gaps, _text_mask
+    source, items = _bany06_fixture('flatbg', 4)
+    rgb = np.asarray(Image.open(source).convert('RGB'))
+    selected = [next(item for item in items if item['text'] == label)
+                for label in ('不好意思就医', '自购妇科洗液冲洗；症状反复2')]
+    def reader(path, **kwargs):
+        pixels = np.asarray(Image.open(path).convert('RGB'))
+        box = list(cv2.boundingRect((pixels.min(axis=2) < 160).astype(np.uint8)))
+        return [{'text': '医，', 'box': box, 'confidence': .99}], None
+    refined, _, _ = _recover_text_gaps(rgb, selected, _text_mask(selected, rgb.shape[:2]), tmp_path, reader)
+    assert refined[0]['text'] == '不好意思就医，'
+    assert len(refined) == 2
+
+
 @pytest.mark.parametrize('read_prefix', [False, True])
 def test_unhosted_percent_plus_is_one_raster_unit(tmp_path, read_prefix):
     from image2editable.layout_first import prepare_layout
@@ -1168,12 +1385,10 @@ def test_glow_bridged_owned_components_split_into_separate_objects(tmp_path):
 def test_flatbg_illustration_does_not_lose_card_cut_columns(tmp_path):
     from image2editable.layout_first import prepare_layout
 
-    source = Path('E:/PPT/projects/2026-10-01-chunyu092704-cervical-cancer/working/flatfirst/task0/render/flatbg-p02.png')
+    source, items = _bany06_fixture('flatbg', 2, 'b')
     rgb = np.asarray(Image.open(source).convert('RGB')).copy()
     path = tmp_path/'real-crop.png'
     Image.fromarray(rgb).save(path)
-    cache = source.parents[2]/'task5f'/'lf'/'p02'/'text_001.json'
-    items = json.loads(cache.read_text(encoding='utf8'))['text_items']
     slide, _ = prepare_layout(path, tmp_path/'assets', text_items=items, background_mode='source',
                               label_reader=lambda *a, **k: ([], None))
     for x, y in ((775, 979), (775, 1677)):
