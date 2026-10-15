@@ -492,6 +492,11 @@ def _geometry(rgb, mask, text, outline=False):
     if outline:
         edge = (mask != 0) & (cv2.erode(mask, np.ones((5, 5), np.uint8)) == 0)
         pixels = rgb[edge]
+        if not len(pixels):
+            # a silhouette that fills its bbox edge-to-edge (a page-sized
+            # pale contour) erodes to nothing — fall back to the shape's own
+            # ink instead of emitting a NaN stroke
+            pixels = rgb[mask != 0]
         colored = pixels[np.max(pixels.astype(int), axis=1) - np.min(pixels.astype(int), axis=1) > 5]
         shape['stroke_rgb'] = np.median(colored if len(colored) else pixels, axis=0).astype(int).tolist()
         shape['line_width'] = max(1, min(mask.shape) / 700)
@@ -2073,7 +2078,11 @@ def _border_band_centre(cover, edge, cap):
     return (centre, b - a + 1) if abs(centre - edge) <= cap else None
 
 
-def _preserve_straddling_marks(cleaning, rgb_zone, local_text):
+_STRADDLE_PUNCT = set('。，、；：？！…·—～「」『』（）《》〈〉.,;:!?%)]}\'"')
+
+
+def _preserve_straddling_marks(cleaning, rgb_zone, local_text, items=None,
+                             zone_offset=(0, 0)):
     """Un-clean closed ink components that straddle the text-mask edge.
 
     The text mask follows OCR boxes, so a mark whose ink intrudes into a
@@ -2085,14 +2094,79 @@ def _preserve_straddling_marks(cleaning, rgb_zone, local_text):
     is inside the box.  Open strokes (a dash tip under a frame edge) clip
     cleanly and are never preserved: their in-box ink would count as a
     raster re-print over a live text box (I1).
+
+    The exception is the text item's own head/tail punctuation.  When the
+    live text ends in a punctuation character, the small mark straddling
+    the corresponding box edge is that glyph's source ink, not a neighbour
+    decoration: the native text redraws it, so the whole component goes to
+    cleaning instead of surviving to double-print (run04 p04's '佩戴。').
     """
     if not np.any(cleaning):
         return cleaning
     dark = (rgb_zone.max(axis=2) < 160).astype(np.uint8)
     count, labels = cv2.connectedComponents(dark, 8)
+    ox, oy = zone_offset
+    edges = []
+    for item in items or []:
+        value = (item.get('text') or '').strip()
+        if not value or item.get('rotation_degrees'):
+            continue
+        ix, iy, iw, ih = item['box']
+        if iw <= 0 or ih <= 0:
+            continue
+        head = value[0] in _STRADDLE_PUNCT
+        tail = value[-1] in _STRADDLE_PUNCT
+        if head or tail:
+            edges.append((ix - ox, iy - oy, ix + iw - ox, iy + ih - oy,
+                          ih, head, tail))
+    hi_labels = None
+    if edges:
+        hi_labels = cv2.connectedComponents(
+            (rgb_zone.max(axis=2) < 224).astype(np.uint8), 8)[1]
     for lab in range(1, count):
         comp = labels == lab
         if not np.any(comp & cleaning):
+            continue
+        twin = 0
+        if edges:
+            ys, xs = np.nonzero(comp)
+            cx, cy = xs.mean(), ys.mean()
+            small = max(xs.max() - xs.min() + 1,
+                        ys.max() - ys.min() + 1)
+            for bx0, by0, bx1, by1, ih, head, tail in edges:
+                if small > ih * 1.5:
+                    continue
+                # tail punctuation of the last line hugs the right edge;
+                # leading punctuation of the first line hugs the left edge
+                if (tail and bx1 - 1.2 * ih <= cx <= bx1 + 1.0 * ih
+                        and by1 - 1.4 * ih <= cy <= by1 + .4 * ih) \
+                        or (head and bx0 - 1.0 * ih <= cx <= bx0 + 1.2 * ih
+                            and by0 - .4 * ih <= cy <= by0 + 1.4 * ih):
+                    twin = ih
+                    break
+        if twin:
+            # erase the glyph's AA halo too: regrow the component under a
+            # lighter threshold so the fringe goes to cleaning with the
+            # core, unless it welds into a bigger shape (a border line)
+            ids = np.unique(hi_labels[comp])
+            grow = np.isin(hi_labels, ids[ids > 0])
+            gy, gx = np.nonzero(grow)
+            if len(gx) and np.count_nonzero(grow) <= np.count_nonzero(comp) * 8 \
+                    and max(gx.max() - gx.min(), gy.max() - gy.min()) <= twin * 1.8:
+                comp = grow
+                # detached faint specks of the same glyph (the ring's
+                # outermost AA is a separate component at every threshold)
+                # inside the padded bbox — erase them, but never pixels of
+                # another dark component's ink
+                fx0, fy0 = max(0, gx.min() - 2), max(0, gy.min() - 2)
+                fx1 = min(comp.shape[1], gx.max() + 3)
+                fy1 = min(comp.shape[0], gy.max() + 3)
+                fringe = np.zeros_like(comp)
+                fringe[fy0:fy1, fx0:fx1] = (
+                    rgb_zone[fy0:fy1, fx0:fx1].max(axis=2) < 245) \
+                    & (dark[fy0:fy1, fx0:fx1] == 0)
+                comp = comp | fringe
+            cleaning = cleaning | comp
             continue
         inside = np.count_nonzero(comp & (local_text != 0))
         _, hier = cv2.findContours(comp.astype(np.uint8), cv2.RETR_CCOMP,
@@ -2125,9 +2199,14 @@ def _emit_residual(records, elements, asset_dir, difference, page_size,
     def _overlay(canvas, rec, ux0, uy0):
         sub = canvas[rec['y'] - uy0:rec['y'] - uy0 + rec['h'],
                      rec['x'] - ux0:rec['x'] - ux0 + rec['w']]
-        a = rec['rgba'][..., 3:4].astype(np.float32) / 255
-        sub[..., :3] = (rec['rgba'][..., :3] * a + sub[..., :3] * (1 - a)).astype(np.uint8)
-        sub[..., 3] = np.maximum(sub[..., 3], rec['rgba'][..., 3])
+        sa = rec['rgba'][..., 3:4].astype(np.float32) / 255
+        da = sub[..., 3:4].astype(np.float32) / 255
+        out_a = sa + da * (1 - sa)
+        rgb = rec['rgba'][..., :3].astype(np.float32) * sa \
+            + sub[..., :3].astype(np.float32) * da * (1 - sa)
+        np.divide(rgb, out_a, out=rgb, where=out_a > 0)
+        sub[..., :3] = rgb.astype(np.uint8)
+        sub[..., 3] = (out_a[..., 0] * 255 + .5).astype(np.uint8)
 
     def _inside(box, host):
         sx, sy, sw, sh = box
@@ -2285,7 +2364,16 @@ def _audit_invariants(elements, items, page_size, rgb=None):
         if crop.size == 0:
             continue
         bg = np.median(crop.reshape(-1, 3), axis=0)
-        ink = np.max(np.abs(crop.astype(np.int16) - bg), axis=2) > 45
+        item_rgb = _parse_color(item)
+        if item_rgb is not None:
+            # only this item's own ink colour counts: a padded box edge
+            # reaches into the neighbour element's glyphs (flatbg p04's
+            # yellow '接' sliver inside the white item's box), and raster
+            # re-printing foreign ink there is that element's business
+            ink = np.max(np.abs(crop.astype(np.int16)
+                                - np.array(item_rgb, np.int16)), axis=2) <= 45
+        else:
+            ink = np.max(np.abs(crop.astype(np.int16) - bg), axis=2) > 45
         kept[y0:y1, x0:x1][ink] = 1
     rasters = [e for e in elements
                if e.get('route') == 'raster_component' and 'component' in e]
@@ -2530,6 +2618,13 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
         if measured is not None:
             regions.append(measured)
     pale_seed = ((chroma >= 6) & (rgb.min(axis=2) >= 160)).astype(np.uint8)
+    if not preserve_backdrop:
+        # on a flat backdrop a pale region only exists where the ink differs
+        # from the page colour — otherwise cards a few RGB steps off the
+        # page (flatbg p03's (234,245,254) on (247,250,255)) merge into one
+        # page-sized blob whose averaged fill washes the card outlines out.
+        pale_seed &= (np.max(np.abs(rgb.astype(int) - bg.astype(int)),
+                             axis=2) >= 8).astype(np.uint8)
     pale_contours, _ = cv2.findContours(pale_seed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     for contour in pale_contours:
         area = cv2.contourArea(contour)
@@ -2737,7 +2832,8 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
             cleaned = rgb[ly, lx].copy()
             zone_text = text[ly, lx]
             kill = _preserve_straddling_marks(zone_text != 0,
-                                              rgb[ly, lx], zone_text)
+                                              rgb[ly, lx], zone_text,
+                                              items, (local_x, local_y))
             dev = np.max(np.abs(rgb[ly, lx].astype(int)
                                 - expected[ly, lx].astype(int)), axis=2)
             clean_mask = mask[ly, lx] & (kill | (dev > 16))
@@ -2872,7 +2968,10 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
     for contour in contours:
         area = cv2.contourArea(contour)
         x, y, rw, rh = cv2.boundingRect(contour)
-        if area < h*w*.015 or min(rw, rh) < 20:
+        if area < h*w*.015 or min(rw, rh) < 20 \
+                or (rw >= w - 8 and rh >= h - 8):
+            # a contour covering the page is the backdrop itself, not a frame —
+            # eroding it leaves no edge ring to measure a stroke from anyway.
             continue
         mask = np.zeros((h, w), np.uint8)
         cv2.drawContours(mask, [contour], -1, 255, -1)
@@ -3127,7 +3226,8 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
                     cv2.fillConvexPoly(opaque, hull, 255)
                 cleaning = (local_text != 0) & (opaque != 0)
                 cleaning = _preserve_straddling_marks(cleaning, patch_rgb,
-                                                      local_text)
+                                                      local_text, items,
+                                                      (x, y))
                 if surface is not None:
                     patch_rgb[cleaning] = surface[0][cleaning]
                 elif np.any(cleaning):
@@ -3139,7 +3239,8 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
                 dev = difference[y:bottom, x:right].astype(np.float32)
                 alpha = np.clip((dev - 8) * 255.0 / 40, 0, 255).astype(np.uint8)
                 kill = _preserve_straddling_marks(local_text != 0,
-                                                  patch_rgb, local_text)
+                                                  patch_rgb, local_text,
+                                                  items, (x, y))
                 alpha[kill] = 0
                 # Enclosed weak pixels belong to the object: a white cross on
                 # a near-white page scores dev<=~14 and would render as a
