@@ -773,6 +773,7 @@ def _add_native_shape(
             "rectangle": MSO_SHAPE.RECTANGLE,
             "rounded_rectangle": MSO_SHAPE.ROUNDED_RECTANGLE,
             "ellipse": MSO_SHAPE.OVAL,
+            "pentagon": MSO_SHAPE.PENTAGON,
         }
         if shape_type not in shape_types:
             raise ValueError(f"Unsupported native shape: {shape_type}")
@@ -825,6 +826,8 @@ def _add_native_shape(
     shape.rotation = payload.get('rotation', 0)
     if shape_type == 'rounded_rectangle' and 'corner_ratio' in payload:
         shape.adjustments[0] = payload['corner_ratio']
+    if shape_type == 'pentagon' and 'tip_ratio' in payload:
+        shape.adjustments[0] = payload['tip_ratio']
     if 'dash' in payload:
         from pptx.enum.dml import MSO_LINE_DASH_STYLE
         shape.line.dash_style = MSO_LINE_DASH_STYLE.DASH if payload['dash'] == 'dash' else MSO_LINE_DASH_STYLE.SOLID

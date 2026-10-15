@@ -15,7 +15,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from image2editable.shape_analysis import analyze_shape_candidate, _rounded_rectangle
+from image2editable.shape_analysis import analyze_shape_candidate, fit_fill_shape, _rounded_rectangle
 
 
 def _digest(path):
@@ -588,7 +588,7 @@ def _badge_column_masks(rgb, regions, cluster, x0, x1):
     return masks
 
 
-def _gutter_split_card_masks(rgb, text, regions=None):
+def _gutter_split_card_masks(rgb, text, regions=None, bg=None):
     h, w = rgb.shape[:2]
     gutters = _horizontal_gutters(rgb, text)
     if len(gutters) < 1:
@@ -612,6 +612,9 @@ def _gutter_split_card_masks(rgb, text, regions=None):
             cuts.append(mid)
     if int(pale_rows[-1]) - cuts[-1] >= max(24, h * .04):
         cuts.append(int(pale_rows[-1]))
+    gutter_px = np.concatenate(
+        [rgb[g[1]:g[3], x0:x1].reshape(-1, 3) for g in cluster])
+    gutter_color = np.median(gutter_px, axis=0)
     masks = []
     for top, bottom in zip(cuts, cuts[1:]):
         if bottom - top < max(24, h * .04):
@@ -619,6 +622,19 @@ def _gutter_split_card_masks(rgb, text, regions=None):
         inset_top, inset_bottom = top + 2, bottom - 2
         if inset_bottom - inset_top < 16 or chroma[inset_top:inset_bottom].mean() >= 28:
             continue
+        section = rgb[inset_top:inset_bottom, x0:x1].astype(np.int16)
+        fill_est = np.median(section.reshape(-1, 3), axis=0)
+        if bg is not None and np.max(np.abs(fill_est - np.asarray(bg, float))) < 8:
+            # the whole cut is bare page (run05 p05: a lone gutter above the
+            # capsule makes "first pale row → last pale row" one giant section
+            # whose median is the backdrop itself) — emitting it paints a
+            # bright rectangle over empty background.
+            continue
+        nearer_fill = np.max(np.abs(section - fill_est), axis=2)
+        nearer_gutter = np.max(
+            np.abs(section - gutter_color.astype(np.int16)), axis=2)
+        if np.mean(nearer_fill < nearer_gutter) < .55:
+            continue   # scattered content over page, not one coherent surface
         mask = np.zeros((h, w), np.uint8)
         mask[inset_top:inset_bottom, x0:x1] = 255
         masks.append(mask)
@@ -784,7 +800,7 @@ def _group_layout(elements, items, asset_dir, page_size, card_mode):
                                            and right <= b[2]+gap and bottom <= b[3]+gap))]
         return min(options, key=lambda item: (item[1][2]-item[1][0])*(item[1][3]-item[1][1]))[0] if options else None
     for element in elements:
-        if element.get('role') not in {'visual', 'line'}:
+        if element.get('role') not in {'visual', 'line', 'fill'}:
             continue
         box = bounds(element)
         group_id = owner(box, contained=True)
@@ -2668,7 +2684,7 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
             measured = _geometry(rgb, mask, text)
             if measured is not None:
                 regions.append(measured)
-        for mask in _gutter_split_card_masks(rgb, text, regions):
+        for mask in _gutter_split_card_masks(rgb, text, regions, bg=bg):
             measured = _geometry(rgb, mask, text)
             if measured is not None:
                 regions.append(measured)
@@ -3095,6 +3111,7 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
               & (emblem_mask == 0) & (unit_mask == 0)).astype(np.uint8)
     painted = [e for e in elements
                if e['route'] == 'native_shape' and e.get('shape', {}).get('fill_rgb')]
+    fill_residual = []
     for contour in sorted(cv2.findContours(subtle, cv2.RETR_EXTERNAL,
                                            cv2.CHAIN_APPROX_SIMPLE)[0],
                           key=cv2.contourArea, reverse=True):
@@ -3117,33 +3134,94 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
                   - np.percentile(px, 10, axis=0)).max()
         if spread > 12:
             continue                       # gradient or shadow, not a flat fill
+        block = mask[y:y + rh, x:x + rw] != 0
+        fit = fit_fill_shape(block, rgb, (x, y), fill)
+        if fit is None:
+            # no preset covers this silhouette — ship the exact pixels as a
+            # residual PNG rather than a shape whose outline disagrees with
+            # the source (the fill_shape audit measures that silhouette).
+            rgba = np.dstack(
+                (rgb[y:y + rh, x:x + rw],
+                 np.where(block & (subtle[y:y + rh, x:x + rw] != 0),
+                          255, 0).astype(np.uint8)))
+            fill_residual.append({'rgba': rgba, 'x': x, 'y': y,
+                                  'w': rw, 'h': rh, 'owned': False})
+            continue
         box = [x, y, x + rw, y + rh]
+        if 'ellipse_offset' in fit:
+            # a fragment recovered its full ellipse (an overdrawn line split
+            # the silhouette); emit at the fitted extent, not the fragment's.
+            ox0, oy0, ox1, oy1 = fit['ellipse_offset']
+            box = [max(0, x + ox0), max(0, y + oy0),
+                   min(w, x + ox1), min(h, y + oy1)]
+            rw, rh = box[2] - box[0], box[3] - box[1]
         host_z = 0.0
+        occluders = []
         for e in elements:
-            eb = e.get('bbox')
+            # raster components carry their own rect; their 'bbox' may be
+            # stale after frame-splitting carved a piece out of the band
+            if e.get('component'):
+                c = e['component']
+                eb = [c['x'], c['y'], c['x'] + c['w'], c['y'] + c['h']]
+            else:
+                eb = e.get('bbox')
             if not eb:
                 continue
             inter = (max(0, min(box[2], eb[2]) - max(box[0], eb[0]))
                      * max(0, min(box[3], eb[3]) - max(box[1], eb[1])))
-            if inter >= .9 * rw * rh:
-                host_z = max(host_z, e.get('z_index', 0))
-            elif (inter >= .6 * rw * rh and e['route'] == 'native_shape'
+            if (inter >= .6 * rw * rh and e['route'] == 'native_shape'
                     and e.get('shape', {}).get('fill_rgb') is not None
                     and max(abs(a - b) for a, b in zip(e['shape']['fill_rgb'], fill)) <= 14):
                 host_z = None            # a sibling shape already paints it
                 break
+            # only a containing native shape can host; a giant raster over
+            # the box is an occluder, not a surface to sit on
+            if (e['route'] == 'native_shape' and e.get('bbox') is not None
+                    and inter >= .9 * rw * rh):
+                host_z = max(host_z, e.get('z_index', 0))
+            elif inter > 0:
+                occluders.append(e)
         if host_z is None:
             continue
-        corner = _corner_radius(mask[y:y + rh, x:x + rw])
-        shape = {'shape_type': 'rounded_rectangle' if corner >= min(rw, rh) * .03
-                 else 'rectangle',
+        z = host_z + .01
+        for e in occluders:
+            ez = e.get('z_index', 0)
+            if ez < host_z:
+                continue
+            # the fitted box may extend past the mask under whatever covers
+            # the silhouette there (a rule line, an icon).  Read the source's
+            # own z-order: overlap pixels matching our fill mean we stay on
+            # top; anything else means that element occludes us.
+            if e.get('component'):
+                c = e['component']
+                eb = [c['x'], c['y'], c['x'] + c['w'], c['y'] + c['h']]
+            else:
+                eb = e['bbox']
+            ix0, iy0 = max(box[0], int(eb[0])), max(box[1], int(eb[1]))
+            ix1, iy1 = min(box[2], int(eb[2])), min(box[3], int(eb[3]))
+            ours = np.mean(np.max(np.abs(
+                rgb[iy0:iy1, ix0:ix1].astype(np.int16) - fill), axis=2) <= 14)
+            if ours < .5:
+                z = min(z, ez - .01)
+        shape = {'shape_type': fit['shape_type'],
                  'fill_rgb': fill.astype(int).tolist(), 'stroke_rgb': None,
                  'rotation': 0}
-        if shape['shape_type'] == 'rounded_rectangle':
-            shape['corner_ratio'] = min(.5, corner / min(rw, rh))
+        if fit['shape_type'] == 'rounded_rectangle':
+            corner = _corner_radius(mask[y:y + rh, x:x + rw])
+            if corner < min(rw, rh) * .03:
+                shape['shape_type'] = 'rectangle'
+            else:
+                shape['corner_ratio'] = min(.5, corner / min(rw, rh))
+        elif fit['shape_type'] == 'pentagon':
+            shape['tip_ratio'] = fit['tip_ratio']
+            if fit['tip_direction'] == 'left':
+                shape['rotation'] = 180
+        # role 'fill', not 'card': a fill must never root a card_group — a
+        # group paints at the end of the shape tree, which would lift the
+        # fill above unrelated bands/objects regardless of its z_index.
         elements.append({'object_id': f'fill_{len(elements):04d}',
-                         'route': 'native_shape', 'role': 'card',
-                         'z_index': host_z + .01, 'bbox': box, 'shape': shape})
+                         'route': 'native_shape', 'role': 'fill',
+                         'z_index': z, 'bbox': box, 'shape': shape})
     residual = (difference > 20).astype(np.uint8)
     residual[(emblem_mask | unit_mask) != 0] = 0
     if os.environ.get('LF_DEBUG_RESIDUAL'):
@@ -3271,6 +3349,7 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
     # card mask cannot hide its own fragments) then into an emitted visual
     # element (a dash under an icon rides the icon's PNG); isolated card-owned
     # slivers absorb into the card, isolated free slivers survive.
+    records += fill_residual
     residual_objects += _emit_residual(records, elements, asset_dir, difference,
                                        (h, w), text, items)
     residual_candidates = residual_objects
