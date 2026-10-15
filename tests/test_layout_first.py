@@ -1448,8 +1448,10 @@ def test_in_card_icon_halo_extracts_with_soft_alpha(tmp_path):
     slide, audit = prepare_layout(path, tmp_path / 'assets', text_items=[], card_mode='native')
     visuals = [e for e in slide['visual_elements'] if e.get('role') == 'visual']
     assert visuals
-    alpha = np.asarray(Image.open(visuals[0]['component']['path']))[..., 3]
-    assert np.count_nonzero((alpha > 32) & (alpha < 255)) > 0
+    assert any(np.count_nonzero(
+        (np.asarray(Image.open(v['component']['path']))[..., 3] > 32)
+        & (np.asarray(Image.open(v['component']['path']))[..., 3] < 255)) > 0
+        for v in visuals)
 
 
 def test_readable_glyph_in_unreadable_art_unit_is_suppressed(tmp_path):
@@ -2824,3 +2826,135 @@ def test_bany09_audit_i1_foreign_colour_ink_not_flagged(tmp_path):
     elements[0]['component'] = {'path': str(path2), 'x': 0, 'y': 0, 'w': 400, 'h': 120}
     audit = _audit_invariants(elements, items, (120, 400), src2)
     assert audit['i1'] == 1
+
+
+def test_bany09b_fit_fill_shape_picks_preset_or_returns_none():
+    # the silhouette fitter must name the nearest preset — pentagon, ellipse,
+    # rounded rectangle — and refuse (None -> PNG residual) when no preset
+    # covers a sparse irregular block.
+    from image2editable.shape_analysis import (
+        fit_fill_shape, _ellipse, _pentagon, _rounded_rectangle)
+    fit = fit_fill_shape(_pentagon(120, 470, 58, 'right'))
+    assert fit['shape_type'] == 'pentagon'
+    assert fit['tip_direction'] == 'right'
+    assert fit['tip_ratio'] == pytest.approx(58 / 120, abs=.04)
+    fit = fit_fill_shape(_pentagon(120, 470, 58, 'left'))
+    assert fit['shape_type'] == 'pentagon' and fit['tip_direction'] == 'left'
+    assert fit_fill_shape(_ellipse(140, 300))['shape_type'] == 'ellipse'
+    assert fit_fill_shape(_rounded_rectangle(200, 400, 40))['shape_type'] \
+        == 'rounded_rectangle'
+    lshape = np.zeros((200, 200), bool)
+    lshape[50:190, 40:90] = True
+    lshape[40:90, 40:170] = True
+    assert fit_fill_shape(lshape) is None
+
+
+def test_bany09b_flatbg_p05_nav_labels_emit_arrow_pentagons(tmp_path):
+    # flatbg p05's 02/03/04 navigation tags are homePlate pentagons — a
+    # straight-sided label with a pointed right tip (~half the height),
+    # not capsules.  The emitted native shape must keep that silhouette.
+    from image2editable.layout_first import prepare_layout
+    source, items = _bany06_fixture('flatbg', 5)
+    slide, _ = prepare_layout(source, tmp_path / 'assets', text_items=items,
+                              background_mode='source', label_reader=lambda *a, **k: ([], None))
+    navs = [e for e in slide['visual_elements']
+            if e.get('route') == 'native_shape'
+            and e['bbox'][1] < 200 and e['bbox'][0] > 2200
+            and e['bbox'][2] - e['bbox'][0] > 300]
+    assert len(navs) == 3, [e['object_id'] for e in navs]
+    for nav in navs:
+        assert nav['shape']['shape_type'] == 'pentagon'
+        assert nav['shape']['fill_rgb'] == pytest.approx([228, 236, 248], abs=6)
+        w_, h_ = nav['bbox'][2] - nav['bbox'][0], nav['bbox'][3] - nav['bbox'][1]
+        tip = nav['shape'].get('tip_ratio', 0) * min(w_, h_)
+        assert tip == pytest.approx(58, abs=10)
+
+
+def test_bany09b_flatbg_p03_shadows_and_circle_emit_ellipses(tmp_path):
+    # flatbg p03: the two icon drop shadows are icon-occluded silhouettes —
+    # they may emit as an ellipse or fall back to a PNG residual, never a
+    # rectangle/rounded-rectangle whose outline contradicts the source.  The
+    # top-right decoration is a circle whose dome/cap the page border line
+    # split apart; it must emit as one native ellipse spanning both.
+    from image2editable.layout_first import prepare_layout
+    source, items = _bany06_fixture('flatbg', 3)
+    slide, _ = prepare_layout(source, tmp_path / 'assets', text_items=items,
+                              background_mode='source', label_reader=lambda *a, **k: ([], None))
+    spots = [(337, 1150, 784, 1220), (1237, 1163, 1696, 1220)]
+    for sx0, sy0, sx1, sy1 in spots:
+        # a shape sized like the shadow itself must not be a box — only an
+        # ellipse may claim that footprint; anything else is PNG fallback.
+        near = [e for e in slide['visual_elements']
+                if e.get('route') == 'native_shape'
+                and abs(e['bbox'][0] - sx0) < 60 and abs(e['bbox'][1] - sy0) < 60
+                and abs(e['bbox'][2] - sx1) < 60 and abs(e['bbox'][3] - sy1) < 60]
+        assert all(e['shape'].get('shape_type') == 'ellipse' for e in near), \
+            [(e['object_id'], e['shape']['shape_type']) for e in near]
+        painted = [e for e in slide['visual_elements']
+                   if e['route'] in ('native_shape', 'raster_component')
+                   and (lambda eb: eb and
+                        (max(0, min(eb[2], sx1) - max(eb[0], sx0))
+                         * max(0, min(eb[3], sy1) - max(eb[1], sy0)))
+                        > .3 * (sx1 - sx0) * (sy1 - sy0))(
+                       e.get('bbox') or ([e['component'][k] for k in ('x', 'y')]
+                                         + [e['component']['x'] + e['component']['w'],
+                                            e['component']['y'] + e['component']['h']]
+                                         if e.get('component') else None))]
+        assert painted, f'nothing paints the shadow near {sx0},{sy0}'
+    deco = [e for e in slide['visual_elements']
+            if e.get('route') == 'native_shape'
+            and e['shape'].get('shape_type') == 'ellipse'
+            and abs(e['bbox'][0] - 3544) < 30 and abs(e['bbox'][1] - 82) < 30
+            and abs(e['bbox'][2] - 3778) < 30 and abs(e['bbox'][3] - 315) < 30]
+    assert len(deco) == 1, [e['object_id'] for e in deco]
+
+
+def test_bany09b_run04_p05_bottom_emptiness_is_not_a_card(tmp_path):
+    # run04/run05 p05: below the last pale gutter the page is mostly empty
+    # (the capsule banner + bottom strip only occupy ~1/3).  Emitting the
+    # whole low-chroma section as one giant rect paints a bright rectangle
+    # over empty page — fill_shape [870,1600,2006,557].
+    from image2editable.layout_first import prepare_layout
+    source, items = _bany06_fixture('run04', 5)
+    slide, _ = prepare_layout(source, tmp_path / 'assets', text_items=items,
+                              background_mode='source', label_reader=lambda *a, **k: ([], None))
+    offenders = [e for e in slide['visual_elements']
+                 if e.get('route') == 'native_shape'
+                 and e['bbox'][3] - e['bbox'][1] > 300
+                 and e['bbox'][1] >= 1500 and e['bbox'][3] >= 2100]
+    assert not offenders, [(e['object_id'], e['bbox']) for e in offenders]
+
+
+def test_bany09b_png2_p03_shadows_emit_ellipses(tmp_path):
+    # png2 p03 shares the template: the icon shadows must never emit a
+    # rectangle/rounded-rectangle over their crescent silhouette, and the
+    # line-split right-edge decoration is one ellipse.
+    from image2editable.layout_first import prepare_layout
+    source, items = _bany06_fixture('png2', 3)
+    slide, _ = prepare_layout(source, tmp_path / 'assets', text_items=items,
+                              background_mode='source', label_reader=lambda *a, **k: ([], None))
+    spots = [(337, 1150, 784, 1220), (1237, 1163, 1696, 1220)]
+    for sx0, sy0, sx1, sy1 in spots:
+        near = [e for e in slide['visual_elements']
+                if e.get('route') == 'native_shape'
+                and abs(e['bbox'][0] - sx0) < 60 and abs(e['bbox'][1] - sy0) < 60
+                and abs(e['bbox'][2] - sx1) < 60 and abs(e['bbox'][3] - sy1) < 60]
+        assert all(e['shape'].get('shape_type') == 'ellipse' for e in near), \
+            [(e['object_id'], e['shape']['shape_type']) for e in near]
+        painted = [e for e in slide['visual_elements']
+                   if e['route'] in ('native_shape', 'raster_component')
+                   and (lambda eb: eb and
+                        (max(0, min(eb[2], sx1) - max(eb[0], sx0))
+                         * max(0, min(eb[3], sy1) - max(eb[1], sy0)))
+                        > .3 * (sx1 - sx0) * (sy1 - sy0))(
+                       e.get('bbox') or ([e['component'][k] for k in ('x', 'y')]
+                                         + [e['component']['x'] + e['component']['w'],
+                                            e['component']['y'] + e['component']['h']]
+                                         if e.get('component') else None))]
+        assert painted, f'nothing paints the shadow near {sx0},{sy0}'
+    deco = [e for e in slide['visual_elements']
+            if e.get('route') == 'native_shape'
+            and e['shape'].get('shape_type') == 'ellipse'
+            and abs(e['bbox'][0] - 3544) < 30 and abs(e['bbox'][1] - 82) < 30
+            and abs(e['bbox'][2] - 3778) < 30 and abs(e['bbox'][3] - 315) < 30]
+    assert len(deco) == 1, [e['object_id'] for e in deco]

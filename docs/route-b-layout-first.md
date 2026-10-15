@@ -28,13 +28,34 @@ All pixel geometry below is in the 3840×2160 source frame unless noted.
   On preserved backdrops the filter is skipped: photographic backgrounds
   have no single `bg` to compare against.
 - **Boundaries**: cards whose fill is within 8 of the page colour still
-  cannot be recovered by this channel (they are genuinely invisible). The
-  channel emits bounding shapes only — contour-fitted shapes (ellipse,
-  circle, arrow pentagon) are a separate follow-up (B-any-09 item 2,
-  deferred until the `fill_shape` detector lands in B-gen-10).
+  cannot be recovered by this channel (they are genuinely invisible).
+  Which preset shape a pale/subtle block emits is decided separately —
+  see *Fill contour emission* below.
 - **Tests**: `test_bany09_flatbg_p03_pale_cards_emit_fills`,
   `test_dark_card_with_painted_light_content_is_still_a_card`,
   `test_disconnected_icon_on_pale_panel_is_one_faithful_png`.
+
+### Gutter-split card column (`_gutter_split_card_masks`)
+
+- **Problem**: near-white card columns separated by pale horizontal
+  gutters emit one card per interval ("first pale row → each gutter
+  mid → last pale row"). A lone gutter turns the interval into one giant
+  section spanning bare page under the real content — run04/run05 p05
+  emitted a bright `[870,1600,2876,2157]` rectangle over the mostly
+  empty area beneath the capsule banner (`fill_shape` flag).
+- **Rule**: every cut section is verified against two references — the
+  gutter bands' own median colour (what separates cards is page showing
+  through) and the page `bg`. A section whose interior median is within
+  `8` of `bg` is bare page, not a card, and is skipped; a section where
+  `< .55` of pixels sit nearer its own median than the gutter colour is
+  scattered content over page, not one coherent surface. (Threshold 8
+  mirrors `pale_seed`'s page-colour margin; `.55` matches the
+  contour fill-ratio floor used by the subtle-fill pass.)
+- **Boundaries**: a real card whose fill is within 8 of the page colour
+  would also be dropped — it is indistinguishable from page anyway. The
+  check only gates the fallback section path; badge-column masks from
+  `_badge_column_masks` (2+ badge regions) are unaffected.
+- **Test**: `test_bany09b_run04_p05_bottom_emptiness_is_not_a_card`.
 
 ### Page-covering contours
 
@@ -46,6 +67,77 @@ All pixel geometry below is in the 3840×2160 source frame unless noted.
   `h >= page_h-8` are skipped. Separately, `_geometry` falls back to
   sampling the silhouette's own ink when the eroded edge ring is empty.
 - **Test**: `test_bany09_run04_p01_no_page_sized_frame`.
+
+### Fill contour emission (`fit_fill_shape`)
+
+- **Problem** (B-any-09b): subtle-fill blocks (`5 < deviation <= 20`,
+  pale icon underlays/nav labels/decorations) used to emit as
+  `rectangle`/`rounded_rectangle` on the contour's bounding box whatever
+  the silhouette. flatbg p05's 02/03/04 navigation tags are arrow
+  pentagons and flatbg/png2 p03's right-edge decoration is a circle —
+  boxes over those outlines trip the `fill_shape` audit (B-gen-10
+  `19b7aff`: edge-band silhouette IoU `< .70` plus global `< .97`
+  between the nearer-fill-vs-local-bg masks of source and render inside
+  the padded element box).
+- **Rule**: `fit_fill_shape(mask, rgb, origin, fill_rgb)` scores the
+  block mask against prototypes — `rectangle` (IoU = fill ratio),
+  `rounded_rectangle` (radius sweep via `_best_rounded`), `ellipse`
+  (inscribed), `pentagon` (homePlate; tip-length sweep
+  `4 .. min(h-1, (w-1)//2)`, both directions).
+  - Winner `>= .95` → emit that preset. `pentagon`/`ellipse` must beat
+    the box family by `.015`/`.02` — a chamfered rectangle is not a
+    point (the nav labels score `.999` vs `.94` boxes).
+  - Winner `< .95` → the mask may be an occluded fragment;
+    `_refit_ellipse` iteratively re-fits the contour boundary (4 rounds,
+    radial-residual trim `<= .10`, points riding the crop edge excluded
+    as clip artifacts; needs `>= .60` boundary inlier and `>= .97`
+    mask-inside coverage). The recovered ellipse's *grown* region must
+    still read as the same fill in the source (`>= .60` of grown pixels
+    within 14 of `fill_rgb`) — a shallow arc fits arbitrarily large
+    circles, so extension is accepted only where the page already
+    carries the tint. The emitted box is the fitted ellipse's tight
+    bounds (flatbg p03's line-split circle lands at `[3544,82,3778,315]`
+    from a 137-px dome fragment).
+  - Recovery failed → emit the argmax only when the mask is mostly solid
+    (`fill >= .85` and score `>= .75`); otherwise `None`.
+- **PNG fallback**: a `None` fit becomes a raster record (alpha = the
+  exact subtle-seed pixels, RGB verbatim) flowing through
+  `_emit_residual` like any residual — the render reproduces the source
+  silhouette pixel-for-pixel even though nothing native claims it. This
+  is the spec'd behaviour: "拟合不上就回退成 PNG 残差，不要发错形状".
+- **Grown-fill z-order**: a fill emitted past its own mask could cover
+  whatever occludes the silhouette. Each partially-overlapping element
+  is sampled in the source: overlap pixels matching our fill (`<=14`)
+  keep the fill on top; otherwise the fill caps below that element
+  (`z = min(host+.01, occluder_z−.01)`) — the border line still draws
+  over the deco circle, the icon over its shadow.
+- **Grouping is not z-order (B-any-09b lesson)**: `object_groups` are
+  appended to the slide tree *after* all loose shapes, so a group paints
+  above every ungrouped element regardless of `z_index`. A fill must
+  therefore never carry `role='card'`/`'frame'`: `_group_layout` turns
+  every such element into its own `card_group` root, and a lone-fill
+  group floating at the tail of `spTree` paints over the band fragment
+  it was capped below (`fill_*` covering the p03 border line read as a
+  `lost` defect). Fills emit with `role='fill'`; `owner()` adopts them
+  into a host card group when fully contained (in-group order follows
+  `z_index`, so the fill still sits just above its host surface), and
+  uncontained fills stay loose at their computed `z`. For the same
+  reason occluder/hosts are read from `component` rects when present —
+  a `*_frame_*` piece's inherited `bbox` is the pre-split bounds — and
+  only a `native_shape` may host (a large raster containing the box is
+  an occluder, not a surface).
+- **Pentagon in PPTX**: `shape_type='pentagon'` maps to OOXML
+  `homePlate`; `tip_ratio` (tip length / min side) writes
+  `adjustments[0]`; left-pointing emits `rotation=180`.
+- **Boundaries**: non-elliptical occluded silhouettes (the p03 icon
+  shadows — crescent arcs under icon bodies) cannot be recovered and
+  stay PNG residual; a grown region covered by occluder ink fails the
+  source check by design. `fill_shape=0` is still reached there because
+  the PNG paints the exact silhouette.
+- **Tests**: `test_bany09b_fit_fill_shape_picks_preset_or_returns_none`,
+  `test_bany09b_flatbg_p05_nav_labels_emit_arrow_pentagons`,
+  `test_bany09b_flatbg_p03_shadows_and_circle_emit_ellipses`,
+  `test_bany09b_png2_p03_shadows_emit_ellipses`.
 
 ## Text items
 
