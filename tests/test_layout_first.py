@@ -2958,3 +2958,115 @@ def test_bany09b_png2_p03_shadows_emit_ellipses(tmp_path):
             and abs(e['bbox'][0] - 3544) < 30 and abs(e['bbox'][1] - 82) < 30
             and abs(e['bbox'][2] - 3778) < 30 and abs(e['bbox'][3] - 315) < 30]
     assert len(deco) == 1, [e['object_id'] for e in deco]
+
+
+# B-any-09c: the four icon drop shadows on p03 are whole ellipses partially
+# covered by their icons.  Expected extents measured from the source images
+# (widest seed row / deepest seed column; ±40 tolerance covers AA wobble).
+_BANY09C_SHADOWS = {
+    1: ([337, 1138, 784, 1222], [225, 239, 254]),
+    2: ([1237, 1124, 1696, 1222], [225, 239, 254]),
+    3: ([2160, 1122, 2600, 1207], [19, 80, 200]),
+    4: ([3059, 1146, 3514, 1231], [225, 239, 254]),
+}
+
+
+def _element_paints_shadow(element, fill_rgb, page):
+    """Boolean page mask: where this element renders approximately the fill."""
+    painted = np.zeros(page, bool)
+    if element.get('route') == 'native_shape':
+        x0, y0, x1, y1 = (int(v) for v in element['bbox'])
+        fill = element['shape'].get('fill_rgb')
+        if fill is None or max(abs(a - b) for a, b in zip(fill, fill_rgb)) > 8:
+            return painted
+        if element['shape'].get('shape_type') == 'ellipse':
+            footprint = np.zeros(page, np.uint8)
+            cv2.ellipse(footprint, ((x0 + x1) // 2, (y0 + y1) // 2),
+                        ((x1 - x0) // 2, (y1 - y0) // 2), 0, 0, 360, 1, -1)
+            painted |= footprint.astype(bool)
+        else:
+            painted[y0:y1, x0:x1] = True
+        return painted
+    comp = element.get('component')
+    if comp is None:
+        return painted
+    with Image.open(comp['path']) as image:
+        rgba = np.asarray(image.convert('RGBA')).astype(int)
+    hits = (rgba[:, :, 3] >= 128) \
+        & (np.abs(rgba[:, :, :3] - np.asarray(fill_rgb)).max(axis=2) <= 8)
+    painted[comp['y']:comp['y'] + comp['h'], comp['x']:comp['x'] + comp['w']] = hits
+    return painted
+
+
+@pytest.mark.parametrize('kind', ['png2', 'flatbg'])
+def test_bany09c_p03_icon_shadows_render_as_occluded_ellipses(kind, tmp_path):
+    # Each icon shadow is a flat ellipse partly hidden under its icon.  The
+    # render must reproduce it everywhere it is visible in the source — a
+    # native ellipse below the icon (preferred) or verbatim PNG pixels —
+    # with no straight clip edge along the icon's bounding box.
+    from image2editable.layout_first import prepare_layout
+    source, items = _bany06_fixture(kind, 3)
+    slide, _ = prepare_layout(source, tmp_path / 'assets', text_items=items,
+                              background_mode='source',
+                              label_reader=lambda *a, **k: ([], None))
+    rgb = np.asarray(Image.open(source).convert('RGB')).astype(int)
+    h, w = rgb.shape[:2]
+    for index, ((sx0, sy0, sx1, sy1), fill_rgb) in _BANY09C_SHADOWS.items():
+        # 1. a native ellipse claims the shadow footprint
+        ellipses = [e for e in slide['visual_elements']
+                    if e.get('route') == 'native_shape'
+                    and e.get('shape', {}).get('shape_type') == 'ellipse'
+                    and abs(e['bbox'][0] - sx0) < 40 and abs(e['bbox'][1] - sy0) < 40
+                    and abs(e['bbox'][2] - sx1) < 40 and abs(e['bbox'][3] - sy1) < 40]
+        assert ellipses, f'{kind} icon{index}: no ellipse near {[sx0, sy0, sx1, sy1]}'
+        fill_el = min(ellipses,
+                      key=lambda e: abs(e['bbox'][0] - sx0) + abs(e['bbox'][1] - sy0))
+        assert fill_el['shape']['fill_rgb'] == pytest.approx(fill_rgb, abs=6)
+        # 2. it sits below every raster element whose ink enters the ellipse
+        ex0, ey0, ex1, ey1 = (int(v) for v in fill_el['bbox'])
+        for other in slide['visual_elements']:
+            if other is fill_el or other.get('route') != 'raster_component':
+                continue
+            comp = other.get('component')
+            if comp is None:
+                continue
+            if not (comp['x'] < ex1 and comp['x'] + comp['w'] > ex0
+                    and comp['y'] < ey1 and comp['y'] + comp['h'] > ey0):
+                continue
+            with Image.open(comp['path']) as image:
+                alpha = np.asarray(image.convert('RGBA'))[:, :, 3]
+            ix0, iy0 = max(ex0, comp['x']), max(ey0, comp['y'])
+            ix1, iy1 = min(ex1, comp['x'] + comp['w']), min(ey1, comp['y'] + comp['h'])
+            sub = alpha[iy0 - comp['y']:iy1 - comp['y'],
+                        ix0 - comp['x']:ix1 - comp['x']]
+            if (sub >= 128).sum() < 20:
+                continue
+            assert other['z_index'] > fill_el['z_index'], \
+                f'{kind} icon{index}: {other["object_id"]} occludes shadow ' \
+                f'but z {other["z_index"]} <= fill z {fill_el["z_index"]}'
+        # 3. every source pixel that reads as the shadow is painted as such —
+        #    row-wise, so a straight clip edge (a band of unpainted shadow
+        #    between two painted zones) fails.
+        zone = rgb[sy0:sy1, sx0:sx1]
+        src_shadow = np.abs(zone - np.asarray(fill_rgb)).max(axis=2) <= 8
+        painted = np.zeros((sy1 - sy0, sx1 - sx0), bool)
+        for element in slide['visual_elements']:
+            eb = element.get('bbox')
+            if eb and not (eb[0] < sx1 and eb[2] > sx0 and eb[1] < sy1 and eb[3] > sy0):
+                continue
+            pmap = _element_paints_shadow(element, fill_rgb, (h, w))
+            painted |= pmap[sy0:sy1, sx0:sx1]
+        covered = painted & src_shadow
+        assert covered.sum() >= src_shadow.sum() * .9, \
+            f'{kind} icon{index}: shadow pixels painted {covered.sum()}/{src_shadow.sum()}'
+        # wide rows are the shadow's body — a straight clip edge leaves them
+        # unpainted; the outer ~3px rim is AA territory a fitted ellipse can
+        # legitimately miss by a pixel or two, so narrow rows don't count.
+        wide = src_shadow.sum(axis=1).max() * .3
+        for row in range(src_shadow.shape[0]):
+            n = src_shadow[row].sum()
+            if n < wide:
+                continue
+            assert covered[row].sum() >= n * .8, \
+                f'{kind} icon{index}: row {sy0 + row} paints ' \
+                f'{covered[row].sum()}/{n} shadow px (clip edge?)'

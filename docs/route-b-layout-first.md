@@ -90,14 +90,17 @@ All pixel geometry below is in the 3840×2160 source frame unless noted.
   - Winner `< .95` → the mask may be an occluded fragment;
     `_refit_ellipse` iteratively re-fits the contour boundary (4 rounds,
     radial-residual trim `<= .10`, points riding the crop edge excluded
-    as clip artifacts; needs `>= .60` boundary inlier and `>= .97`
+    as clip artifacts; needs `>= .60` boundary inlier and `>= .90`
     mask-inside coverage). The recovered ellipse's *grown* region must
     still read as the same fill in the source (`>= .60` of grown pixels
     within 14 of `fill_rgb`) — a shallow arc fits arbitrarily large
     circles, so extension is accepted only where the page already
     carries the tint. The emitted box is the fitted ellipse's tight
     bounds (flatbg p03's line-split circle lands at `[3544,82,3778,315]`
-    from a 137-px dome fragment).
+    from a 137-px dome fragment). Silhouette pixels the ellipse cannot
+    explain (up to `1 - coverage`) come back as `residue` and ship as a
+    verbatim PNG next to the shape — a foreign sliver welded into the
+    same contour is preserved instead of dropped.
   - Recovery failed → emit the argmax only when the mask is mostly solid
     (`fill >= .85` and score `>= .75`); otherwise `None`.
 - **PNG fallback**: a `None` fit becomes a raster record (alpha = the
@@ -129,15 +132,60 @@ All pixel geometry below is in the 3840×2160 source frame unless noted.
 - **Pentagon in PPTX**: `shape_type='pentagon'` maps to OOXML
   `homePlate`; `tip_ratio` (tip length / min side) writes
   `adjustments[0]`; left-pointing emits `rotation=180`.
-- **Boundaries**: non-elliptical occluded silhouettes (the p03 icon
-  shadows — crescent arcs under icon bodies) cannot be recovered and
-  stay PNG residual; a grown region covered by occluder ink fails the
-  source check by design. `fill_shape=0` is still reached there because
-  the PNG paints the exact silhouette.
+- **Occluded fills (B-any-09c)**: an element drawn over a fill — an icon
+  on its drop shadow, a rule across a decoration — splits the subtle
+  seed into fragments that used to lose twice: the unit's dev-ramp
+  alpha (`alpha > 0` for `dev >= 9`) swallowed the seed pixels it sat
+  on, and the surviving fragments failed the `.55` fill-ratio floor or
+  the `.60` boundary-inlier check because most of their boundary traced
+  the occluder, not the ellipse.
+  - **Seeds**: `unit_solid` excludes only opaque unit ink
+    (`alpha >= 128`) from `subtle`; faint dev-ramp pixels still seed —
+    their colour is the surface's, not the unit's.
+  - **Occluder map**: `unit_mask | emblem_mask | text | dev>20`.  Where
+    a silhouette's interior is interrupted by occluder pixels they no
+    longer count against the zone check; where grown pixels land on
+    occluder ink they are exempt from the source-colour check (the
+    extension is hidden there either way) — but `< 50` checkable grown
+    pixels still rejects an unverifiable ellipse.
+  - **Fragment joining**: same-fill (`<= 8` per channel) pieces whose
+    gap corridor is `>= 60%` occluder ink merge into one silhouette
+    before fitting — `bridge = max(24, 2% page width)`.  A lone piece
+    below the `.55` fill-ratio floor only earns a fit when `>= 20%` of
+    its boundary hugs occluder ink; standalone blobs still drop.
+  - **Boundary pool**: `_refit_ellipse` fits on *all* pieces' outlines
+    minus points within ~3 px of occluder ink — those trace the
+    occluder's outline, not the ellipse's.  With `< 20` free points the
+    piece is too buried to recover and falls back to PNG.
+  - **Emission**: the recovered ellipse emits at its fitted extent
+    (`ellipse_offset`), z sits at `host_z + .01` under every raster —
+    the icon paints over it by construction.  If no preset or refit
+    covers the silhouette the piece(s) ship as verbatim PNG of the full
+    seed — never clipped to an occluder's bbox.
+  - **Sibling-vs-host**: a containing `role='card'` shape whose fill is
+    within 14 of ours is the *host*, not a same-colour duplicate — the
+    early "sibling already paints it" bail now only fires for non-card
+    roles, so a pale shadow on a near-pale card still emits.
+  - **Redundancy**: the post-pass drop of raster-covered fills now
+    measures *foreign* opaque pixels (colour differs `> 14`) for the
+    `.55` burial check and adds a separate `.85` verbatim-coverage drop
+    — a fill whose box is already painted the same colour by an opaque
+    raster (a card-face PNG) is redundant and still drops, while an
+    ellipse mostly under icon ink survives.
+- **Boundaries**: occluded *ellipses* recover; other occluded
+  silhouettes fall back to verbatim PNG of the whole seed region.
+  Recovery requires the fragment's free boundary to constrain the
+  ellipse — `>= 20` non-occluder-adjacent contour points — and the
+  visible grown ring to verify the fill colour; a shadow buried under
+  nearly-opaque art or with an arbitrary outline stays PNG.
 - **Tests**: `test_bany09b_fit_fill_shape_picks_preset_or_returns_none`,
   `test_bany09b_flatbg_p05_nav_labels_emit_arrow_pentagons`,
   `test_bany09b_flatbg_p03_shadows_and_circle_emit_ellipses`,
-  `test_bany09b_png2_p03_shadows_emit_ellipses`.
+  `test_bany09b_png2_p03_shadows_emit_ellipses`,
+  `test_bany09c_p03_icon_shadows_render_as_occluded_ellipses` (both
+  `png2` and `flatbg`; asserts native ellipse per icon shadow, z below
+  the occluding raster, and row-wise verbatim coverage so a straight
+  clip edge fails).
 
 ## Text items
 
