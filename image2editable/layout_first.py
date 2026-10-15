@@ -2870,8 +2870,11 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
                     item['rotation_degrees'] = region['rotation']
     # suppressed text units and unread series rows emit one unit PNG per slot so
     # "01" is a single movable object and digit ink never reaches the residual
-    # pass where it could weld into the icon below.
+    # pass where it could weld into the icon below.  unit_solid tracks only
+    # opaque ink: the dev-ramp alpha fades a unit's edge into its surface and
+    # those faint pixels still belong to whatever fill lies underneath.
     unit_mask = visual_mask.copy()
+    unit_solid = visual_mask.copy()
     for index, (px, py, pw, ph, mask) in enumerate(panel_specs, 1):
         path = asset_dir / f'icon_panel_{index:04d}.png'
         Image.fromarray(np.dstack((rgb[py:py+ph, px:px+pw], mask))).save(path)
@@ -2932,6 +2935,7 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
                          'component': {'path': str(path), 'x': ux0 + bx0, 'y': uy0 + by0,
                                        'w': bx1 - bx0, 'h': by1 - by0}})
         unit_mask[uy0:uy1, ux0:ux1][alpha != 0] = 255
+        unit_solid[uy0:uy1, ux0:ux1][alpha >= 128] = 255
     # Full-width coherent bands (header rules, accent strips) emit as one
     # raster strip each.  The pale-line pass below would otherwise shred a
     # band into per-edge 1px lines while the residual pass fragments its core;
@@ -3108,24 +3112,45 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
     # emits as a native fill shape drawn immediately above its containing
     # element (or just over the backdrop) and below all content.
     subtle = ((difference > 5) & (difference <= 20) & (text == 0)
-              & (emblem_mask == 0) & (unit_mask == 0)).astype(np.uint8)
+              & (emblem_mask == 0) & (unit_solid == 0)).astype(np.uint8)
+    # ink that legitimately sits on top of a fill — unit/emblem art, text,
+    # strong residual content.  A silhouette interrupted by occluder pixels
+    # is one shape seen through them, not several shapes.
+    occluder = ((unit_mask != 0) | (emblem_mask != 0) | (text != 0)
+                | (difference > 20))
+    _dbg_subtle = os.environ.get('LF_DEBUG_SUBTLE')
+    if _dbg_subtle:
+        _dbg_dir = Path(_dbg_subtle)
+        _dbg_dir.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(_dbg_dir / 'subtle.npz', subtle=subtle,
+                            unit_mask=unit_mask, unit_solid=unit_solid,
+                            emblem_mask=emblem_mask, occluder=occluder.astype(np.uint8),
+                            difference=difference, text=text.astype(np.uint8),
+                            expected=expected.astype(np.int16))
     painted = [e for e in elements
                if e['route'] == 'native_shape' and e.get('shape', {}).get('fill_rgb')]
     fill_residual = []
+    # gather subtle contours as silhouette pieces; an icon or rule drawn over
+    # one fill splits its seed into several contours that only fit together.
+    pieces = []
+    min_dim = max(16, round(h * .008))
     for contour in sorted(cv2.findContours(subtle, cv2.RETR_EXTERNAL,
                                            cv2.CHAIN_APPROX_SIMPLE)[0],
                           key=cv2.contourArea, reverse=True):
         area = cv2.contourArea(contour)
-        if area < h * w * .0008 or area > h * w * .45:
+        if area < h * w * .0004 or area > h * w * .45:
             continue
         x, y, rw, rh = cv2.boundingRect(contour)
-        if min(rw, rh) < max(16, round(h * .008)) or area < rw * rh * .55:
-            continue                       # thin strips and blobby shapes
+        if min(rw, rh) < min_dim:
+            continue                       # thin strips never fill
         mask = np.zeros((h, w), np.uint8)
         cv2.drawContours(mask, [contour], -1, 255, -1)
         zone = mask != 0
-        if np.count_nonzero(zone & (subtle == 0)) > np.count_nonzero(zone) * .55:
-            continue                       # mostly non-fill inside the contour
+        # the interior must be fill — or ink sitting on top of it; occluder
+        # pixels inside a fragmented silhouette are expected, not foreign
+        if np.count_nonzero(zone & (subtle == 0) & ~occluder) \
+                > np.count_nonzero(zone) * .55:
+            continue
         px = rgb[zone & (subtle != 0)]
         if not len(px):
             continue
@@ -3134,18 +3159,105 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
                   - np.percentile(px, 10, axis=0)).max()
         if spread > 12:
             continue                       # gradient or shadow, not a flat fill
-        block = mask[y:y + rh, x:x + rw] != 0
-        fit = fit_fill_shape(block, rgb, (x, y), fill)
+        pieces.append({'area': area, 'mask': zone, 'fill': fill,
+                       'x': x, 'y': y, 'w': rw, 'h': rh})
+    # union-find pieces whose gap corridor is mostly occluder ink into one
+    # silhouette — same fill colour on both sides, nothing else between.
+    bridge = max(24, round(w * .02))
+    near = np.ones((5, 5), np.uint8)
+    occ_dilated = cv2.dilate(occluder.astype(np.uint8), near, iterations=2) != 0
+    parent = list(range(len(pieces)))
+
+    def _root(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for ai in range(len(pieces)):
+        for bi in range(ai + 1, len(pieces)):
+            a, b = pieces[ai], pieces[bi]
+            if np.abs(a['fill'] - b['fill']).max() > 8:
+                continue
+            gap = max(b['x'] - a['x'] - a['w'], a['x'] - b['x'] - b['w'],
+                      b['y'] - a['y'] - a['h'], a['y'] - b['y'] - b['h'], 0)
+            if gap > bridge:
+                continue
+            # corridor: where the two pieces' dilation fronts meet.  If most
+            # of it is occluder ink the split is explained by the overdrawn
+            # element; clean surface between them means two separate fills.
+            wx0 = max(0, min(a['x'], b['x']) - bridge)
+            wy0 = max(0, min(a['y'], b['y']) - bridge)
+            wx1 = min(w, max(a['x'] + a['w'], b['x'] + b['w']) + bridge)
+            wy1 = min(h, max(a['y'] + a['h'], b['y'] + b['h']) + bridge)
+            steps = max(1, bridge // 4)
+            front_a = cv2.dilate(a['mask'][wy0:wy1, wx0:wx1].astype(np.uint8),
+                                 near, iterations=steps) != 0
+            front_b = cv2.dilate(b['mask'][wy0:wy1, wx0:wx1].astype(np.uint8),
+                                 near, iterations=steps) != 0
+            corridor = front_a & front_b \
+                & ~a['mask'][wy0:wy1, wx0:wx1] & ~b['mask'][wy0:wy1, wx0:wx1]
+            count = np.count_nonzero(corridor)
+            if count >= 40 and np.count_nonzero(
+                    corridor & occluder[wy0:wy1, wx0:wx1]) >= count * .6:
+                parent[_root(ai)] = _root(bi)
+    clusters = {}
+    for i, piece in enumerate(pieces):
+        clusters.setdefault(_root(i), []).append(piece)
+    for cluster in clusters.values():
+        if len(cluster) > 1:
+            zone = np.zeros((h, w), bool)
+            for piece in cluster:
+                zone |= piece['mask']
+            x = min(p['x'] for p in cluster)
+            y = min(p['y'] for p in cluster)
+            rw = max(p['x'] + p['w'] for p in cluster) - x
+            rh = max(p['y'] + p['h'] for p in cluster) - y
+            area = sum(p['area'] for p in cluster)
+            if area < h * w * .0008:
+                continue                   # even joined it is a speck
+            fill = np.median(np.concatenate(
+                [rgb[p['mask'] & (subtle != 0)] for p in cluster]), axis=0)
+            mask = zone
+        else:
+            piece = cluster[0]
+            zone, fill = piece['mask'], piece['fill']
+            x, y, rw, rh, area = (piece['x'], piece['y'], piece['w'],
+                                  piece['h'], piece['area'])
+            if area < h * w * .0008:
+                continue
+            mask = zone
+            if area < rw * rh * .55:
+                # below the fill-ratio floor a lone silhouette only earns a
+                # fit when its edge hugs occluder ink — a fragment of a
+                # bigger fill the icon cut away; standalone blobs stay dropped
+                edge = mask.astype(np.uint8) - cv2.erode(
+                    mask.astype(np.uint8), np.ones((3, 3), np.uint8))
+                flanked = (np.count_nonzero(edge.astype(bool) & occ_dilated)
+                           >= np.count_nonzero(edge) * .2)
+                if not flanked:
+                    continue               # blobby shape, not a fill — drop
+        block = mask[y:y + rh, x:x + rw]
+        fit = fit_fill_shape(block, rgb, (x, y), fill, occluder=occluder)
+        if _dbg_subtle:
+            np.savez_compressed(
+                Path(_dbg_subtle) / f'contour_{x}_{y}_{rw}x{rh}.npz',
+                block=block, fill=fill,
+                fit=json.dumps(fit, default=str))
         if fit is None:
             # no preset covers this silhouette — ship the exact pixels as a
             # residual PNG rather than a shape whose outline disagrees with
             # the source (the fill_shape audit measures that silhouette).
-            rgba = np.dstack(
-                (rgb[y:y + rh, x:x + rw],
-                 np.where(block & (subtle[y:y + rh, x:x + rw] != 0),
-                          255, 0).astype(np.uint8)))
-            fill_residual.append({'rgba': rgba, 'x': x, 'y': y,
-                                  'w': rw, 'h': rh, 'owned': False})
+            for piece in cluster:
+                cx, cy, cw, ch = (piece['x'], piece['y'],
+                                  piece['w'], piece['h'])
+                rgba = np.dstack(
+                    (rgb[cy:cy + ch, cx:cx + cw],
+                     np.where(piece['mask'][cy:cy + ch, cx:cx + cw]
+                              & (subtle[cy:cy + ch, cx:cx + cw] != 0),
+                              255, 0).astype(np.uint8)))
+                fill_residual.append({'rgba': rgba, 'x': cx, 'y': cy,
+                                      'w': cw, 'h': ch, 'owned': False})
             continue
         box = [x, y, x + rw, y + rh]
         if 'ellipse_offset' in fit:
@@ -3155,6 +3267,26 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
             box = [max(0, x + ox0), max(0, y + oy0),
                    min(w, x + ox1), min(h, y + oy1)]
             rw, rh = box[2] - box[0], box[3] - box[1]
+            residue = fit.get('residue')
+            if residue is not None and residue.any():
+                # seed pixels the ellipse cannot explain (a foreign sliver
+                # sharing the contour) ship as their own verbatim PNG
+                cx0, cy0 = fit['canvas_offset']
+                rys, rxs = np.nonzero(residue)
+                pys, pxs = rys + y + cy0, rxs + x + cx0
+                in_page = (pys >= 0) & (pys < h) & (pxs >= 0) & (pxs < w)
+                pys, pxs = pys[in_page], pxs[in_page]
+                seeded = subtle[pys, pxs] != 0
+                pys, pxs = pys[seeded], pxs[seeded]
+                if len(pxs) >= 200:
+                    bx0, bx1 = int(pxs.min()), int(pxs.max()) + 1
+                    by0, by1 = int(pys.min()), int(pys.max()) + 1
+                    alpha = np.zeros((by1 - by0, bx1 - bx0), np.uint8)
+                    alpha[pys - by0, pxs - bx0] = 255
+                    rgba = np.dstack((rgb[by0:by1, bx0:bx1], alpha))
+                    fill_residual.append({'rgba': rgba, 'x': bx0, 'y': by0,
+                                          'w': bx1 - bx0, 'h': by1 - by0,
+                                          'owned': False})
         host_z = 0.0
         occluders = []
         for e in elements:
@@ -3170,6 +3302,7 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
             inter = (max(0, min(box[2], eb[2]) - max(box[0], eb[0]))
                      * max(0, min(box[3], eb[3]) - max(box[1], eb[1])))
             if (inter >= .6 * rw * rh and e['route'] == 'native_shape'
+                    and e.get('role') != 'card'
                     and e.get('shape', {}).get('fill_rgb') is not None
                     and max(abs(a - b) for a, b in zip(e['shape']['fill_rgb'], fill)) <= 14):
                 host_z = None            # a sibling shape already paints it
@@ -3356,21 +3489,37 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
     # A subtle fill is invisible where emitted raster art already paints the
     # same surface (png-mode cards carry their own pale face) — the shape then
     # only double-covers the PNG and trips I3.  Drop fills whose area is
-    # mostly covered by opaque residual pixels.
-    opaque_zone = np.zeros((h, w), bool)
-    for e in elements:
-        c = e.get('component')
-        if c is None:
-            continue
-        with Image.open(c['path']) as image:
-            a = np.asarray(image.convert('RGBA'))[:, :, 3]
-        opaque_zone[c['y']:c['y'] + c['h'], c['x']:c['x'] + c['w']] |= a > 128
+    # mostly FOREIGN opaque pixels (ink in another colour buries it) or whose
+    # pixels are nearly all already painted verbatim by an opaque raster
+    # (the shape adds nothing).  Same-colour pixels inside a partial occluder
+    # — a unit that baked in the shadow it sits on — do neither.
     for e in list(elements):
         if not e['object_id'].startswith('fill_'):
             continue
         fx0, fy0, fx1, fy1 = (round(v) for v in e['bbox'])
         area = max(1, (fy1 - fy0) * (fx1 - fx0))
-        if np.count_nonzero(opaque_zone[fy0:fy1, fx0:fx1]) > .55 * area:
+        fill_rgb = np.asarray(e['shape']['fill_rgb'])
+        foreign = np.zeros((fy1 - fy0, fx1 - fx0), bool)
+        verbatim = np.zeros((fy1 - fy0, fx1 - fx0), bool)
+        for other in elements:
+            if other is e:
+                continue
+            c = other.get('component')
+            if c is None:
+                continue
+            ix0, iy0 = max(fx0, c['x']), max(fy0, c['y'])
+            ix1, iy1 = min(fx1, c['x'] + c['w']), min(fy1, c['y'] + c['h'])
+            if ix1 <= ix0 or iy1 <= iy0:
+                continue
+            with Image.open(c['path']) as image:
+                rgba = np.asarray(image.convert('RGBA')).astype(np.int16)
+            sub = rgba[iy0 - c['y']:iy1 - c['y'], ix0 - c['x']:ix1 - c['x']]
+            solid = sub[:, :, 3] > 128
+            same = np.abs(sub[:, :, :3] - fill_rgb).max(axis=2) <= 14
+            foreign[iy0 - fy0:iy1 - fy0, ix0 - fx0:ix1 - fx0] |= solid & ~same
+            verbatim[iy0 - fy0:iy1 - fy0, ix0 - fx0:ix1 - fx0] |= solid & same
+        if np.count_nonzero(foreign) > .55 * area \
+                or np.count_nonzero(verbatim) > .85 * area:
             elements.remove(e)
     for fragment in list(elements):
         c = fragment.get('component')

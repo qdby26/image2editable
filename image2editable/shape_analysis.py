@@ -166,20 +166,28 @@ def _best_pentagon(mask: np.ndarray) -> tuple[float, int, str] | None:
     return best if best[0] > 0 else None
 
 
-def _refit_ellipse(mask: np.ndarray) -> dict | None:
+def _refit_ellipse(
+    mask: np.ndarray, occluder: np.ndarray | None = None
+) -> dict | None:
     """Recover a full ellipse from a partially occluded silhouette.
 
     A contour split by an overdrawn line or clipped under an icon keeps only
     the visible boundary on its true outline; points riding the crop's own
-    edges are clip artifacts, not shape edges.  Iterative fitEllipse with
-    radial-residual trimming drops whatever occlusion edges remain.
+    edges are clip artifacts, not shape edges, and — when ``occluder`` is
+    given — points hugging occluding ink trace the occluder's outline, not
+    the ellipse's.  Iterative fitEllipse with radial-residual trimming drops
+    whatever occlusion edges remain.
     """
     contours, _ = cv2.findContours(
         mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
     )
     if not contours:
         return None
-    points = max(contours, key=cv2.contourArea).reshape(-1, 2).astype(np.float32)
+    # every piece's outline contributes: a mask joined from occluder-split
+    # fragments carries more than the largest contour's boundary
+    points = np.concatenate(
+        [contour.reshape(-1, 2) for contour in contours]
+    ).astype(np.float32)
     if len(points) < 40:
         return None
     height, width = mask.shape
@@ -189,7 +197,20 @@ def _refit_ellipse(mask: np.ndarray) -> dict | None:
         | (points[:, 1] <= 2)
         | (points[:, 1] >= height - 3)
     )
-    pool = points[~on_edge] if np.count_nonzero(~on_edge) >= 20 else points
+    free = ~on_edge
+    if occluder is not None:
+        near_ink = cv2.dilate(
+            occluder.astype(np.uint8), np.ones((7, 7), np.uint8)
+        ) != 0
+        free &= ~near_ink[
+            np.clip(points[:, 1].astype(int), 0, height - 1),
+            np.clip(points[:, 0].astype(int), 0, width - 1),
+        ]
+    pool = points[free]
+    if len(pool) < 20:
+        # too little exposed boundary to pin an ellipse — whatever ink covers
+        # this silhouette decides its apparent outline, not geometry
+        return None
     inliers = np.ones(len(pool), bool)
     ellipse = None
     for _ in range(4):
@@ -238,8 +259,11 @@ def _refit_ellipse(mask: np.ndarray) -> dict | None:
     inside = canvas.astype(bool)
     observed = placed.astype(bool)
     coverage = np.count_nonzero(inside & observed) / np.count_nonzero(observed)
-    if coverage < 0.97:
+    if coverage < 0.90:
         return None
+    # silhouette pixels the ellipse cannot explain (a foreign sliver welded
+    # into the same contour) are returned for verbatim PNG emission — the
+    # caller ships them instead of dropping or mis-shaping them.
     outline = cv2.ellipse2Poly(
         (int(round(cx)), int(round(cy))),
         (int(round(d1 / 2)), int(round(d2 / 2))),
@@ -255,6 +279,7 @@ def _refit_ellipse(mask: np.ndarray) -> dict | None:
         "ellipse_offset": [int(ex), int(ey), int(ex + ew), int(ey + eh)],
         "canvas_offset": [int(x0), int(y0)],
         "grown": (inside & ~observed).astype(np.uint8),
+        "residue": (observed & ~inside).astype(np.uint8),
     }
 
 
@@ -263,6 +288,7 @@ def fit_fill_shape(
     rgb: np.ndarray | None = None,
     origin: tuple[int, int] | None = None,
     fill_rgb: np.ndarray | None = None,
+    occluder: np.ndarray | None = None,
 ) -> dict | None:
     """Fit one filled-block silhouette to the nearest native preset shape.
 
@@ -277,6 +303,10 @@ def fit_fill_shape(
     still read as the same fill colour in the source — pass ``rgb`` (the
     full page), ``origin`` (the crop's x, y on the page) and ``fill_rgb``
     to enable that check; without them a recovered ellipse is rejected.
+    ``occluder`` (a page-sized mask of ink that legitimately sits on top —
+    icon/text/residual art) exempts grown pixels from that colour check and
+    excludes occluder-hugging boundary points from the fit itself, since
+    they trace the occluder's outline rather than the ellipse's.
     """
     binary = np.asarray(mask) != 0
     if binary.ndim != 2 or not np.any(binary) or min(binary.shape) < 8:
@@ -321,24 +351,40 @@ def fit_fill_shape(
     # An imperfect silhouette may be a fragment of a bigger shape — an
     # ellipse split by an overdrawn line or clipped under an icon keeps only
     # the visible boundary on its true outline.  Try to recover it.
-    recovered = _refit_ellipse(binary)
+    occ_crop = None
+    if occluder is not None and origin is not None:
+        occ_crop = (
+            np.asarray(occluder)[
+                origin[1] : origin[1] + height, origin[0] : origin[0] + width
+            ]
+            != 0
+        )
+    recovered = _refit_ellipse(binary, occ_crop)
     if recovered is not None:
         if rgb is None or origin is None or fill_rgb is None:
             return None   # unverifiable extension — keep the PNG residual
         # verify the grown region reads as this fill in the source — a
         # shallow arc alone fits arbitrarily large circles, so only accept
-        # the extension where the page already carries the tint.
-        cx0, cy0 = recovered.pop("canvas_offset")
-        grown = recovered.pop("grown")
+        # the extension where the page already carries the tint.  Pixels
+        # sitting under occluder ink are exempt: the extension is hidden
+        # there either way.
+        cx0, cy0 = recovered["canvas_offset"]
+        grown = recovered["grown"]
         ys, xs = np.nonzero(grown)
         ys = ys + origin[1] + cy0
         xs = xs + origin[0] + cx0
         in_page = (ys >= 0) & (ys < rgb.shape[0]) & (xs >= 0) & (xs < rgb.shape[1])
         if not np.count_nonzero(in_page):
             return None
-        px = rgb[ys[in_page], xs[in_page]].astype(np.int16)
-        near = np.mean(np.max(np.abs(px - np.asarray(fill_rgb)), axis=1) <= 14)
-        return recovered if near >= 0.6 else None
+        gx, gy = xs[in_page], ys[in_page]
+        px = rgb[gy, gx].astype(np.int16)
+        near = np.max(np.abs(px - np.asarray(fill_rgb)), axis=1) <= 14
+        if occluder is not None:
+            checkable = np.asarray(occluder)[gy, gx] == 0
+            if np.count_nonzero(checkable) < 50:
+                return None   # extension almost fully hidden — unverifiable
+            near = near[checkable]
+        return recovered if np.mean(near) >= 0.6 else None
     # no ellipse recovery: a solid but imperfect block (a card with an inner
     # pill hole scores ~.89) still wants its closest preset; sparse alien
     # silhouettes earn the PNG residual fallback.
