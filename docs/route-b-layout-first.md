@@ -1,0 +1,225 @@
+# Route B — layout-first reconstruction rules
+
+`image2editable.layout_first` converts a slide image into editable PPTX
+elements: native text items, native fill shapes (cards/frames/lines), and
+raster PNG components for whatever cannot be expressed natively. This file
+lists the rules that govern those decisions, in the order they run. Each
+entry states what problem the rule solves, its trigger and thresholds, its
+known boundaries, and the fixture/test that pins it.
+
+All pixel geometry below is in the 3840×2160 source frame unless noted.
+
+## Region detection
+
+### Pale-region seed (`pale_seed`)
+
+- **Problem**: pale tinted cards (a few RGB steps off the page colour) carry
+  no strong chroma edge, so they are invisible to saturated-component
+  detection and disappear into the page.
+- **Trigger**: `chroma >= 6` (max−min channel) and `min(r,g,b) >= 160`.
+  Contours are kept when `area >= 1.5%` of the page and at least 65% of the
+  filled contour is seed pixels; geometry is then measured by `_geometry`.
+- **Flat-backdrop restriction** (added in B-any-09): when the page is not a
+  preserved photographic backdrop (`background_mode` resolves flat), seed
+  pixels must additionally differ from the page colour `bg` by `>= 8` on the
+  max-channel distance. Without it, cards like flatbg p03's (234,245,254) on
+  a (247,250,255) page seed together with the page interior and produce one
+  page-sized pale contour whose averaged fill washes every card outline out.
+  On preserved backdrops the filter is skipped: photographic backgrounds
+  have no single `bg` to compare against.
+- **Boundaries**: cards whose fill is within 8 of the page colour still
+  cannot be recovered by this channel (they are genuinely invisible). The
+  channel emits bounding shapes only — contour-fitted shapes (ellipse,
+  circle, arrow pentagon) are a separate follow-up (B-any-09 item 2,
+  deferred until the `fill_shape` detector lands in B-gen-10).
+- **Tests**: `test_bany09_flatbg_p03_pale_cards_emit_fills`,
+  `test_dark_card_with_painted_light_content_is_still_a_card`,
+  `test_disconnected_icon_on_pale_panel_is_one_faithful_png`.
+
+### Page-covering contours
+
+- **Problem**: a pale/saturated contour that fills the page edge-to-edge is
+  the backdrop itself; emitting it as a frame adds a spurious full-page
+  stroke and its eroded "edge ring" is empty, so `stroke_rgb` would be
+  sampled from nothing (`NaN` → `RGBColor` crash in the assembler).
+- **Trigger**: outline/frame candidates with `w >= page_w-8` and
+  `h >= page_h-8` are skipped. Separately, `_geometry` falls back to
+  sampling the silhouette's own ink when the eroded edge ring is empty.
+- **Test**: `test_bany09_run04_p01_no_page_sized_frame`.
+
+## Text items
+
+### Mixed-colour line split and `measured_ink_box`
+
+- **Problem**: one OCR line frequently mixes colours (white lead-in, yellow
+  highlight). A single item cannot be both colours, so the line is split
+  into per-colour children; each child's box starts as the span of its OCR
+  words, which includes word-box padding into the neighbour's ink.
+- **Trigger**: children ending in `：`/`:` get a font fit
+  (`match_text_face`); when the fit succeeds and the own-colour ink covers
+  a plausible share of the crop (`0 < ink.mean() < .5`, height `>= 30%` of
+  the crop), the child's box is replaced by that ink's bounding box
+  (`box_kind='ink'`); `measured_ink_box` is promoted into `item['box']`
+  right before element emission. Non-colon children keep their word-span
+  box.
+- **Boundaries**: the ink-box path only runs for colon-ending children and
+  only when font matching succeeds. Word-span boxes still carry OCR
+  padding (see I1 for how the invariant treats foreign ink inside them).
+- **Tests**: `test_mixed_color_line_split_keeps_glyph_with_own_color`,
+  `test_refine_trims_overlapping_padding_without_deleting_words`,
+  `test_refine_trims_misread_tail_overlapping_next_prefix`,
+  `test_split_color_label_refits_its_own_weight`.
+
+### Unit suppression (`_suppress_mixed_unit_text`, `_free_glyph_units`)
+
+- **Problem**: a compact text unit that is partially unread (the "%" beside
+  a read "70"), or a slot label repeated across sibling cards where OCR
+  read only some instances, looks wrong as half-native text — the unread
+  piece stays raster while the read piece renders natively, with visibly
+  different weight. Such units go to raster whole (`unit_*` PNG).
+- **Trigger (partial-unit)**: a same-colour ink component (median colour
+  within 40 of the item colour) inside the item's host region, height
+  within `[0.45, 2.2]×` the item height, vertical overlap `>= 40%`, and
+  horizontal gap `<= 1.5×` item height. Long sentence-shaped items
+  (`width > 6× height`) or items containing sentence punctuation
+  `，。；！？,;!?` are never suppressed — a stray glyph beside a sentence
+  must not rasterize the sentence.
+- **Trigger (sibling series)**: same slot on `>= 2` sibling cards with
+  matching element-vs-surface polarity; when some slots are unread the
+  whole series goes raster for visual consistency.
+- **Boundaries**: suppression is the conservative path — the raster is
+  pixel-faithful, so a false suppression costs editability, not fidelity.
+- **Tests**: `test_sibling_card_series_suppresses_read_digit_when_others_unread`,
+  `test_inverted_highlight_card_keeps_series_membership`,
+  `test_long_sentence_with_unread_glyph_stays_native`,
+  `test_sentence_with_terminal_punctuation_is_not_a_compact_series`.
+
+## Raster emission
+
+### `_preserve_straddling_marks` — closed-shape carve-out and the tail-punctuation exception
+
+- **Problem**: when ink under a text box is cleaned out of a raster
+  component, components that straddle the text-mask edge get clipped in
+  half — a closed ring (a seal, a bullet) left with its inner half erased
+  renders as a broken arc. Originally, any *closed* component straddling
+  the mask edge was un-cleaned entirely, so the PNG kept it whole.
+- **Rewritten rule (B-any-09)**: a closed component still survives whole
+  only when the live text does not already draw it. When an item's text
+  begins or ends with a punctuation character (`。，、；：？！…·—～「」『』
+  （）《》〈〉.,;:!?%)]}'"` and ASCII equivalents), a small dark component
+  (max dimension `<= 1.5×` item height) sitting at the corresponding box
+  edge — tail punctuation: centre within `[x1-1.2h, x1+1.0h] ×
+  [y1-1.4h, y1+0.4h]`; head punctuation mirrored — is that glyph's own
+  source ink. The whole component joins `cleaning`, expanded to include
+  the anti-aliased halo: the component is regrown at a lighter threshold
+  (`max channel < 224`) and accepted when the regrown blob stays compact
+  (`<= 8×` the core's area, max dimension `<= 1.8×` item height) so a
+  halo welded into a border line does not drag the line into cleaning.
+  After a regrowth is accepted, the padded component bbox (`+2px`) is
+  swept once more for faint specks (`160 <= max channel < 245`, i.e. not
+  themselves part of the `<160` dark mask) — the ring's outermost AA is
+  a separate component at every threshold — and those join `cleaning`
+  too. Dark `<160` pixels are never swept, so a neighbouring glyph's
+  core ink cannot be erased by the sweep.
+- **Required statement**: ink covered by the text mask at a
+  punctuation-tail position is drawn by the native text; the PNG erases
+  the whole component, halo included. run04 p04's `佩戴。` is the pinned
+  case — the small circle after 戴 is the `。` glyph itself, and keeping
+  it produced `。。` on render.
+- **B-any-08 misdiagnosis (recorded per review)**: that round classified
+  the same circle as an unrelated hollow ring `◯` and kept it under the
+  closed-shape rule, while a detector-side change ("near-exact same-size
+  pairing preferred" + shifted suppression) then suppressed the
+  `extra_glyph` the defect produced. Both parts were wrong: the circle is
+  the source `。`, and hiding the report in `fast_defects.py` masked a
+  real duplication. The engine-side rule was rewritten as above; the
+  detector changes were reverted by B-gen-10.
+- **Boundaries**: open strokes straddling the mask edge still clip
+  cleanly (never preserved — their in-box ink would be a raster re-print
+  over live text). Non-punctuation head/tail neighbours keep the original
+  closed-component survival. Rotated items are not punctuation twins.
+- **Tests**: `test_bany09_tail_punct_twin_is_erased_not_preserved`,
+  `test_bany09_run04_p04_baked_tail_period_is_gone`,
+  `test_tail_punctuation_context_merges_without_repeating_glyph`.
+
+### Residual merge compositing (`_emit_residual` `_overlay`)
+
+- **Problem**: small residual records are merged into shared PNGs. The old
+  merge wrote `rec*alpha + dst*(1-alpha)` over a transparent-black canvas,
+  which premultiplies semi-transparent source colours onto black —
+  a ~47%-alpha light-blue edge sliver landed as a grey `(≈101,110,117)`
+  pixel, rendering as short grey dashes on run04 p02's border lines.
+- **Rule**: source-over compositing. `out_a = sa + da·(1−sa)`; RGB
+  accumulates premultiplied (`rec·sa + dst·da·(1−sa)`) and is divided by
+  `out_a` before store, so a fragment keeps its own colour at union alpha.
+- **Boundaries**: merging is paint-order only; it does not decide whether
+  a fragment should exist at all.
+- **Tests**: `test_bany09_residual_merge_keeps_partial_alpha_colour`,
+  `test_bany09_run04_p02_no_fabricated_dark_in_card_gap`.
+
+## Card and frame geometry
+
+### Border-band stroke placement (`_border_band_centre`)
+
+- **Problem**: a card border's drawn stroke centres on the shape edge, but
+  the detected mask edge can sit a few px off the true ink band
+  (antialiased skirt) or inside it. Placing the stroke on the mask edge
+  leaves the source band half-uncovered.
+- **Trigger**: for each of the four edges, take the row/column of
+  border-coverage counts; the contiguous covered run straddling the edge
+  (followed at most `cap` px both ways) gives the band centre and width.
+  The stroke is placed on that centre; when no covered run touches the
+  edge the caller keeps its fallback placement.
+- **Boundaries**: the run must stay within `cap` of the mask edge — a
+  parallel line farther away (a neighbouring card's border) is not
+  captured. Returns `None` on empty coverage.
+- **Tests**: `test_frame_stroke_width_is_measured_from_pixels`,
+  `test_full_width_band_emits_one_strip_not_lines`,
+  `test_card_frame_chain_never_swallows_its_host_card`.
+
+### Emission order (group z-order)
+
+- **Rule**: regions emit largest-mask-first, ties by x (`sorted(regions,
+  key=(-count_nonzero(mask), bbox[0]))`), so page-wide surfaces and host
+  cards land under the smaller elements they contain; `_group_layout`
+  sorts nested elements the same way when it groups card contents.
+- **Tests**: `test_nested_card_surface_never_seeds_outer_unit`,
+  `test_wide_outlined_card_is_not_an_endpointless_native_line`.
+
+## Invariant audit (`_audit_invariants`)
+
+Self-audit emitted per page into `page_audit_*.json → invariants`:
+
+- **I1** — raster opaque ink must not sit on a live text item's glyph
+  strokes. The kept zone is the item box padded by `max(2, 6% of box
+  height)`; inside it, the item's *own* ink colour (`±45` per channel of
+  the item's parsed `color`; falls back to "any pixel differing from the
+  local background median by >45" when the item has no parseable colour)
+  defines the glyph region. A raster pixel counts only when it is opaque,
+  inside the kept zone, and within `±45` of the source pixel colour —
+  a solid underlay behind native text is legitimate and not flagged.
+  Violation when the count exceeds `max(32, 1% of the element's alpha)`.
+  - *B-any-09 refinement*: kept ink is the item's own colour only.
+    Previously any non-background pixel counted, so a neighbour element's
+    differently-coloured glyph protruding into the padded box edge
+    (flatbg p04: the yellow `接触性出血` unit's first strokes 8px left of
+    its OCR box, inside the white item's box) was misread as the white
+    item's glyphs being re-printed. Foreign-colour ink is that element's
+    own business; I1 is about duplicated *text*.
+- **I2** — a raster component's placed box contains an item's box either
+  almost wholly or not at all: partial containment
+  (`2% < intersection/item_area < 90%`) is a violation.
+- **I3** — no element twice: raster-vs-card mutual coverage `>50%` where
+  the raster is dedupe-equal to the card, or a PNG whose opaque pixels are
+  `>50%` covered by another PNG's opaque pixels.
+- **Tests**: `test_audit_i1_solid_underlay_not_flagged`,
+  `test_audit_i1_reprinted_glyph_flagged`,
+  `test_bany09_audit_i1_foreign_colour_ink_not_flagged`,
+  `test_audit_does_not_call_foreign_icon_a_duplicate_card`.
+
+## Fixtures
+
+`tests/fixtures/bany06/` holds the source PNG + OCR JSON pairs the rules
+above are pinned against (`flatbg-p0*`, `png2-p0*`, `run01-p0*`,
+`run04-p0*`). PNGs are binary fixtures — added with `git add -f` when the
+repo ignores `*.png`.

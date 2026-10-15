@@ -67,6 +67,7 @@ Thumbs.db
 !docs/
 docs/*
 !docs/route-c.md
+!docs/route-b-layout-first.md
 !docs/images/
 docs/images/*
 !docs/images/*.png

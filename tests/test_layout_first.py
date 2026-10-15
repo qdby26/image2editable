@@ -2637,3 +2637,190 @@ def test_text_color_picks_dominant_ink_over_foreign_fringe():
     color = sample_text_color(region)
     actual = tuple(int(color[i:i + 2], 16) for i in (1, 3, 5))
     assert actual == pytest.approx((255, 217, 23), abs=30)
+
+
+# ---------------------------------------------------------------------------
+# B-any-09: tail-glyph twins, pale-card fill recovery, residual compositing
+# ---------------------------------------------------------------------------
+
+
+def test_bany09_tail_punct_twin_is_erased_not_preserved():
+    from image2editable.layout_first import _preserve_straddling_marks
+    # run04 p04: the source '。' of '接触血液体液时佩戴。' straddles the frame's
+    # right edge (ink x~3089-3108, box ends 3095).  It is the glyph the native
+    # text redraws — not a neighbour decoration — so the whole component must
+    # go to cleaning or it double-prints as '。。'.
+    zone = np.full((60, 140, 3), 235, np.uint8)
+    text = np.zeros((60, 140), np.uint8)
+    text[8:52, 8:102] = 255                       # mask ≈ item box dilated +2
+    cv2.circle(zone, (96, 30), 10, (40, 40, 120), 3)   # '。' ink x86..106
+    ring = ((np.indices(zone.shape[:2])[1] - 96) ** 2
+            + (np.indices(zone.shape[:2])[0] - 30) ** 2 <= 196)
+    ring_comp = ring & (zone.max(axis=2) < 160)
+    cleaning = text != 0
+    items = [{'text': '……佩戴。', 'box': [0, 8, 100, 44]}]
+    kept = _preserve_straddling_marks(
+        cleaning.copy(), zone, text, items, (0, 0))
+    # every ring pixel joins the clean set — text repaints it, not the PNG
+    assert np.all(kept[ring_comp])
+    # same geometry but the line ends in a hanzi: the ring is a neighbour
+    # mark with no text to redraw it, so it survives whole as before
+    kept = _preserve_straddling_marks(
+        cleaning.copy(), zone, text,
+        [{'text': '……佩戴', 'box': [0, 8, 100, 44]}], (0, 0))
+    assert not np.any(kept & ring_comp)
+
+
+def test_bany09_run04_p04_baked_tail_period_is_gone(tmp_path):
+    from image2editable.layout_first import prepare_layout
+    source, items = _bany06_fixture('run04', 4)
+    slide, _ = prepare_layout(source, tmp_path / 'assets', text_items=items,
+                              background_mode='source',
+                              label_reader=lambda *a, **k: ([], None))
+    texts = [it['text'] for it in slide['text_items']]
+    assert '接触血液体液时佩戴。' in texts
+    assert '喷溅风险操作时佩戴。' in texts
+    # the zones hold only the source '。' rings, so any dark ink a PNG still
+    # carries there is the baked glyph — it would re-print beside the live
+    # text's own period and render as '。。'
+    for element in slide['visual_elements']:
+        c = element.get('component')
+        if not c:
+            continue
+        for x0, y0, x1, y1 in ((3080, 1145, 3140, 1190),
+                               (3085, 1845, 3140, 1915)):
+            ix0, iy0 = max(x0, c['x']), max(y0, c['y'])
+            ix1, iy1 = min(x1, c['x'] + c['w']), min(y1, c['y'] + c['h'])
+            if ix1 <= ix0 or iy1 <= iy0:
+                continue
+            rgba = np.asarray(Image.open(c['path']).convert('RGBA'))
+            zone = rgba[iy0 - c['y']:iy1 - c['y'], ix0 - c['x']:ix1 - c['x']]
+            baked = (zone[:, :, :3].max(axis=2) < 200) & (zone[:, :, 3] > 100)
+            assert not np.any(baked), \
+                (element['object_id'], int(baked.sum()))
+
+
+def test_bany09_run04_p01_no_page_sized_frame(tmp_path):
+    from image2editable.layout_first import prepare_layout
+    source, items = _bany06_fixture('run04', 1)
+    slide, _ = prepare_layout(source, tmp_path / 'assets', text_items=items,
+                              background_mode='source',
+                              label_reader=lambda *a, **k: ([], None))
+    for element in slide['visual_elements']:
+        shape = element.get('shape') or {}
+        stroke = shape.get('stroke_rgb')
+        if stroke is not None:
+            assert all(isinstance(v, int) and 0 <= v <= 255 for v in stroke), \
+                (element['object_id'], stroke)
+        if element.get('role') == 'frame':
+            x0, y0, x1, y1 = element['bbox']
+            assert not (x1 - x0 >= 3830 and y1 - y0 >= 2150), \
+                element['object_id']
+
+
+def test_bany09_flatbg_p03_pale_cards_emit_fills(tmp_path):
+    from image2editable.layout_first import prepare_layout
+    source, items = _bany06_fixture('flatbg', 3)
+    slide, _ = prepare_layout(source, tmp_path / 'assets', text_items=items,
+                              background_mode='source',
+                              label_reader=lambda *a, **k: ([], None))
+    fills = [e for e in slide['visual_elements']
+             if e['route'] == 'native_shape' and e.get('shape', {}).get('fill_rgb')]
+    # the three pale case cards (01/02/04) must keep their (234,245,254)
+    # fill against the (247,250,255) page — outlines stay visible.  A shape
+    # qualifies only when its own bbox hugs the card: the old page-sized
+    # pale blob merely *covers* every card and averages the contrast away.
+    for cx0, cy0, cx1, cy1 in ((137, 499, 984, 1684), (1044, 499, 1886, 1690),
+                              (2872, 499, 3709, 1695)):
+        hit = next((e for e in fills
+                    if max(abs(e['bbox'][0] - cx0), abs(e['bbox'][2] - cx1),
+                           abs(e['bbox'][1] - cy0), abs(e['bbox'][3] - cy1)) <= 90
+                    and max(abs(a - b) for a, b in zip(
+                        e['shape']['fill_rgb'], (234, 245, 254))) <= 8), None)
+        assert hit is not None, \
+            (cx0, [(e['bbox'], e['shape'].get('fill_rgb')) for e in fills])
+
+
+def test_bany09_run04_p02_no_fabricated_dark_in_card_gap(tmp_path):
+    from image2editable.layout_first import prepare_layout
+    source, items = _bany06_fixture('run04', 2)
+    slide, _ = prepare_layout(source, tmp_path / 'assets', text_items=items,
+                              background_mode='source',
+                              label_reader=lambda *a, **k: ([], None))
+    # the source strip between the two cards holds only light-blue ink —
+    # every dark pixel a PNG carries there is a compositing artefact that
+    # renders as a grey dash over the border lines
+    for x0, y0, x1, y1 in ((300, 1596, 3680, 1610), (300, 1636, 3680, 1652)):
+        for element in slide['visual_elements']:
+            c = element.get('component')
+            if not c:
+                continue
+            ix0, iy0 = max(x0, c['x']), max(y0, c['y'])
+            ix1, iy1 = min(x1, c['x'] + c['w']), min(y1, c['y'] + c['h'])
+            if ix1 <= ix0 or iy1 <= iy0:
+                continue
+            rgba = np.asarray(Image.open(c['path']).convert('RGBA'))
+            zone = rgba[iy0 - c['y']:iy1 - c['y'], ix0 - c['x']:ix1 - c['x']]
+            dark = (zone[:, :, :3].max(axis=2) < 160) & (zone[:, :, 3] > 100)
+            assert not np.any(dark), \
+                (element['object_id'], int(dark.sum()))
+
+
+def test_bany09_residual_merge_keeps_partial_alpha_colour(tmp_path):
+    # run04 p02: the between-cards strip absorbed anti-aliased line-edge
+    # fragments whose ~50% alpha was blended onto the empty canvas as
+    # colour*alpha — a premultiplied grey that rendered as dashes on the
+    # border lines.  A merge must composite properly: the fragment keeps
+    # its own colour under union alpha.
+    from image2editable.layout_first import _emit_residual
+    difference = np.zeros((600, 800), np.uint8)
+    text = np.zeros((600, 800), np.uint8)
+    host = np.zeros((100, 200, 4), np.uint8)
+    host[20:60, 20:180] = (240, 246, 252, 255)         # opaque strip core
+    frag = np.zeros((20, 20, 4), np.uint8)
+    frag[5:15, 5:15] = (214, 234, 247, 120)            # half-alpha edge sliver
+    records = [
+        {'rgba': host, 'x': 100, 'y': 100, 'w': 200, 'h': 100, 'owned': False},
+        # inside the host's box but over its transparent corner — where the
+        # old formula premultiplied the colour onto rgb 0
+        {'rgba': frag, 'x': 130, 'y': 170, 'w': 20, 'h': 20, 'owned': False},
+    ]
+    elements = []
+    _emit_residual(records, elements, tmp_path, difference, (600, 800), text, [])
+    assert len(elements) == 1
+    merged = np.asarray(Image.open(elements[0]['component']['path']))
+    px = merged[80, 40]
+    assert px[:3].tolist() == pytest.approx([214, 234, 247], abs=2)
+    assert px[3] >= 119
+
+
+def test_bany09_audit_i1_foreign_colour_ink_not_flagged(tmp_path):
+    # flatbg p04: the suppressed yellow '接触性出血' unit's first glyph pokes
+    # 8 px left of its OCR box, inside the white '思考：面对这位' item's box
+    # edge.  That ink is the neighbour element's own — I1 must only fire on
+    # raster re-printing the item's *own* glyph colour, otherwise every
+    # boundary-straddling foreign glyph reads as a duplicate text.
+    from image2editable.layout_first import _audit_invariants
+    src = np.full((120, 400, 3), (26, 78, 187), np.uint8)
+    src[40:80, 40:140] = 255            # white '…这位' ink
+    src[40:80, 136:190] = (255, 209, 32)  # yellow '接' ink protruding left
+    png = np.zeros((120, 400, 4), np.uint8)
+    png[40:80, 136:190] = (255, 209, 32, 255)
+    path = tmp_path / 'unit_0001.png'
+    Image.fromarray(png).save(path)
+    elements = [{'route': 'raster_component',
+                 'component': {'path': str(path), 'x': 0, 'y': 0, 'w': 400, 'h': 120}}]
+    items = [{'box': (30, 30, 110, 60), 'text': '…这位', 'color': '#ffffff'},
+             {'box': (190, 30, 150, 60), 'text': '…女性', 'color': '#ffffff'}]
+    audit = _audit_invariants(elements, items, (120, 400), src)
+    assert audit['i1'] == 0
+    # the gate still fires when the PNG re-prints ink of the item's own colour
+    src2 = src.copy()
+    src2[40:80, 136:190] = 255
+    png2 = np.zeros((120, 400, 4), np.uint8)
+    png2[40:80, 136:190] = (255, 255, 255, 255)
+    path2 = tmp_path / 'unit_0002.png'
+    Image.fromarray(png2).save(path2)
+    elements[0]['component'] = {'path': str(path2), 'x': 0, 'y': 0, 'w': 400, 'h': 120}
+    audit = _audit_invariants(elements, items, (120, 400), src2)
+    assert audit['i1'] == 1
