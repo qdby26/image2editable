@@ -44,9 +44,15 @@ def test_accepted_page_has_no_hard_defects(page, tmp_path):
     if page == 3:
         # The pale-blue circle top-right never rendered in v30d — a
         # tolerated miss at acceptance, now correctly reported as
-        # fill_lost by the B-gen-10 source-block scan.
+        # fill_lost by the B-gen-10 source-block scan. B-gen-12's
+        # local-surround scan additionally reports the four icon
+        # shadow plates, which v30d never rendered at all.
         assert [(d['category'], d['bbox']) for d in hard] == [
-            ('fill_lost', [3544, 82, 234, 141])], report['defects']
+            ('fill_lost', [3544, 82, 234, 141]),
+            ('fill_lost', [338, 1064, 445, 235]),
+            ('fill_lost', [1238, 1135, 182, 156]),
+            ('fill_lost', [2161, 1112, 438, 174]),
+            ('fill_lost', [3061, 1096, 452, 202])], report['defects']
     else:
         assert not hard, report
 
@@ -874,3 +880,69 @@ def test_bgen11_thinner_bold_titles_are_weight_loss(run, page, x, y, tmp_path):
     report = _run_report(run, page, tmp_path)
     hits = _hits(report, 'weight_loss', x, y, x+800, y+200, 'fixable')
     assert hits, [d['bbox'] for d in report['defects']]
+
+# ---------------------------------------------------------------------------
+# B-gen-12 fixtures: subtle fills sitting on non-page surfaces — the p03
+# icon underlay shadows — collapse into the card colour, not the page
+# background, so both earlier fill_lost paths missed them (03/04 are gone
+# in v39 AND v40; 01 loses its top half to the icon-unit PNG clip in v40;
+# 02 keeps a straight off-centre cut). The local-surround extension must
+# flag them, while page-edge blobs, low-contrast decorations and edge
+# rims of larger regions stay silent.
+# ---------------------------------------------------------------------------
+
+
+def _ver_report(ver, page, tmp_path):
+    run = WORK/f'routeb/{ver}-png2-five/p{page:02d}'
+    return detect_defects(WORK/'routeb/png2-ascii'/f'p{page:02d}.png',
+                          run/'out.pptx', run/'render_001.png',
+                          output_dir=tmp_path)
+
+
+def _flat_report(ver, page, tmp_path):
+    run = WORK/f'routeb/{ver}-flatbg/p{page:02d}'
+    return detect_defects(WORK/'flatfirst/task0/render'/f'flatbg-p{page:02d}.png',
+                          run/'out.pptx', run/'render_001.png',
+                          output_dir=tmp_path)
+
+
+def test_v40_png2_p03_icon_shadows_are_fill_lost(tmp_path):
+    # 03 (dark ellipse on the dark card) and 04 are entirely absent; 01 is
+    # clipped to its bottom half -- majority losses are hard.
+    report = _ver_report('v40', 3, tmp_path)
+    for x0, x1 in ((300, 820), (2000, 2700), (2900, 3600)):
+        assert _hits(report, 'fill_lost', x0, 1000, x1, 1400, 'hard'), \
+            (x0, [d['bbox'] for d in report['defects']])
+
+
+def test_v40_flatbg_p03_icon_shadows_are_fill_lost(tmp_path):
+    report = _flat_report('v40', 3, tmp_path)
+    for x0, x1 in ((300, 820), (2000, 2700), (2900, 3600)):
+        assert _hits(report, 'fill_lost', x0, 1000, x1, 1400, 'hard'), \
+            (x0, [d['bbox'] for d in report['defects']])
+
+
+def test_v39_png2_p03_lost_shadows_reported(tmp_path):
+    # v39 emitted no underlay for 03/04 either; 01/02 carry fill_shape
+    # already. Each position must have a hard defect of either category.
+    report = _ver_report('v39', 3, tmp_path)
+    for x0, x1 in ((300, 820), (2000, 2700), (2900, 3600)):
+        hard = _hits(report, 'fill_lost', x0, 1000, x1, 1400, 'hard') \
+            + _hits(report, 'fill_shape', x0, 1000, x1, 1400, 'hard')
+        assert hard, (x0, [d['bbox'] for d in report['defects']])
+
+
+def test_v40_png2_p02_edge_blobs_stay_silent(tmp_path):
+    # The page-edge dark motif, the faint pill outline (s_edge ~5) and the
+    # white-card rim must not flag — none is a lost fill.
+    report = _ver_report('v40', 2, tmp_path)
+    assert not [d for d in report['defects'] if d['category'] == 'fill_lost'], \
+        [d['bbox'] for d in report['defects']]
+
+
+def test_run06_p05_top_wash_is_not_fill_lost(tmp_path):
+    # The 2560px top strip between the blue rules is a same-surface wash,
+    # not a fill block — the compact-blob cap must reject it.
+    report = _run_report('run06', 5, tmp_path)
+    assert not _hits(report, 'fill_lost', 1100, 0, 3840, 250), \
+        [d['bbox'] for d in report['defects']]

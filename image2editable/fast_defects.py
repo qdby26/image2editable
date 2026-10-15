@@ -1132,6 +1132,126 @@ def detect_defects(source, pptx, rendered, *, output_dir, slide_index=0):
         related = [o for o in objects if _intersection(o['bbox'], box)]
         add('fill_lost', box, int(fa), related, 'hard',
             'source fill block collapsed to page background')
+    # fill_lost (local-surround scan, B-gen-12): subtle fills sitting on a
+    # NON-page surface — the p03 icon shadow plates on cards — collapse
+    # into their local surround, which both paths above miss because they
+    # measure the render against the page background. Closing/opening the
+    # source with a 7%-of-min-dimension ellipse reconstructs the local
+    # surface; pixels 4..30 off both reconstructions are 'subtle fill on
+    # some surface'. A reportable block is >=0.05% of the page, compact
+    # (<=35% of a page dimension — a same-surface wash spanning the page
+    # is not a fill), clear of the page edge (the ring needs a full
+    # surround), >=55% uniform on a 7px-eroded core (anti-aliased rims
+    # dilute raw uniformity), <=50% covered by source text (a fill whose
+    # interior is mostly text is not a clean fill block), and stands
+    # 7..30 off its own flat surround ring (<7 sits under anti-alias
+    # noise; >30 is a strong fill other paths already cover). A candidate
+    # is dropped when the non-block interior of its bbox is itself a
+    # uniform surface matching the block colour (<=max(4, .3*s_edge)) —
+    # that is the edge ring of a larger region, not a fill. The render
+    # 'kept' fraction is the share of block pixels still reading off the
+    # rendered surround; >=45% loss is a collapse (hard), and a single
+    # contiguous lost piece covering >=25% of the block with >=15% total
+    # loss is a straight cut (fixable). Icon occluders split shadows into
+    # lobes: candidates sharing fill colour, surround colour and severity
+    # with a <=200px horizontal gap and >=30% vertical overlap merge back
+    # into one defect.
+    kk = round(min(width, height)*.07) | 1
+    surf = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kk, kk))
+    lclose = cv2.morphologyEx(src, cv2.MORPH_CLOSE, surf)
+    lopen = cv2.morphologyEx(src, cv2.MORPH_OPEN, surf)
+    ldiff = np.maximum(
+        np.max(np.abs(src.astype(np.int16)-lclose.astype(np.int16)), axis=2),
+        np.max(np.abs(src.astype(np.int16)-lopen.astype(np.int16)), axis=2))
+    subtle = cv2.morphologyEx(((ldiff >= 4) & (ldiff <= 30)).astype(np.uint8),
+                              cv2.MORPH_OPEN, np.ones((9, 9), np.uint8))
+    lcount, llabels, lstats, _ = cv2.connectedComponentsWithStats(subtle, 8)
+    plates = []
+    for index, (x, y, w, h, area) in enumerate(lstats[1:], 1):
+        if area < width*height*.0005:
+            continue
+        if w > width*.35 or h > height*.35:
+            continue
+        if x <= 2 or y <= 2 or x+w >= width-2 or y+h >= height-2:
+            continue
+        comp = llabels[y:y+h, x:x+w] == index
+        if np.count_nonzero(comp & text_mask[y:y+h, x:x+w]) > comp.sum()*.5:
+            continue
+        core = cv2.erode(comp.astype(np.uint8), np.ones((7, 7), np.uint8)) > 0
+        if core.sum() < 200:
+            continue
+        cpx = src[y:y+h, x:x+w][core]
+        med = np.median(cpx, axis=0)
+        if np.mean(np.max(np.abs(cpx.astype(np.int16)-med), axis=1) <= 6) < .55:
+            continue
+        compmask = np.zeros((height, width), np.uint8)
+        compmask[y:y+h, x:x+w][comp] = 1
+        ringmask = cv2.dilate(compmask, np.ones((17, 17), np.uint8)
+                              ).astype(bool) & ~compmask.astype(bool)
+        sring = src[ringmask]
+        sflat = sring[np.max(np.abs(sring.astype(np.int16)
+                                     - np.median(sring, axis=0)), axis=1) <= 12]
+        if len(sflat) < 200:
+            continue
+        s_edge = np.max(np.abs(med-np.median(sflat, axis=0)))
+        if s_edge < 7 or s_edge > 30:
+            continue
+        inner = src[y:y+h, x:x+w][~comp]
+        if len(inner):
+            imed = np.median(inner, axis=0)
+            if (np.max(np.abs(imed-med)) <= max(4, .3*s_edge)
+                    and np.mean(np.max(np.abs(inner.astype(np.int16)-imed),
+                                     axis=1) <= 8) >= .6):
+                continue
+        dring = dst[ringmask]
+        dflat = dring[np.max(np.abs(dring.astype(np.int16)
+                                     - np.median(dring, axis=0)), axis=1) <= 12]
+        if len(dflat) < 200:
+            continue
+        dpx = dst[y:y+h, x:x+w].astype(np.int16)
+        lost = (np.max(np.abs(dpx-np.median(dflat, axis=0)), axis=2)
+                < max(3, .5*s_edge)) & comp
+        kept = 1-lost.sum()/comp.sum()
+        lostmask = np.zeros((height, width), np.uint8)
+        lostmask[y:y+h, x:x+w][lost] = 1
+        n_lost, _, lstat2, _ = cv2.connectedComponentsWithStats(lostmask, 8)
+        patch = (lstat2[1:, 4].max() if n_lost > 1 else 0)/max(1, comp.sum())
+        if kept >= .55 and not (kept < .85 and patch >= .25):
+            continue
+        plates.append({'box': [int(x), int(y), int(w), int(h)],
+                       'area': int(area), 'med': med,
+                       'ring': np.median(sflat, axis=0), 'kept': float(kept),
+                       'patch': float(patch),
+                       'sev': 'fixable' if kept >= .55 else 'hard'})
+    mergedplates = []
+    for plate in sorted(plates, key=lambda f: f['box'][0]):
+        if mergedplates:
+            m = mergedplates[-1]
+            mx, my, mw, mh = m['box']; fx, fy, fw, fh = plate['box']
+            gap = fx-(mx+mw)
+            yov = min(my+mh, fy+fh)-max(my, fy)
+            if (np.max(np.abs(plate['med']-m['med'])) <= 6
+                    and np.max(np.abs(plate['ring']-m['ring'])) <= 6
+                    and plate['sev'] == m['sev'] and -mw <= gap <= 200
+                    and yov >= .3*min(mh, fh)):
+                m['box'] = [mx, my, fx+fw-mx, max(my+mh, fy+fh)-my]
+                m['kept'] = (m['kept']*m['area']+plate['kept']*plate['area']
+                             )/(m['area']+plate['area'])
+                m['area'] += plate['area']
+                m['patch'] = max(m['patch'], plate['patch'])
+                continue
+        mergedplates.append(plate)
+    for plate in mergedplates:
+        box = plate['box']
+        if any(d['category'] in ('fill_lost', 'fill_shape')
+               and _intersection(d['bbox'], box) >= .5*box[2]*box[3]
+               for d in defects):
+            continue
+        related = [o for o in objects if _intersection(o['bbox'], box)]
+        add('fill_lost', box, plate['area'], related, plate['sev'],
+            'subtle fill collapsed into its local surround'
+            if plate['sev'] == 'hard' else
+            'subtle fill partially lost into its local surround')
     mask = changed&~text_mask
     opened = cv2.morphologyEx(mask.astype(np.uint8),cv2.MORPH_OPEN,np.ones((3,3),np.uint8))
     count,labels,stats,_ = cv2.connectedComponentsWithStats(opened,8)
