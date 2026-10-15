@@ -30,8 +30,8 @@ the repair pass / informational.
 | `fill_lost` | hard | Two paths. (a) Region: a `patch`-flagged cell region whose source near-bg pixels sat on a light fill ≥5 off page background and ≥60% of the region now reads as page background. (b) Block scan: a uniform source fill block (5–25 off page bg, ≥0.2% page, ≥60% uniform) whose boundary collapsed — source edge ≥4 against its flat ring, render edge ≤5 and ≤40% of the source edge. | render keeps a boundary (fb p03 capsule keeps contrast 14 → not lost); whitespace blocks (source edge 0) | flatbg p02 icon underlays; flatbg p03/p04 cards; v30d/v31/v35 p03 top-right circle; v31 p02 card backings |
 | `fill_shape` | hard | Native fill silhouette wrong: per-pixel nearer-fill/nearer-local-background masks on both images; four edge bands of thickness 0.5·min(w,h); flag when min band IoU <.70 and global IoU <.97. | shapes touching the page edge (clipped outline unreadable); fill ≈ local bg (<6 contrast → fill_lost's domain); masks <200 px | v38 png2 p03 circle→capsule+square, ellipse→pill/rect; flatbg p05 pentagon arrows→capsules; flatbg p05 round cards stay clean (min band .81) |
 | `broken_border` | hard | Source row holds a continuous ≥25%-page-width ≥80%-uniform line on flat context; render breaks it into ≥3 missing segments, missing rate 10–95%. | fully-dropped rows (that's `lost`); non-uniform context (photos) | run01 p02 card top borders ×2 |
-| `weight_loss` | fixable | Native text box: source stroke-width p90 ≥1.3× render's and ink density ≥1.15× — bold text rendered regular. | phantom-flagged boxes | run01 p02 entry titles ×14 |
-| `patch` | fixable | Cells of 40px on source near-background pixels with median delta ≥2.5; regions ≥0.4% page survive a 13px opening (solid changed mass ≥50%). Recoloured/both-direction shifts stay here; one-directional collapse goes to `fill_lost`. | halo rings around shifted content; faint gradient flattening | run01 p05 capsule backdrop; flatbg p03 whole-page blue-grey shift |
+| `weight_loss` | fixable | Native text box: source stroke-width p90 ≥1.3× render's and ink density ≥1.15×; second tier (B-gen-11) covers the ~1.2 stroke band — ≥1.18× stroke plus ≥1.2× density — bold text rendered regular. | phantom-flagged boxes | run01 p02 entry titles ×14; run03/run04 card titles (sw≈1.2) |
+| `patch` | fixable | Cells of 40px on source near-background pixels with median delta ≥2.5; regions ≥0.4% page survive a 13px opening (solid changed mass ≥50%). Recoloured/both-direction shifts stay here; one-directional collapse goes to `fill_lost`. | halo rings around shifted content; faint gradient flattening | run01 p05 capsule backdrop; (historical) flatbg p03 pre-v39 whole-page blue-grey shift — resolved by the engine `pale_seed` fix, not Task 7 |
 | `seam` | fixable→hard | Thin missing strip (min dim <0.3% page, max >8%) that falls back to page/local background ≥60% — hard; otherwise an edge deviation — fixable. | — | v37 p05 `[1652,336]` |
 | `micro` | fixable | Independent raster object below 0.01% page area — a leftover crumb. | — | run01 p05 |
 
@@ -73,10 +73,13 @@ baked leftover and let the real extra mark slip.
   each) in both runs — pre-existing. Not covered by any category
   (`broken_border` requires missing source-line coverage; these are
   additive marks).
-- **background tint drift**: flatbg renders the page background ~4–9
-  channels bluer (e.g. p03 (247,250,255)→(244,249,255)); `patch` catches
-  it only as a whole-page fixable flag. Source of truth is Task 7 / the
-  flat-bg asset.
+- **background tint drift (resolved at v39)**: earlier flatbg versions
+  rendered the page background ~4–9 channels bluer — root cause was the
+  engine's `pale_seed` merging cards and blank page into one block
+  (fixed by B-any-09a, not the flat-bg asset / not Task 7). v39 flatbg
+  p02–p05 and png2 p01–p05 now measure 0-channel deltas at sampled
+  blank points (B-gen-11 table). `patch` still carries a whole-page
+  fixable flag if a drift ever returns.
 - **punctuation style drift**: '，"'→'"' curly-vs-straight, full- vs
   half-width in ink-positioned items — fixable via engine, no detector.
 - **baked text residue inside PNG objects** (the run03 p04 '，' ancestor):

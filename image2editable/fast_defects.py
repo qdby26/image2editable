@@ -849,7 +849,9 @@ def detect_defects(source, pptx, rendered, *, output_dir, slide_index=0):
     # regular weight. Measured as the 90th-percentile stroke width
     # (distance transform over the ink mask) plus ink density inside the
     # text frame; weight_loss = fixable when source exceeds render by
-    # 30% in stroke width and 15% in density. Phantom-flagged boxes are
+    # 30% stroke + 15% density, or ~18% stroke + 20% density (B-gen-11
+    # second tier for the s_p90/d_p90 ~1.2 bold-loss band). Phantom-flagged
+    # boxes are
     # excluded: a graphic OCR'd into a glyph is not a weight issue.
     for obj in texts:
         if obj['id'] in phantom_ids:
@@ -868,7 +870,11 @@ def detect_defects(source, pptx, rendered, *, output_dir, slide_index=0):
         s_dt = cv2.distanceTransform(s_ink.astype(np.uint8), cv2.DIST_L2, 5)[s_ink]
         d_dt = cv2.distanceTransform(d_ink.astype(np.uint8), cv2.DIST_L2, 5)[d_ink]
         s_p90 = float(np.percentile(s_dt, 90)); d_p90 = float(np.percentile(d_dt, 90))
-        if s_p90 >= 1.3*max(.8, d_p90) and s_ink.mean() >= 1.15*d_ink.mean():
+        if (s_p90 >= 1.3*max(.8, d_p90) and s_ink.mean() >= 1.15*d_ink.mean()) or \
+           (s_p90 >= 1.18*max(.8, d_p90) and s_ink.mean() >= 1.2*d_ink.mean()):
+            # second tier: B-gen-11 — bold losses measuring ~1.2 in stroke
+            # (1.1990 on run03/run04 card titles, p90 quantization) only count
+            # with stronger density evidence (>=1.2x) to keep precision.
             add('weight_loss', [x, y, r-x, b-y], int(np.count_nonzero(s_ink)), [obj],
                 'fixable', 'bold source text rendered at regular weight')
     # fill_shape (B-gen-10): a native fill must reproduce the source

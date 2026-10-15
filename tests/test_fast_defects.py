@@ -850,3 +850,27 @@ def test_v38_flatbg_p03_card_fills_are_fill_lost(tmp_path):
                             output_dir=tmp_path)
     hits = _hits(report, 'fill_lost', 100, 450, 3760, 1750, 'hard')
     assert len(hits) >= 2, [d['bbox'] for d in report['defects']]
+
+
+# B-gen-11 fixtures: bold-loss instances whose stroke-width ratio sits at
+# ~1.2 (measured 1.1990 — the distance-transform p90 quantization of 1.2)
+# slipped under the old >=1.3 stroke gate. run03/run04 share the source.
+# ---------------------------------------------------------------------------
+
+def _run_report(run, page, tmp_path):
+    return detect_defects(TRIAL/f'source/p{page:02d}.png',
+                          TRIAL/f'working/{run}/out.pptx',
+                          TRIAL/f'working/{run}/conv/render_{page:03d}.png',
+                          output_dir=tmp_path, slide_index=page-1)
+
+
+@pytest.mark.parametrize('run,page,x,y', [
+    ('run04', 3, 1559, 1287),   # '接触者需免疫前' card title
+    ('run04', 3, 485, 1289),    # '性接触前' card title
+    ('run04', 4, 2572, 1710),   # '项目注意事项' card title
+    ('run03', 1, 2256, 1481),   # subtitle segment, sw=1.299 boundary miss
+])
+def test_bgen11_thinner_bold_titles_are_weight_loss(run, page, x, y, tmp_path):
+    report = _run_report(run, page, tmp_path)
+    hits = _hits(report, 'weight_loss', x, y, x+800, y+200, 'fixable')
+    assert hits, [d['bbox'] for d in report['defects']]
