@@ -460,7 +460,7 @@ def detect_defects(source, pptx, rendered, *, output_dir, slide_index=0,
         x, y, w, h = obj['bbox']
         for raster in rasters:
             rx, ry, rw, rh = raster['bbox']
-            if rx <= x and ry <= y and rx+rw >= x+w and rx+rh >= y+h:
+            if rx <= x and ry <= y and rx+rw >= x+w and ry+rh >= y+h:
                 phantom_ids.add(obj['id'])
                 add('phantom_text', obj['bbox'], max(1, round(w*h)), [obj, raster],
                     reason='native glyph inside raster graphic region (OCR artefact)')

@@ -3579,3 +3579,224 @@ def test_bany12_ink_box_centring_accounts_for_character_spacing(script_dir):
     # 'ABCD': 3 gaps, first inked char at 0 -> centre drift 1.5 * spacing
     assert (left0 - left) / 914400 == pytest.approx(10.0 * 1.5 * inch_per_px, abs=1e-3)
     assert (width - width0) / 914400 == pytest.approx(10.0 * 3 * inch_per_px, abs=1e-3)
+
+
+_BANY13_FIXTURES = Path(__file__).parent / 'fixtures' / 'bany13'
+
+
+def _bany13_fixture(tag):
+    if isinstance(tag, int):
+        tag = f'b16-p{tag:02d}'
+    return (_BANY13_FIXTURES / f'{tag}.png',
+            json.loads((_BANY13_FIXTURES / f'{tag}.json')
+                       .read_text(encoding='utf8'))['text_items'])
+
+
+def test_bany13_residual_does_not_repaint_native_card(tmp_path):
+    # a mixed residual contour (table grid + checkmarks + text smudge) must
+    # not bake opaque alpha over zones a native card already renders —
+    # otherwise every card gets a raster twin (b16 p02 header I3 ghost).
+    from image2editable.layout_first import prepare_layout
+    source, items = _bany13_fixture(2)
+    slide, _ = prepare_layout(source, tmp_path/'assets', text_items=items,
+                              background_mode='source',
+                              label_reader=lambda *a, **k: ([], None))
+    cards = [e for e in slide['visual_elements']
+             if e.get('route') == 'native_shape' and e.get('role') == 'card'
+             and e.get('bbox') and 430 < e['bbox'][1] < 500
+             and 100 < e['bbox'][3] - e['bbox'][1] < 260]
+    assert len(cards) >= 3, [e['object_id'] for e in cards]
+    for card in cards:
+        x, y, x1, y1 = card['bbox']
+        cover = 0
+        for e in slide['visual_elements']:
+            c = e.get('component')
+            if not c:
+                continue
+            ax, ay = max(0, x - c['x']), max(0, y - c['y'])
+            ar, ab = min(c['w'], x1 - c['x']), min(c['h'], y1 - c['y'])
+            if ar <= ax or ab <= ay:
+                continue
+            alpha = np.asarray(Image.open(c['path']).convert('RGBA'))[:, :, 3]
+            cover += np.count_nonzero(alpha[ay:ab, ax:ar] > 0)
+        assert cover < .5 * (x1 - x) * (y1 - y), (
+            f"raster repaints native card {card['object_id']}: {cover}px")
+
+
+def test_bany13_emblem_does_not_bake_neighbour_text(tmp_path):
+    # a light label's emblem bakes its own glyphs, not the neighbour's —
+    # native text stays single-drawn (b16 p06 '02'/'03' ghosts).  Multi-tone
+    # digits retire to raster instead — see test_bany13_multitone_glyph_stays_raster.
+    from image2editable.layout_first import prepare_layout
+    source, items = _bany13_fixture(6)
+    slide, _ = prepare_layout(source, tmp_path/'assets', text_items=items,
+                              background_mode='source',
+                              label_reader=lambda *a, **k: ([], None))
+    for it in slide['text_items']:
+        x, y, w, h = [round(v) for v in it['box']]
+        for e in slide['visual_elements']:
+            c = e.get('component')
+            if not c or not e['object_id'].startswith('emblem_'):
+                continue
+            ax, ay = max(0, x - c['x']), max(0, y - c['y'])
+            ar, ab = min(c['w'], x + w - c['x']), min(c['h'], y + h - c['y'])
+            if ar <= ax or ab <= ay:
+                continue
+            alpha = np.asarray(Image.open(c['path']).convert('RGBA'))[:, :, 3]
+            cover = np.count_nonzero(alpha[ay:ab, ax:ar] > 0) / ((ar - ax) * (ab - ay))
+            assert cover < .35, (
+                f"{e['object_id']} bakes native text {it['text']!r}: {cover:.0%}")
+
+
+def _raster_cover(slide, zone):
+    # total nonzero residual alpha over a page-space rect, as a fraction.
+    x, y, x1, y1 = zone
+    cover = 0
+    for e in slide['visual_elements']:
+        c = e.get('component')
+        if not c:
+            continue
+        ax, ay = max(0, x - c['x']), max(0, y - c['y'])
+        ar, ab = min(c['w'], x1 - c['x']), min(c['h'], y1 - c['y'])
+        if ar <= ax or ab <= ay:
+            continue
+        alpha = np.asarray(Image.open(c['path']).convert('RGBA'))[:, :, 3]
+        cover += np.count_nonzero(alpha[ay:ab, ax:ar] > 0)
+    return cover / ((x1 - x) * (y1 - y))
+
+
+def test_bany13_fill_shapes_are_not_rebaked_by_residual(tmp_path):
+    # run11 p03: three panels emit native fill_* shapes; the residual
+    # pass used to keep opaque alpha across them -> I3 mutual-coverage
+    # ghosts.  fill_claim must carve the residual inside each fill.
+    from image2editable.layout_first import prepare_layout
+    source, items = _bany13_fixture('run11-p03')
+    slide, _ = prepare_layout(source, tmp_path/'assets', text_items=items,
+                              background_mode='source',
+                              label_reader=lambda *a, **k: ([], None))
+    fills = [e for e in slide['visual_elements']
+             if e.get('object_id', '').startswith('fill_')]
+    assert fills, 'expected native fill shapes'
+    for f in fills:
+        x, y, x1, y1 = [round(v) for v in f['bbox']]
+        assert _raster_cover(slide, (x, y, x1, y1)) < .5, (
+            f"residual repaints {f['object_id']}: "
+            f"{_raster_cover(slide, (x, y, x1, y1)):.0%}")
+
+
+def test_bany13_fill_sliver_drops_card_owned_ink(tmp_path):
+    # b16 p04: a small navy badge (card_0004) sits inside fill_0007's
+    # subtle zone.  The fill's unexplained sliver used to carry the
+    # badge's AA edge; the frame splitter then peeled a raster twin of
+    # the native card (object_0015_frame_0001 -> I3).  Card ground is
+    # foreign — the sliver must leave it out.
+    from image2editable.layout_first import prepare_layout
+    source, items = _bany13_fixture(4)
+    slide, audit = prepare_layout(source, tmp_path / 'assets',
+                                  text_items=items,
+                                  background_mode='source',
+                                  label_reader=lambda *a, **k: ([], None))
+    assert audit['invariants']['i3'] == 0, audit['invariants']
+
+
+def test_bany13_foreign_ink_under_translucent_unit_survives(tmp_path):
+    # png2 p01: a chart bar's bottom edge sits under a unit's dev-ramp
+    # alpha (~51/255).  The unit does not reproduce it solidly, so the
+    # residual sliver must survive — carving it drops the edge (G5 lost).
+    from image2editable.layout_first import prepare_layout
+    source, items = _bany13_fixture('png2-p01')
+    slide, _ = prepare_layout(source, tmp_path/'assets', text_items=items,
+                              background_mode='source',
+                              label_reader=lambda *a, **k: ([], None))
+    cover = _raster_cover(slide, (2190, 825, 2190 + 144, 825 + 29))
+    assert cover > .3, f'bar-bottom edge lost: raster cover {cover:.0%}'
+
+
+def _stub_boxes(slide):
+    # mirrors the phantom_text gate: a <=4-char latin/symbol stub whose
+    # emitted box sits wholly inside a raster bbox reads as OCR artefact.
+    stubs = []
+
+    def _stubish(txt):
+        sq = ''.join(str(txt).split())
+        return (0 < len(sq) <= 4 and all(
+            ch.isascii() and (not ch.isalnum() or ch.isalpha())
+            for ch in sq))
+
+    for it in slide['text_items']:
+        runs = it.get('runs') or []
+        if runs:
+            bx, by, bw, bh = it['box']
+            for r in runs:
+                rb = r.get('box')
+                if not _stubish(r.get('text')) or not rb:
+                    continue
+                if max(rb) <= 1.0:
+                    stubs.append((bx + rb[0] * bw, by + rb[1] * bh,
+                                  rb[2] * bw, rb[3] * bh))
+                else:
+                    stubs.append(tuple(rb))
+        elif _stubish(it.get('text')):
+            stubs.append(tuple(it['box']))
+    return stubs
+
+
+def test_bany13_sliver_does_not_engulf_stub_text(tmp_path):
+    # flatbg p05: fill_0012's unexplained sliver carries the pale band's
+    # border ring — a single connected stroke spanning the whole fill.
+    # Its bbox used to swallow the native 'HPV ' stub whole; the phantom
+    # gate then reads the legit native text as a raster-OCR artefact.
+    # The record must split around stub boxes so no emitted PNG fully
+    # contains one (the ring becomes top/bottom arcs + side stubs).
+    from image2editable.layout_first import prepare_layout
+    source, items = _bany13_fixture('flatbg-p05')
+    slide, _ = prepare_layout(source, tmp_path / 'assets',
+                              text_items=items,
+                              background_mode='source',
+                              label_reader=lambda *a, **k: ([], None))
+    stubs = _stub_boxes(slide)
+    band = [s for s in stubs
+            if 639 <= s[1] <= 933 and 1653 <= s[0] <= 3762]
+    assert band, 'expected a latin stub inside the band'
+    for e in slide['visual_elements']:
+        c = e.get('component')
+        if not c:
+            continue
+        for (tx, ty, tw, th) in band:
+            assert not (c['x'] <= tx and c['y'] <= ty
+                        and c['x'] + c['w'] >= tx + tw
+                        and c['y'] + c['h'] >= ty + th), (
+                f"{e['object_id']} engulfs stub {tx, ty, tw, th}")
+    # the border content must still be emitted — the band's top edge
+    # keeps raster coverage, just in pieces (a hairline, not a strip).
+    assert _raster_cover(slide, (1660, 636, 3750, 665)) > .05
+
+
+def test_bany13_multitone_glyph_stays_raster(tmp_path):
+    # b16 p06: agenda digits '02'/'03' are shaded art inside the emblem —
+    # a highlight cap, a flat body and a dark groove (source lum
+    # p10-p90 ~130 over the emblem alpha).  A flat native redraw loses
+    # the shading (~18k >30-error pixels across the page); carving the
+    # emblem re-creates the raster+native ghost.  A multi-tone glyph
+    # keeps its raster copy and the native item retires instead.
+    from image2editable.layout_first import prepare_layout
+    source, items = _bany13_fixture(6)
+    slide, _ = prepare_layout(source, tmp_path / 'assets',
+                              text_items=items,
+                              background_mode='source',
+                              label_reader=lambda *a, **k: ([], None))
+    numbers = [it for it in slide['text_items']
+               if it['text'].strip() in ('02', '03')]
+    assert not numbers, 'multi-tone digits must retire to raster'
+    # the shaded digits survive as raster coverage over their boxes.
+    for box in ((198, 1057, 472, 1235), (198, 1506, 472, 1685)):
+        cover = _raster_cover(slide, box)
+        assert cover > .15, f'digit art lost at {box}: cover {cover:.0%}'
+    # a mono neighbour still promotes native (b16 p04 '30.').
+    source4, items4 = _bany13_fixture(4)
+    slide4, _ = prepare_layout(source4, tmp_path / 'assets4',
+                               text_items=items4,
+                               background_mode='source',
+                               label_reader=lambda *a, **k: ([], None))
+    assert any(it['text'].strip() == '30.'
+               for it in slide4['text_items']), 'mono text must stay native'

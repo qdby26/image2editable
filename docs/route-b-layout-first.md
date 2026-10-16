@@ -403,6 +403,110 @@ source pixels over OCR estimates in one dimension:
   element whose overlap area is not `>= 50%` fill-coloured.
 - **Tests**: `test_bany10_badge_promoted_to_native_shape`.
 
+### Residual native-ownership carve (B-any-13)
+
+- **Problem**: residual records baked whole silhouettes over regions a
+  native element already paints — e.g. b16 p02's white table header text
+  (`unit_*` + native text both drawing `旗舰版`), p06's agenda digits
+  re-baked into emblem PNGs, and opaque cards re-sprayed by `object_*`
+  PNGs.  The I3 audit sees mutual raster/native coverage `> 50%`.
+- **Ownership model**: after all text/unit/fill processing, four masks
+  describe ground a native element already paints:
+  - `consumed` — promoted card/band/ring silhouettes;
+  - `unit_mask` / `unit_solid` — unit PNG alpha `!= 0` vs `>= 128`
+    (dev-ramp edges stay translucent and do **not** reproduce ink);
+  - `emblem_mask` — emblem PNG silhouette alpha;
+  - `fill_claim` — the *emitted* native fill shape rasterised by
+    `shape_type` (rect/ellipse/pentagon footprint, not just its seed
+    contour);
+  - `text_ink` — pixel-level native glyph ownership: source pixels inside
+    each surviving text item's box that match the item's own parsed
+    colour (±tolerance), dilated ~4px to catch antialiased residue, still
+    bounded by the text region so a decorated box interior is not
+    swallowed whole.
+- **Rule**: a single post-alpha carve runs for both the `complete` and
+  soft-alpha residual branches: `alpha[claimed & ~foreign] = 0`, where
+  `foreign = (dev > 20 | fill-ink) & ~unit_solid & ~emblem_mask
+  & ~text_ink`.  Foreign ink is only surrendered to native art that
+  actually reproduces it:
+  - ink under a *translucent* unit ramp (png2 p01's bar-bottom edge at
+    alpha≈51) stays protected — `unit_solid`, not `unit_mask`, decides
+    reproduction;
+  - `fill-ink` = pixels inside a `fill_claim` that deviate `> 8` from
+    the fill's own colour (`fill_colour` map kept per-pixel).  A fill
+    owns its flat surface, not the ink on it — b16 p01's pale-blue card
+    border sits *inside* the silhouette and would otherwise be flattened
+    (`fill_lost`).  The same gate drives the `unexplained` sliver; it was
+    14 until run12 p03 showed a 240-toned gradient ring on a 254 fill
+    (dev 8–14) got flattened, collapsing the block-vs-surround contrast
+    the `fill_lost` block scan reads.
+- **Emblem baking narrowed**: the emblem pass used to `|=` the whole
+  padded `_text_mask` into each emblem's alpha, which baked neighbouring
+  agenda numbers into the PNG (p06 `02`/`03` echoes).  Bleed is now the
+  label-local region (item box + ~6% height pad), and after
+  `text_ink` is finalised a per-emblem glyph carve drops any surviving
+  native-glyph pixels.
+- **Boundaries**: `_emit_residual` merges records after carving, so the
+  carve must run before emission; keeping it pre-merge also means merged
+  PNGs never reintroduce owned pixels.  `unit_mask` (not `unit_solid`)
+  stays on the claim side — translucent unit art is still unit territory
+  for coverage, it just cannot silence foreign ink.
+- **Suppression interplay**: the post-emit dedup drops a `fill_*` whose
+  area is `> 85%` painted verbatim by an opaque raster.  Carving kills
+  that coverage, so previously-suppressed fills now survive — correct
+  where the fill is faithful, harmful only if `fill-ink` did not also
+  preserve the structure inside (hence the `> 8` rule above).
+- **Stub-safe emission** (`_split_record_around_stubs`): a residual
+  fragment whose ink avoids a text's glyphs can still swallow the text
+  *box* whole — the band-border ring around flatbg p05's 'HPV ' was one
+  connected stroke spanning the fill.  The phantom gate reads any
+  ≤4-char latin/symbol stub inside a raster bbox as an OCR artefact, so
+  emission now cuts each record around a protected rect (the stub grown
+  into the union of every intersecting item box, plus any item a piece
+  would graze): left/right keep full height, top/bottom clip to the
+  hole's x-range, hole-interior pixels ship as their own piece.  The
+  split is kept only when it strictly reduces stub containment and never
+  degrades a fully-enclosed item into a partial raster overlap (I2) —
+  dense-interior records (b16 p02's table blob over 'X' marks) revert
+  untouched.
+- **Colour-near halo — tried and reverted**: `text_ink`'s ~4px dilation
+  claim also swallows the *dark drop shadow* around white header glyphs
+  (b16 p02's 表头 halo, ~2.1k error pixels/page as flat text).  A variant
+  that only claimed colour-near fringe pixels and left the shadow as
+  residual ink restored the halo, but the shadow sliver then part-covered
+  the native text box and the I2 gate read it as `truncated` (b16j:
+  hard 18 with 4 new truncated vs 16 flat).  Flat glyphs stay the lesser
+  cost; a faithful halo needs an outline/shadow-capable native text
+  path, not raster.
+- **Multi-tone glyph retirement** (`tone_dropped`): when ≥35% of a text
+  item's own ink sits inside an emblem AND the emblem-covered source
+  pixels are multi-toned (lum p90−p10 > 60 — shaded/bevelled art like
+  b16 p06's agenda digits '02'/'03'), promoting it native forces a flat
+  fill that visibly loses the shading (~18k error pixels on p06) while
+  carving the emblem re-creates the ghost.  The item retires to raster:
+  it leaves `items`/`accepted`, the emblem keeps its baked glyphs, and
+  the glyph part outside the emblem ('0' in '02') flows to residual.
+  Mono neighbours ('30.' on p04: p90−p10 ≈ 37) keep the native path.
+  `_drop_items` matches the `accepted` twin by text + >50% box overlap
+  because `refine_layout_text` deep-copies items — `id()` never matches
+  across the two lists.
+- **Detector correction** (`fast_defects.py`): the `phantom_text` gate
+  tested `rx + rh >= y + h` — raster x-plus-HEIGHT vs text bottom — a
+  typo for `ry + rh`.  It flagging thin wide residual strips whose box
+  never contained the stub (flatbg p05's 1696×4 border hairline over
+  'HPV ').  All baselines were re-measured under the corrected gate:
+  v44 stays hard=0, run10 stays hard=3, HEAD-b16 stays hard=36 — only
+  the false positive clears.
+- **Tests**: `test_bany13_residual_does_not_repaint_native_card`,
+  `test_bany13_emblem_does_not_bake_neighbour_text`,
+  `test_bany13_fill_shapes_are_not_rebaked_by_residual`,
+  `test_bany13_fill_sliver_drops_card_owned_ink`,
+  `test_bany13_foreign_ink_under_translucent_unit_survives`,
+  `test_bany13_sliver_does_not_engulf_stub_text`,
+  `test_bany13_multitone_glyph_stays_raster`,
+  `test_raster_arrow_text_cleanup_keeps_opaque_background_under_native_text`,
+  `test_wide_text_mask_does_not_split_arrow_into_top_and_bottom_fragments`.
+
 ### Residual merge compositing (`_emit_residual` `_overlay`)
 
 - **Problem**: small residual records are merged into shared PNGs. The old

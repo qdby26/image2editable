@@ -2292,6 +2292,175 @@ def _preserve_straddling_marks(cleaning, rgb_zone, local_text, items=None,
     return cleaning
 
 
+def _stub_text_boxes(items):
+    # absolute boxes of the short latin/symbol stubs the phantom_text gate
+    # hunts for: <=4 squashed chars, all ascii letters or symbols (digits
+    # stay native-owned). Runs carry fractional boxes relative to their
+    # item box, so rescale them back to page space.
+    stubs = []
+
+    def _stubish(txt):
+        sq = ''.join(str(txt or '').split())
+        return (0 < len(sq) <= 4 and all(
+            ch.isascii() and (not ch.isalnum() or ch.isalpha())
+            for ch in sq))
+
+    for it in items:
+        runs = it.get('runs') or []
+        if runs:
+            bx, by, bw, bh = it['box']
+            for r in runs:
+                rb = r.get('box')
+                if not _stubish(r.get('text')) or not rb:
+                    continue
+                if max(rb) <= 1.0:
+                    stubs.append((bx + rb[0] * bw, by + rb[1] * bh,
+                                  rb[2] * bw, rb[3] * bh))
+                else:
+                    stubs.append(tuple(rb))
+        elif _stubish(it.get('text')):
+            stubs.append(tuple(it['box']))
+    return stubs
+
+
+def _split_record_around_stubs(rec, stubs, items, max_iter=24):
+    """Break a raster record whose box swallows a stub text whole.
+
+    A residual fragment's content is honest even when its bounding box
+    engulfs a latin stub it never draws — but the phantom gate flags any
+    native stub inside a raster bbox as an OCR artefact.  Splitting the
+    record at each contained stub's y-band (and the band's x-span) keeps
+    every pixel while shrinking the emitted boxes: the band's border ring
+    becomes top/bottom arcs plus short side stubs that cannot contain a
+    text box (flatbg p05 'HPV ').  Pixels inside the stub box itself stay
+    in an inner piece that is exempt from re-checking (they belong to the
+    text zone, not the surrounding pattern).
+
+    The split is kept only when it is a strict improvement: if a piece
+    would still contain a stub (dense ink inside the box), or would turn
+    a fully-covered item into a partial overlap (a fresh I2 hit), the
+    original record is returned unchanged.
+    """
+    rec_box = (rec['x'], rec['y'], rec['w'], rec['h'])
+
+    def _frac(box, host):
+        ix = max(0, min(box[0] + box[2], host[0] + host[2])
+                 - max(box[0], host[0]))
+        iy = max(0, min(box[1] + box[3], host[1] + host[3])
+                 - max(box[1], host[1]))
+        return ix * iy / max(1.0, host[2] * host[3])
+
+    def _piece_bbox(m):
+        ys, xs = np.nonzero(m)
+        x0, x1 = rec['x'] + int(xs.min()), rec['x'] + int(xs.max()) + 1
+        y0, y1 = rec['y'] + int(ys.min()), rec['y'] + int(ys.max()) + 1
+        return (x0, y0, x1 - x0, y1 - y0)
+
+    base_hits = sum(1 for s in stubs if _frac(rec_box, s) >= .9)
+    if not base_hits:
+        return [rec]
+    enclosed = [it['box'] for it in items
+                if _frac(rec_box, it['box']) >= .9]
+    alpha = rec['rgba'][..., 3] != 0
+    pieces = [(alpha, True)]
+    for _ in range(max_iter):
+        hit = None
+        for i, (m, check) in enumerate(pieces):
+            if not check or not m.any():
+                continue
+            pb = _piece_bbox(m)
+            for s in stubs:
+                if _frac(pb, s) >= .9:
+                    hit = (i, s)
+                    break
+            if hit:
+                break
+        if hit is None:
+            break
+        i, (tx, ty, tw, th) = hit
+        m, _ = pieces.pop(i)
+        # Grow the protected rect into the union of every item box that
+        # intersects it: a cut landing 2px inside a neighbour's box turns
+        # its full enclosure into a partial raster overlap (fresh I2).
+        # Unioning first keeps every item either wholly inside the hole or
+        # clear of every cut edge.
+        rx0, ry0, rx1, ry1 = tx, ty, tx + tw, ty + th
+        grown = [None]
+        for _grow in range(20):
+            changed = False
+            for ib in (it['box'] for it in items):
+                if (min(rx1, ib[0] + ib[2]) > max(rx0, ib[0])
+                        and min(ry1, ib[1] + ib[3]) > max(ry0, ib[1])):
+                    u = (min(rx0, ib[0]), min(ry0, ib[1]),
+                         max(rx1, ib[0] + ib[2]), max(ry1, ib[1] + ib[3]))
+                    if u != (rx0, ry0, rx1, ry1):
+                        rx0, ry0, rx1, ry1 = u
+                        changed = True
+            if changed:
+                continue
+            y0 = int(ry0) - rec['y']
+            y1 = int(np.ceil(ry1)) - rec['y']
+            x0 = int(rx0) - rec['x']
+            x1 = int(np.ceil(rx1)) - rec['x']
+            # hole topology: the protected rect falls out of every piece.
+            # Left/right keep full height so items beside the stub stay
+            # whole; top/bottom are clipped to the hole's x-range.
+            left = m.copy()
+            left[:, max(0, x0):] = False
+            right = m.copy()
+            right[:, :min(m.shape[1], x1)] = False
+            mid = m & ~left & ~right
+            top = mid.copy()
+            top[max(0, y0):] = False
+            bot = mid.copy()
+            bot[:min(m.shape[0], y1)] = False
+            inner = mid & ~top & ~bot
+            cand = [(p, True) for p in (left, right, top, bot) if p.any()]
+            if inner.any():
+                cand.append((inner, False))
+            # a piece that clips an item the record enclosed (or grazes
+            # one it partly did) is a fresh I2 — swallow that item into
+            # the protected rect and re-cut.
+            grazed = None
+            for ib in (it['box'] for it in items):
+                for pm, _ in cand:
+                    if .02 < _frac(_piece_bbox(pm), ib) < .9:
+                        grazed = ib
+                        break
+                if grazed is not None:
+                    break
+            if grazed is None:
+                grown[0] = cand
+                break
+            rx0, ry0 = min(rx0, grazed[0]), min(ry0, grazed[1])
+            rx1, ry1 = max(rx1, grazed[0] + grazed[2]), max(ry1, grazed[1] + grazed[3])
+        if grown[0] is not None:
+            pieces += grown[0]
+        else:
+            pieces.append((m, False))
+    live = [m for m, _ in pieces if m.any()]
+    # split kept only when it strictly reduces stub containment and never
+    # degrades a fully-enclosed item into a partial raster overlap (I2).
+    remaining = sum(1 for m in live for s in stubs
+                    if _frac(_piece_bbox(m), s) >= .9)
+    if remaining >= base_hits:
+        return [rec]
+    for m in live:
+        pb = _piece_bbox(m)
+        if any(.02 < _frac(pb, ib) < .9 for ib in enclosed):
+            return [rec]
+    out = []
+    for m in live:
+        x0, y0, pw, ph = _piece_bbox(m)
+        x0 -= rec['x']
+        y0 -= rec['y']
+        rgba = rec['rgba'][y0:y0 + ph, x0:x0 + pw].copy()
+        rgba[..., 3] = np.where(m[y0:y0 + ph, x0:x0 + pw], rgba[..., 3], 0)
+        out.append(dict(rec, rgba=rgba, x=rec['x'] + x0,
+                        y=rec['y'] + y0, w=pw, h=ph))
+    return out
+
+
 def _emit_residual(records, elements, asset_dir, difference, page_size,
                    text, items):
     """Emit residual records as object_NNNN.png elements, merging as needed.
@@ -2412,6 +2581,7 @@ def _emit_residual(records, elements, asset_dir, difference, page_size,
                     continue
         emitted.append(rec)
     emitted_count = 0
+    stub_boxes = _stub_text_boxes(items)
     for rec in emitted:
         if rec['w']*rec['h'] < h*w*.0001:
             continue
@@ -2445,15 +2615,16 @@ def _emit_residual(records, elements, asset_dir, difference, page_size,
                         and min(rec['y'] + rec['h'], iy + ih) - max(rec['y'], iy) > 0):
                     print(f'    item-hit {it.get("text","")[:20]!r} box={[round(v) for v in it["box"]]}'
                           f' runs={len(it.get("runs") or [])} rot={it.get("rotation_degrees")}')
-        index = sum(1 for e in elements
-                    if e['object_id'].startswith('object_'))
-        path = asset_dir / f'object_{index + 1:04d}.png'
-        Image.fromarray(rec['rgba']).save(path)
-        elements.append({'object_id': f'object_{index + 1:04d}', 'route': 'raster_component',
-                         'role': 'visual', 'z_index': 1000 + index,
-                         'component': {'path': str(path), 'x': rec['x'], 'y': rec['y'],
-                                       'w': rec['w'], 'h': rec['h']}})
-        emitted_count += 1
+        for piece in _split_record_around_stubs(rec, stub_boxes, items):
+            index = sum(1 for e in elements
+                        if e['object_id'].startswith('object_'))
+            path = asset_dir / f'object_{index + 1:04d}.png'
+            Image.fromarray(piece['rgba']).save(path)
+            elements.append({'object_id': f'object_{index + 1:04d}', 'route': 'raster_component',
+                             'role': 'visual', 'z_index': 1000 + index,
+                             'component': {'path': str(path), 'x': piece['x'], 'y': piece['y'],
+                                           'w': piece['w'], 'h': piece['h']}})
+            emitted_count += 1
     return emitted_count
 
 
@@ -3936,7 +4107,15 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
             cv2.drawContours(alpha, exts, -1, 255, -1)
         if np.count_nonzero(alpha) < tw*th*.25:
             continue
-        alpha[y0:y1, x0:x1] |= (text[y0:y1, x0:x1] != 0).astype(np.uint8)*255
+        # the emblem owns its own label's glyphs; the padded probe zone also
+        # reaches neighbouring text (agenda digits beside a light label) —
+        # OR-ing the whole zone bakes them into the PNG while they stay
+        # native, double-drawing them (b16 p06 '02'/'03' ghosts).
+        bleed = max(2, round(th * .06))
+        itx0, ity0 = max(0, int(round(x - bleed))), max(0, int(round(y - bleed)))
+        itx1, ity1 = min(w, int(round(x + tw + bleed))), min(h, int(round(y + th + bleed)))
+        alpha[ity0:ity1, itx0:itx1] |= (text[ity0:ity1, itx0:itx1] != 0) \
+            .astype(np.uint8) * 255
         ys, xs = np.nonzero(alpha)
         bx0, by0, bx1, by1 = int(xs.min()), int(ys.min()), int(xs.max())+1, int(ys.max())+1
         if np.count_nonzero(emblem_mask[by0:by1, bx0:bx1] != 0) / np.count_nonzero(alpha) > .7:
@@ -3950,11 +4129,111 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
                          'component': {'path': str(path), 'x': bx0, 'y': by0, 'w': bx1-bx0, 'h': by1-by0}})
         emblem_mask |= alpha
         emblem_dropped.add(id(it))
-    if emblem_dropped:
-        items = [it for it in items if id(it) not in emblem_dropped]
+    def _drop_items(dropped_ids):
+        # refine_layout_text deep-copies accepted into items, so the same
+        # logical text lives in both lists under different ids — match the
+        # accepted twin by text + overlapping box before rebuilding `text`,
+        # or the dropped item's box keeps masking its own ink.
+        nonlocal items, accepted, text, released
+        dropped = [it for it in items if id(it) in dropped_ids]
+        items = [it for it in items if id(it) not in dropped_ids]
+
+        def _same(a, b):
+            if (a.get('text') or '').strip() != (b.get('text') or '').strip():
+                return False
+            ax, ay, aw, ah = a['box']
+            bx, by, bw, bh = b['box']
+            inter = (max(0, min(ax + aw, bx + bw) - max(ax, bx))
+                     * max(0, min(ay + ah, by + bh) - max(ay, by)))
+            return inter > .5 * min(aw * ah, bw * bh)
+
+        accepted = [it for it in accepted
+                    if not any(_same(it, d) for d in dropped)]
         text = _text_mask(items, (h, w)) | _text_mask(accepted, (h, w))
         text, released2 = _release_boxed_decorations(rgb, items, regions, text)
         released |= released2
+
+    if emblem_dropped:
+        _drop_items(emblem_dropped)
+    # A surviving neighbour text redrawn natively replaces its emblem-baked
+    # glyphs with a flat fill.  When the baked art is multi-toned (agenda
+    # digits '02'/'03' on b16 p06: highlight cap + dark groove, source lum
+    # p10-p90 ~130 over the emblem alpha) the flat redraw visibly loses the
+    # shading while the raster copy was faithful — retire the item to
+    # raster instead of double-investing it.  A mono neighbour keeps the
+    # flat-native path (b16 p04 '30.': lum p10-p90 ~37).
+    tone_dropped = set()
+    for it in items:
+        ix, iy, iw, ih = map(round, it['box'])
+        if iw <= 0 or ih <= 0:
+            continue
+        x0, y0 = max(0, ix), max(0, iy)
+        x1, y1 = min(w, ix + iw), min(h, iy + ih)
+        item_rgb = _parse_color(it)
+        if item_rgb is None:
+            continue
+        ink = np.max(np.abs(rgb[y0:y1, x0:x1].astype(np.int16)
+                            - np.asarray(item_rgb, np.int16)), axis=2) <= 45
+        own = (text[y0:y1, x0:x1] != 0) & ink
+        inside = own & (emblem_mask[y0:y1, x0:x1] != 0)
+        if (np.count_nonzero(inside) < 200
+                or np.count_nonzero(inside) < np.count_nonzero(own) * .35):
+            continue
+        lum = rgb[y0:y1, x0:x1][emblem_mask[y0:y1, x0:x1] != 0].mean(axis=1)
+        if np.percentile(lum, 90) - np.percentile(lum, 10) > 60:
+            tone_dropped.add(id(it))
+    if tone_dropped:
+        _drop_items(tone_dropped)
+    # Per-pixel glyph ownership for the surviving native text — only source
+    # pixels matching an item's own ink colour count, so a straddling mark or
+    # badge fragment sharing the padded box keeps its residual claim.
+    # Intersecting with the released `text` mask leaves
+    # _release_boxed_decorations' returned pixels free.  Dropped (emblem- or
+    # unit-owned) items are absent from `items`, so their glyphs stay
+    # unclaimed.
+    text_ink = np.zeros((h, w), np.uint8)
+    for it in items:
+        ix, iy, iw, ih = map(round, it['box'])
+        if iw <= 0 or ih <= 0:
+            continue
+        pad = max(2, round(ih * .06))
+        x0, y0 = max(0, ix - pad), max(0, iy - pad)
+        x1, y1 = min(w, ix + iw + pad), min(h, iy + ih + pad)
+        zone = text[y0:y1, x0:x1] != 0
+        if not zone.any():
+            continue
+        item_rgb = _parse_color(it)
+        if item_rgb is None:
+            continue  # colourless item: cannot tell glyph ink from underlay
+        crop = rgb[y0:y1, x0:x1].astype(np.int16)
+        zone &= np.max(np.abs(crop - np.asarray(item_rgb, np.int16)),
+                       axis=2) <= 45
+        text_ink[y0:y1, x0:x1][zone] = 255
+    # glyph AA fringes shade beyond the ±45 colour match and would survive as
+    # an outline echo around the native glyphs (b16 p06 '02' ring).  Grow the
+    # claim ~4px — never outside the released text mask, so straddling
+    # decorations keep their residual claim.  (A colour-near variant that
+    # left dark drop shadows as residual ink was tried: the shadow sliver
+    # then part-covered the native text box and the I2 gate read it as
+    # truncated — flat glyphs are the lesser cost.)
+    halo = cv2.dilate(text_ink, np.ones((9, 9), np.uint8)) != 0
+    text_ink = np.where(halo & (text != 0), 255, 0).astype(np.uint8)
+    # Neighbouring live text is redrawn natively — baking its glyph ink into
+    # an emblem alpha double-draws it (b16 p06 '02'/'03' ghosts).  Carving
+    # here, after emblem_dropped is final, can never starve an emblem-owned
+    # label: its dropped item no longer contributes ink to text_ink.
+    if text_ink.any():
+        for e in elements:
+            c = e.get('component')
+            if c is None or not e['object_id'].startswith('emblem_'):
+                continue
+            with Image.open(c['path']) as image:
+                rgba = np.asarray(image.convert('RGBA')).copy()
+            zone = text_ink[c['y']:c['y'] + c['h'], c['x']:c['x'] + c['w']] != 0
+            if not zone.any():
+                continue
+            rgba[:, :, 3][zone] = 0
+            Image.fromarray(rgba).save(c['path'])
     difference = np.max(np.abs(rgb.astype(np.int16)-expected.astype(np.int16)), axis=2)
     # Subtle fill blocks: uniform areas whose colour sits between the backdrop
     # and the residual floor (5 < dev <= 20) — pale icon underlays, light case
@@ -3981,6 +4260,8 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
     painted = [e for e in elements
                if e['route'] == 'native_shape' and e.get('shape', {}).get('fill_rgb')]
     fill_residual = []
+    fill_claim = np.zeros((h, w), np.uint8)
+    fill_colour = np.zeros((h, w, 3), np.int16)
     # gather subtle contours as silhouette pieces; an icon or rule drawn over
     # one fill splits its seed into several contours that only fit together.
     pieces = []
@@ -4206,6 +4487,66 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
         elements.append({'object_id': f'fill_{len(elements):04d}',
                          'route': 'native_shape', 'role': 'fill',
                          'z_index': z, 'bbox': box, 'shape': shape})
+        # the emitted shape now owns its surface; residual alpha must leave
+        # it transparent or the PNG double-covers the fill (run11 p03 I3).
+        fw, fh = int(box[2] - box[0]), int(box[3] - box[1])
+        claim = np.zeros((fh, fw), np.uint8)
+        if shape['shape_type'] == 'ellipse':
+            cv2.ellipse(claim, (fw // 2, fh // 2),
+                      (max(1, fw // 2), max(1, fh // 2)), 0, 0, 360, 255, -1)
+        elif shape['shape_type'] == 'pentagon':
+            tip = round(fw * shape.get('tip_ratio', .3))
+            if shape.get('rotation') == 180:
+                pts = np.array([(fw, 0), (tip, 0), (0, fh // 2),
+                                (tip, fh), (fw, fh)])
+            else:
+                pts = np.array([(0, 0), (fw - tip, 0), (fw, fh // 2),
+                                (fw - tip, fh), (0, fh)])
+            cv2.fillPoly(claim, [pts], 255)
+        else:
+            claim[:] = 255
+        bx0, by0 = int(box[0]), int(box[1])
+        fill_claim[by0:by0 + fh, bx0:bx0 + fw] |= claim
+        fill_colour[by0:by0 + fh, bx0:bx0 + fw] = np.where(
+            claim[:, :, None] != 0, np.asarray(fill, np.int16),
+            fill_colour[by0:by0 + fh, bx0:bx0 + fw])
+        # subtle ink the flat fill cannot reproduce — a card's pale border
+        # line lives inside its own silhouette; the fill claims it away
+        # from every other pass, so ship it verbatim or it vanishes
+        # (b16 p01 fill_lost).  Ink inside a card CONTAINED in this fill is
+        # the card's own edge, not the fill's — carrying it would let the
+        # frame splitter peel a raster twin of the native card (b16 p04
+        # I3).  Page-sized cards contain fills rather than sit on them, so
+        # only fully-enclosed bboxes are foreign ground.  The 8-unit gate
+        # keeps faint gradient rings (run12 p03's 240-toned halo on a 254
+        # fill); 14 let the fill flatten them and the surround contrast
+        # the block scan reads collapsed.
+        unexplained = (subtle[by0:by0 + fh, bx0:bx0 + fw] != 0) & (
+            np.max(np.abs(rgb[by0:by0 + fh, bx0:bx0 + fw].astype(np.int16)
+                          - fill), axis=2) > 8)
+        for e in elements:
+            if e.get('role') not in {'card', 'frame'} or 'bbox' not in e:
+                continue
+            cb = e['bbox']
+            if not (cb[0] >= bx0 and cb[1] >= by0
+                    and cb[2] <= bx0 + fw and cb[3] <= by0 + fh):
+                continue
+            cx0 = max(0, round(cb[0] - bx0))
+            cy0 = max(0, round(cb[1] - by0))
+            cx1 = min(fw, round(cb[2] - bx0))
+            cy1 = min(fh, round(cb[3] - by0))
+            unexplained[cy0:cy1, cx0:cx1] = False
+        if np.count_nonzero(unexplained) >= 150:
+            uys, uxs = np.nonzero(unexplained)
+            ux0, ux1 = int(uxs.min()), int(uxs.max()) + 1
+            uy0, uy1 = int(uys.min()), int(uys.max()) + 1
+            ualpha = np.where(unexplained[uy0:uy1, ux0:ux1], 255, 0) \
+                .astype(np.uint8)
+            rgba = np.dstack(
+                (rgb[by0 + uy0:by0 + uy1, bx0 + ux0:bx0 + ux1], ualpha))
+            fill_residual.append({'rgba': rgba, 'x': bx0 + ux0,
+                                  'y': by0 + uy0, 'w': ux1 - ux0,
+                                  'h': uy1 - uy0, 'owned': False})
     residual = (difference > 20).astype(np.uint8)
     residual[(emblem_mask | unit_mask) != 0] = 0
     if os.environ.get('LF_DEBUG_RESIDUAL'):
@@ -4385,6 +4726,26 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
                 enclosed = np.isin(wlab, [i for i in range(1, wn)
                                           if i not in edge_ids])
                 alpha[enclosed] = 255
+            # Native-owned ground — card/band/ring surfaces, unit/emblem art,
+            # and each text item's own glyph ink — must stay transparent in
+            # residual alpha or the PNG re-prints content the native elements
+            # already draw (b16 p02 header ghosts, p06 quotation echoes).
+            # Foreign ink ON native ground keeps its alpha; a straddling mark
+            # whose colour is not the item's ink survives untouched.
+            claimed = ((consumed[y:bottom, x:right] != 0)
+                       | (unit_mask[y:bottom, x:right] != 0)
+                       | (emblem_mask[y:bottom, x:right] != 0)
+                       | (fill_claim[y:bottom, x:right] != 0)
+                       | (text_ink[y:bottom, x:right] != 0))
+            foreign = ((difference[y:bottom, x:right] > 20)
+                       | ((fill_claim[y:bottom, x:right] != 0)
+                          & (np.max(np.abs(
+                              rgb[y:bottom, x:right].astype(np.int16)
+                              - fill_colour[y:bottom, x:right]), axis=2) > 8))) \
+                      & (unit_solid[y:bottom, x:right] == 0) \
+                      & (emblem_mask[y:bottom, x:right] == 0) \
+                      & (text_ink[y:bottom, x:right] == 0)
+            alpha[claimed & ~foreign] = 0
             ys, xs = np.nonzero(alpha)
             if len(xs) == 0:
                 continue
