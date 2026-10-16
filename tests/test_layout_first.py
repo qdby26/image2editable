@@ -3438,3 +3438,144 @@ def test_bany11_inline_dot_runs_keep_source_size(tmp_path):
         # ~15px source dot on this page -> em ~54px in the bold face -> ~13.6pt
         assert 10 <= run['font_size'] <= 17, \
             f"dot run at {run['font_size']}pt misses the 15px source dot"
+
+
+def test_bany12_dot_line_segments_centre_on_source_ink(tmp_path):
+    # B-any-12 item 1: run09 p01's subtitle splits '标准预防 · 手卫生' into
+    # dot runs + text runs, but the text runs keep *layout* boxes — the
+    # leading space's advance then pushes '手卫生' 47px right of its source
+    # span, and the inherited line-level character spacing overshoots its
+    # right edge.  Each text segment must centre its ink on the source span
+    # it was measured from (box_kind='ink') so left/right edges track the
+    # source within ~15px.
+    from image2editable.layout_first import prepare_layout
+
+    source, items = _bany06_fixture('run01', 1)
+    slide, _ = prepare_layout(source, tmp_path / 'assets', text_items=items,
+                              background_mode='source', label_reader=lambda *a, **k: ([], None))
+    item = next(it for it in slide['text_items']
+                if str(it.get('text')) == '标准预防 · 手卫生')
+    runs = item.get('runs') or []
+    segments = [r for r in runs if r['text'] != '·']
+    assert len(segments) == 2
+    for run in segments:
+        assert run.get('box_kind') == 'ink', \
+            f"segment {run['text']!r} still positions by advance layout"
+
+
+def test_bany12_dot_line_flanker_converts_to_ink(tmp_path):
+    # B-any-12 item 1 (cont.): the detached '·' at x~2177 splits the p01
+    # title into two items.  Its right flanker '隔离防护' renders by box
+    # layout — left edge -20px, right edge -53px vs the source ink span.
+    # A detached-dot flanker must convert to an ink-positioned item with
+    # per-glyph spacing solved from the measured source span.
+    from image2editable.layout_first import prepare_layout
+
+    source, items = _bany06_fixture('run01', 1)
+    slide, _ = prepare_layout(source, tmp_path / 'assets', text_items=items,
+                              background_mode='source', label_reader=lambda *a, **k: ([], None))
+    flanker = next(it for it in slide['text_items']
+                   if str(it.get('text')) == '隔离防护')
+    assert flanker.get('box_kind') == 'ink'
+    x, _, w, _ = flanker['box']
+    # source ink span measured on the page: [2282..2765]
+    assert abs(x - 2282) <= 12 and abs((x + w) - 2765) <= 12, \
+        f'flanker box {flanker["box"]} misses the source ink span'
+    spacing = flanker.get('character_spacing_pt') or 0
+    assert 4 <= spacing <= 20, \
+        f'flanker needs ~+11px/char to stretch 451px ink onto the 483px span, got {spacing}'
+
+
+def test_bany12_footer_dot_segments_keep_gaps(tmp_path):
+    # B-any-12 item 1 (cont.): run09 p01's centred footer '院感管理科 · 2026'
+    # renders gaps of 70/72px vs the source's 48/50 — each segment centres
+    # its (narrower) ink inside its span and both edges drift.  Ink-kind
+    # runs plus per-segment spacing must close the gap error under ~15px.
+    from image2editable.layout_first import prepare_layout
+
+    source, items = _bany06_fixture('run01', 1)
+    slide, _ = prepare_layout(source, tmp_path / 'assets', text_items=items,
+                              background_mode='source', label_reader=lambda *a, **k: ([], None))
+    item = next(it for it in slide['text_items']
+                if str(it.get('text')) == '院感管理科 · 2026')
+    runs = item.get('runs') or []
+    segments = [r for r in runs if r['text'] != '·']
+    assert len(segments) == 2
+    for run in segments:
+        assert run.get('box_kind') == 'ink'
+
+
+def test_bany12_badge_text_anchors_to_its_ink(tmp_path):
+    # B-any-12 item 4: the '本课重点' badge text floats centred inside its
+    # OCR box (source ink [2484..2737] in a [2475..2746] box — 9px margins
+    # on both sides).  Emitted left-aligned, the glyphs start at the box
+    # edge and the whole text renders ~8px left of the source.  An item
+    # whose ink floats symmetric inside its box is a centred element —
+    # anchor it by its own ink span.
+    from image2editable.layout_first import prepare_layout
+
+    source, items = _bany06_fixture('png2', 3)
+    slide, _ = prepare_layout(source, tmp_path / 'assets', text_items=items,
+                              background_mode='source', label_reader=lambda *a, **k: ([], None))
+    item = next(it for it in slide['text_items']
+                if str(it.get('text')) == '本课重点')
+    assert item.get('box_kind') == 'ink'
+    x, _, w, _ = item['box']
+    # source ink span on the page: [2484..2737]
+    assert abs(x - 2484) <= 12 and abs((x + w) - 2737) <= 12, \
+        f'badge box {item["box"]} misses the source ink span'
+
+
+def test_bany12_wide_gap_splits_onto_ink_spans(tmp_path):
+    # B-any-12 item 3: png2 p01's '《妇产科学》 本科教学课件' holds a ~49px
+    # zero-ink gap between '》' and '本'; the resolved face's advance +
+    # space width rendered it ~77px.  A wide interior whitespace band whose
+    # count matches the whitespace runs splits the line into ink-kind runs,
+    # each centred on its own measured span — the same contract '·'
+    # islands use.
+    from image2editable.layout_first import prepare_layout
+
+    source, items = _bany06_fixture('png2', 1)
+    slide, _ = prepare_layout(source, tmp_path / 'assets', text_items=items,
+                              background_mode='source', label_reader=lambda *a, **k: ([], None))
+    item = next(it for it in slide['text_items']
+                if '妇产科学' in str(it.get('text')))
+    runs = item.get('runs') or []
+    assert len(runs) == 2
+    for run in runs:
+        assert run.get('box_kind') == 'ink'
+
+
+@pytest.mark.parametrize("script_dir", ["scripts", "skills/image-to-ppt/scripts"])
+def test_bany12_ink_box_centring_accounts_for_character_spacing(script_dir):
+    # B-any-12 follow-up: an ink-kind box centres the rendered glyph ink on
+    # the emitted span, but PowerPoint applies `spc` after placement, so a
+    # spaced line's ink centre drifted right by half the total spread —
+    # 'SECTION 03' rendered +52px (its 'S' orphaned at the source edge).
+    import importlib.util
+    import sys
+    from pptx import Presentation
+
+    path = Path(__file__).resolve().parents[1] / script_dir / 'ppt_assemble.py'
+    spec = importlib.util.spec_from_file_location('bany12_assembler', path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    deck = Presentation()
+    slide = deck.slides.add_slide(deck.slide_layouts[6])
+    transform = module.compute_slide_transform(960, 540, 'original')
+
+    def place(spacing):
+        box = module._add_textbox(slide, {
+            'box': [100, 100, 300, 60], 'text': 'ABCD', 'font_size': 20,
+            'box_kind': 'ink', 'character_spacing_pt': spacing},
+            960, 540, transform)
+        return int(box.left), int(box.width)
+
+    left0, width0 = place(0)
+    left, width = place(10.0)
+    inch_per_px = transform.content_width / 960
+    # 'ABCD': 3 gaps, first inked char at 0 -> centre drift 1.5 * spacing
+    assert (left0 - left) / 914400 == pytest.approx(10.0 * 1.5 * inch_per_px, abs=1e-3)
+    assert (width - width0) / 914400 == pytest.approx(10.0 * 3 * inch_per_px, abs=1e-3)

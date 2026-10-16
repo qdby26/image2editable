@@ -264,6 +264,39 @@ source pixels over OCR estimates in one dimension:
   source dot box and a `font_size` solved so the glyph ink fills it.
   Lines whose dots already render within tolerance keep the single-run
   form; unmatched or connected dots leave the item untouched.
+- **Segment ink anchoring (B-any-12 item 1)**: runs emitted by the dot
+  split used *layout* boxes — the leading whitespace's advance pushed
+  each segment off its source span (` 手卫生` rendered +47px right) and
+  the line-level tracking spacing overshot edges.  Segment runs now
+  carry `box_kind='ink'` over their own measured ink bbox so the
+  assembler centres rendered ink on the source span; when the rendered
+  ink width still misses the span by >6px, `character_spacing_pt` (a
+  run-level field, px semantics like the item one) spreads the
+  difference across the segment's inked glyphs, capped at ±60px/char.
+  The coarse item-level tracking value is cleared when a line splits —
+  per-segment values replace it.
+- **Detached-dot flankers (`_align_dot_line_flankers`)**: a detached `·`
+  recovers as its own item and splits the line visually; the neighbours
+  still lay out by advance.  A same-line item strictly left/right of the
+  dot (gap <= ~1.5 line heights) with no runs/`·` of its own converts to
+  `box_kind='ink'` over its measured ink bbox plus the same spacing
+  solve (run09 p01 `隔离防护` -20/-53px -> both edges land).
+- **Wide-gap splits (`_fit_gap_segments`, B-any-12 item 3)**: interior
+  whitespace is a separator the source positioned itself.  When the
+  zero-ink column bands wider than `max(12px, .18×glyph height)` inside
+  the item's ink extent count-match the interior whitespace runs, the
+  line splits at the spaces into ink-positioned segment runs (png2 p01
+  `《妇产科学》 本科教学课件` gap 77px -> ~49px).
+- **Floating-centre items (`_centre_floating_ink_items`, B-any-12
+  item 4)**: when the source ink leaves ~symmetric margins (each >=4px,
+  delta <= max(6, .35×min)) inside its box, the element is centred by
+  design but emits left-aligned (badge text rendered ~8px left).  The
+  item converts to `box_kind='ink'` over its ink bbox.
+- **Boundaries**: the ink-anchored conversions all share the same guards
+  — single line, no rotation, >=200 ink px, span >=50% of the box in
+  both axes.  Spacing solves are skipped under 6px residual and capped
+  at ±60px/char; beyond that the centre-anchored ink still halves the
+  per-edge error.
 - **Trailing-punctuation ink extent (`_line_ink_extent`, B-any-10 item 2 /
   B-any-11 item 2)**: the assembler's fit-shrink measures a line ending in
   narrow-ink punctuation by its rendered ink right edge — the trailing
