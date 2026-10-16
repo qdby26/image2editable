@@ -858,14 +858,18 @@ def _ocr_measurement_font(font_name: str, bold: bool, italic: bool):
 _TRAILING_FREE_PUNCT = set('，。；：！？、,.;:!?）)】》」』\'"“”‘’')
 
 
-def _line_ink_extent(font, line):
+def _line_ink_extent(font, line, align=None):
     bounds = font.getbbox(line)
     ink_right = bounds[2] - min(0, bounds[0])
     # A line ending on narrow-ink punctuation is constrained by its real ink
     # extent, not the final glyph's full advance — the trailing whitespace
     # inside the advance overflows into free space harmlessly.  getbbox()
     # reports metric boxes (full-width CJK punctuation fills its em), so the
-    # rendered mask is measured instead.
+    # rendered mask is measured instead.  That only holds for left-anchored
+    # lines: centred/right-aligned lines lay out by advance width, so the
+    # freed air pushes ink into a neighbour's space (png2 p04 '的育龄…？').
+    if align not in (None, 0):
+        return max(font.getlength(line), ink_right)
     if line.rstrip() and line.rstrip()[-1] in _TRAILING_FREE_PUNCT:
         mask_bounds = font.getmask(line.rstrip()).getbbox()
         if mask_bounds:
@@ -874,13 +878,13 @@ def _line_ink_extent(font, line):
     return max(font.getlength(line), ink_right)
 
 
-def _fit_ocr_font_size(text, font_name, bold, italic, font_size, width):
+def _fit_ocr_font_size(text, font_name, bold, italic, font_size, width, align=None):
     font = _ocr_measurement_font(font_name, bold, italic)
     if font is None or not text:
         return font_size
     # Measure advances and italic overhangs; keep the detected frame unchanged.
     measured = max(
-        _line_ink_extent(font, line)
+        _line_ink_extent(font, line, align)
         for line in text.split("\n")
     )
     return min(font_size, width * 72 * 1000 / measured) if measured > 0 else font_size
@@ -973,6 +977,7 @@ def _add_textbox(
             font_size = _fit_ocr_font_size(
                 run.text, item.get("font", "Microsoft YaHei"),
                 item.get("bold", False), item.get("italic", False), font_size, width,
+                item.get("align"),
             )
         if 0 < font_size < 1:
             from pptx.enum.text import MSO_AUTO_SIZE

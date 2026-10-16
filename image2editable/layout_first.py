@@ -318,6 +318,12 @@ def refine_layout_text(rgb, text_items):
             bottom = max(e[1][1]+e[1][3] for e in chunk)
             child = {k: v for k, v in item.items() if k not in {'words', 'box'}}
             child.update(text=text, box=[x, y, right-x, bottom-y], color=chunk[0][2])
+            if item.get('bold'):
+                # the parent's bold flag describes the whole line, not each
+                # colour island — '近2个月每次'(regular) split from a bold red
+                # clause would inherit it.  Let the remeasure judge each
+                # child's own ink.
+                child['recheck_weight'] = True
             if text.rstrip().endswith(('：', ':')):
                 from scripts.font_match import match_text_face
                 crop = rgb[max(0,round(y)):min(rgb.shape[0],round(bottom)),
@@ -2577,7 +2583,8 @@ def _remeasure_text_weight(rgb, items):
     height, width = rgb.shape[:2]
     measured = []
     for item in items:
-        if item.get('bold') or item.get('runs'):
+        flagged = bool(item.pop('recheck_weight', None))
+        if item.get('runs') or (item.get('bold') and not flagged):
             continue
         text = str(item.get('text') or '').strip()
         if not text:
@@ -2598,7 +2605,8 @@ def _remeasure_text_weight(rgb, items):
         if glyph_height < 50:
             continue
         dt = cv2.distanceTransform(ink, cv2.DIST_L2, 5)[ink.astype(bool)]
-        source_norm = float(np.percentile(dt, 90)) / glyph_height
+        stroke = float(np.percentile(dt, 90))
+        source_norm = stroke / glyph_height
         face = resolve_font(item.get('font') or 'Microsoft YaHei', False, size=1000)
         if face is None:
             continue
@@ -2613,18 +2621,24 @@ def _remeasure_text_weight(rgb, items):
         if ref_norm <= 0:
             continue
         ratio = source_norm / ref_norm
-        measured.append((item, x, y, w, h, glyph_height, color, ratio))
-        if ratio >= 1.30:
+        measured.append((item, x, y, w, h, glyph_height, color, ratio,
+                         stroke, item.get('font_size')))
+        if flagged:
+            # a colour-split child carries the parent's flag wholesale; its own
+            # ink decides — '近2个月每次' measured 1.12 (regular) while its red
+            # sibling clause measured 1.93 (bold).
+            item['bold'] = ratio >= 1.30
+        elif ratio >= 1.30:
             item['bold'] = True
     # A sibling series sits in one stroke-width band; a hard threshold splits
     # it (run07 p03's titles measured 1.37/1.33/1.24 — two flipped, one not).
     # An item just under the threshold still carries real stroke evidence:
     # when a same-row sibling of matching size and colour flipped on its own
     # >=1.30 measurement, propagate — the source drew them in one weight.
-    for item, x, y, w, h, gh, color, ratio in measured:
+    for item, x, y, w, h, gh, color, ratio, stroke, size in measured:
         if item.get('bold') or ratio < 1.15:
             continue
-        for other, ox, oy, ow, oh, ogh, ocolor, oratio in measured:
+        for other, ox, oy, ow, oh, ogh, ocolor, oratio, ostroke, osize in measured:
             if other is item or not other.get('bold') or oratio < 1.30:
                 continue
             overlap = min(y + h, oy + oh) - max(y, oy)
@@ -2636,6 +2650,41 @@ def _remeasure_text_weight(rgb, items):
                              - np.asarray(ocolor, dtype=int))) > 45:
                 continue
             item['bold'] = True
+            break
+    # A title series can also span a card grid: run08 p04's four card titles
+    # measured 1.36/1.24/1.10/1.09 — the top row sits under even the 1.15
+    # floor because the source's bold face draws thinner strokes there.  The
+    # series still carries shared evidence: same size, near-identical colour,
+    # matching glyph heights, and absolute stroke widths within one band.
+    # A member linked by row *or* column to a bold sibling (itself measured
+    # >=1.15) inherits the weight.  The absolute-stroke and font-size gates
+    # keep grey captions (same row but ~0.65x the stroke, ~0.65x the size)
+    # out of the series; iteration lets a propagated member anchor the next.
+    for _ in range(len(measured)):
+        changed = False
+        for item, x, y, w, h, gh, color, ratio, stroke, size in measured:
+            if item.get('bold') or ratio < 1.05:
+                continue
+            for other, ox, oy, ow, oh, ogh, ocolor, oratio, ostroke, osize in measured:
+                if other is item or not other.get('bold') or oratio < 1.15:
+                    continue
+                row = min(y + h, oy + oh) - max(y, oy) >= .5 * min(h, oh)
+                col = min(x + w, ox + ow) - max(x, ox) >= .5 * min(w, ow)
+                if not (row or col):
+                    continue
+                if not .8 <= gh / ogh <= 1.25:
+                    continue
+                if np.max(np.abs(np.asarray(color, dtype=int)
+                                 - np.asarray(ocolor, dtype=int))) > 45:
+                    continue
+                if size and osize and not .88 <= size / osize <= 1.14:
+                    continue
+                if not .75 <= stroke / ostroke <= 1.45:
+                    continue
+                item['bold'] = True
+                changed = True
+                break
+        if not changed:
             break
 
 
@@ -2692,7 +2741,14 @@ def _remeasure_text_size(rgb, items, page=(0, 0)):
         if predicted_h <= 0 or source_h < predicted_h * 1.35:
             continue
         grown = min(size * source_h / predicted_h, size * 2.0)
-        extent = _line_ink_extent(font, text)
+        if item.get('box_kind') == 'ink':
+            # ink-kind frames hug the glyph ink — the advance's side air is
+            # never drawn, so the ink span is the real width constraint (the
+            # detached '·' on run08 p01 needs ~45pt to fill its 23px ink box
+            # while its advance only spans ~0.24em).
+            extent = mask_box[2] - mask_box[0]
+        else:
+            extent = _line_ink_extent(font, text, item.get('align'))
         if extent > 0:
             grown = min(grown, w * content_in / page_w * 72000.0 / extent)
         if grown > size * 1.15:
@@ -2899,7 +2955,7 @@ def _unify_series_styles(items, regions, page=(0, 0)):
             it = items[i]
             font = _ocr_measurement_font(it.get('font', 'Microsoft YaHei'),
                                          bold, it.get('italic', False))
-            measured = max((_line_ink_extent(font, line)
+            measured = max((_line_ink_extent(font, line, it.get('align'))
                             for line in str(it.get('text') or '').split('\n')),
                            default=0) if font is not None else 0
             if measured > 0:
@@ -2908,6 +2964,155 @@ def _unify_series_styles(items, regions, page=(0, 0)):
             items[i]['font_size'] = size
             items[i]['bold'] = bold
             items[i]['color'] = '#%02x%02x%02x' % tuple(int(v) for v in median_color)
+
+
+def _fit_isolated_dots(rgb, items, page=(0, 0)):
+    """Re-fit isolated '·' islands inside a line to their own source ink size.
+
+    A middle dot inherits the line's font size and weight, but the source's
+    dot glyph rarely matches the resolved face's proportions: YaHei's regular
+    '·' inks ~0.13em while its bold ~0.28em, so a title flipping bold doubles
+    the rendered dot (run08 p03's 15px source dots grew to ~23px) and a
+    detached regular dot stays half-size (run08 p01's second '·').  The dot
+    is a design element of its own — when the rendered glyph deviates from
+    the measured source ink by more than ~18% the '·' splits into its own
+    run carrying an ink-fit frame and a font size solved from the source
+    dot, leaving neighbouring glyphs untouched.
+    """
+    from scripts.font_match import resolve_font
+
+    height, width = rgb.shape[:2]
+    page_w, page_h = page
+    content_in = min(40.0 / 3.0, (page_w / page_h) * 7.5) if page_w and page_h else 40.0 / 3.0
+    px_per_pt = page_w / (content_in * 72.0) if page_w else 0
+    if px_per_pt <= 0:
+        return
+    for item in items:
+        text = str(item.get('text') or '')
+        if (item.get('runs') or '\n' in text or item.get('rotation')
+                or item.get('rotation_degrees') or '·' not in text):
+            continue
+        positions = [i for i, ch in enumerate(text) if ch == '·']
+        color = _parse_color(item)
+        if color is None:
+            continue
+        x, y, w, h = [int(round(v)) for v in item['box']]
+        if x < 0 or y < 0 or x + w > width or y + h > height or w < 8 or h < 8:
+            continue
+        crop = rgb[y:y + h, x:x + w]
+        ink = np.max(np.abs(crop.astype(np.int16) - np.asarray(color)), axis=2) <= 60
+        if np.count_nonzero(ink) < 200:
+            continue
+        ys = np.nonzero(ink.any(axis=1))[0]
+        line_gh = int(ys[-1] - ys[0] + 1)
+        count, _, stats, _ = cv2.connectedComponentsWithStats(ink.astype(np.uint8), 8)
+        dots = []
+        for index in range(1, count):
+            cx0, cy0, cw0, ch0, area = stats[index]
+            if cw0 > .55 * line_gh or ch0 > .55 * line_gh:
+                continue
+            if not .5 <= cw0 / max(1, ch0) <= 2 or area < cw0 * ch0 * .4:
+                continue
+            dots.append((int(cx0), int(cy0), int(cw0), int(ch0)))
+        if len(dots) < len(positions):
+            continue
+        face = resolve_font(item.get('font') or 'Microsoft YaHei',
+                            bool(item.get('bold')), bool(item.get('italic')), size=1000)
+        if face is None:
+            continue
+        advances = [max(1.0, face.getlength(ch)) for ch in text]
+        total = sum(advances)
+        if total <= 0:
+            continue
+        xs = np.nonzero(ink.any(axis=0))[0]
+        ink_left, ink_right = int(xs[0]), int(xs[-1]) + 1
+        predicted, advance_left = [], 0.0
+        for ch, advance in zip(text, advances):
+            mid = advance_left + advance / 2
+            advance_left += advance
+            if ch == '·':
+                predicted.append(ink_left + mid / total * (ink_right - ink_left))
+        matched = []
+        for px in predicted:
+            best = min(dots, key=lambda d: abs(d[0] + d[2] / 2 - px))
+            if abs(best[0] + best[2] / 2 - px) > .4 * line_gh:
+                matched = None
+                break
+            # the declared-colour mask reads the crisp core only — the source
+            # dot's visible size includes its antialiased rim.  Re-measure in
+            # a padded window with a looser tolerance; if the soft component
+            # bleeds into a neighbour keep the crisp bounds.
+            dx0, dy0, dw0, dh0 = best
+            pad = 8
+            wx0, wy0 = max(0, dx0 - pad), max(0, dy0 - pad)
+            wx1, wy1 = min(w, dx0 + dw0 + pad), min(h, dy0 + dh0 + pad)
+            window = crop[wy0:wy1, wx0:wx1]
+            soft = (np.max(np.abs(window.astype(np.int16) - np.asarray(color)),
+                           axis=2) <= 170).astype(np.uint8)
+            _, slabels, sstats, _ = cv2.connectedComponentsWithStats(soft, 8)
+            centre = slabels[min(soft.shape[0] - 1, dy0 + dh0 // 2 - wy0),
+                             min(soft.shape[1] - 1, dx0 + dw0 // 2 - wx0)]
+            if centre:
+                sx, sy, sw0, sh0, _ = sstats[centre]
+                if (sw0 <= .7 * line_gh and sh0 <= .7 * line_gh
+                        and 0 < sx and 0 < sy
+                        and sx + sw0 < window.shape[1] and sy + sh0 < window.shape[0]):
+                    best = (int(wx0 + sx), int(wy0 + sy), int(sw0), int(sh0))
+            matched.append(best)
+        if not matched or len({id(d) for d in matched}) != len(matched):
+            continue
+        dot_mask = face.getmask('·').getbbox()
+        if not dot_mask:
+            continue
+        dot_units = dot_mask[3] - dot_mask[1]
+        font_px = (item.get('font_size') or 0) * px_per_pt
+        if dot_units <= 0 or font_px <= 0:
+            continue
+        rendered = font_px * dot_units / 1000
+        if all(abs(rendered - d[3]) <= .18 * d[3] for d in matched):
+            continue
+        runs = []
+        cursor = 0
+        for dot_box, pos in zip(matched, positions):
+            if pos > cursor:
+                runs.append(('text', text[cursor:pos], None))
+            runs.append(('dot', '·', dot_box))
+            cursor = pos + 1
+        if cursor < len(text):
+            runs.append(('text', text[cursor:], None))
+        emitted = []
+        edges = [0]
+        for d in matched:
+            edges += [int(d[0]), int(d[0] + d[2])]
+        edges.append(w)
+        edge_iter = iter(edges)
+        ok = True
+        for kind, seg_text, dot_box in runs:
+            if kind == 'dot':
+                dx0, dy0, dw0, dh0 = dot_box
+                emitted.append({
+                    'text': seg_text,
+                    'box': [max(0.0, dx0 / w), max(0.0, dy0 / h),
+                            min(1.0, (dx0 + dw0) / w) - max(0.0, dx0 / w),
+                            min(1.0, (dy0 + dh0) / h) - max(0.0, dy0 / h)],
+                    'box_kind': 'ink',
+                    'font_size': round(dh0 * 1000 / (dot_units * px_per_pt), 2),
+                })
+                continue
+            left_edge = next(edge_iter)
+            right_edge = next(edge_iter)
+            span = ink[:, left_edge:right_edge]
+            columns = np.nonzero(span.any(axis=0))[0]
+            if len(columns) < 2:
+                ok = False
+                break
+            sx0, sx1 = left_edge + int(columns[0]), left_edge + int(columns[-1]) + 1
+            emitted.append({'text': seg_text,
+                            'box': [max(0.0, sx0 / w), 0.0,
+                                    min(1.0, sx1 / w) - max(0.0, sx0 / w), 1.0]})
+        if not ok or len(emitted) < 2:
+            continue
+        item['runs'] = emitted
 
 
 def prepare_layout(source, asset_dir, *, text_items, card_mode='native', background=None, label_reader=None,
@@ -3078,6 +3283,7 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
     _remeasure_text_size(rgb, items, page=(w, h))
     _unify_series_styles(items, regions, page=(w, h))
     _remeasure_text_tracking(rgb, items, page=(w, h))
+    _fit_isolated_dots(rgb, items, page=(w, h))
     for item in items:
         if 'measured_ink_box' in item:
             item['box'] = item.pop('measured_ink_box')
