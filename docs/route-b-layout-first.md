@@ -223,12 +223,30 @@ source pixels over OCR estimates in one dimension:
   `bold=True`. Only False→True (never cleared); glyph heights `<50px` are
   skipped because stroke p90 quantises and inflates the ratio on regular
   small text.
+- **Series propagation (B-any-11 item 1)**: a hard threshold still splits a
+  sibling series — run08 p04's 2x2 card titles measured
+  1.36/1.24/1.10/1.09 because the source's bold face draws thinner strokes
+  on the top row.  Two propagation bands close the gap: a same-row sibling
+  that flipped on `>=1.30` pulls a `>=1.15` neighbour along (B-any-10), and
+  a *grid* pass lets a bold sibling (`>=1.15`, row **or** column linked)
+  pull a `>=1.05` member when glyph height, colour (`<=45` channel delta),
+  font size (`+-12%`), and the *absolute* stroke p90 (`0.75..1.45x`) all
+  agree — iterated to fixpoint so a propagated member can anchor the next.
+  The stroke/size gates keep grey captions (same row, `~0.65x` stroke and
+  size) out of the series.
+- **Split-child weight recheck (B-any-11 item 4)**: colour-split children
+  inherit the parent's `bold` wholesale — `近2个月每次`(regular) inherited
+  bold from its red sibling clause.  Children of a bold parent carry
+  `recheck_weight`; the remeasure measures their own ink and may clear the
+  flag (children it cannot measure keep the inherited flag).
 - **Size (item 2)**: OCR font sizes occasionally collapse on single
   outliers (page-number `4` at 9.7pt beside `3`/`5` at ~14pt). The source
   ink height inside the box is compared to the text's rendered ink height
   at the reported size; a `>= 1.35x` deficit rescales `font_size` to match
   (growth capped at 2x, width re-clamped by ink extent, single-line items
-  only).
+  only). Ink-kind items clamp against the glyph's ink span rather than its
+  advance — the detached `·` on run08 p01 needs ~45pt to fill its 23px ink
+  box while its advance is only ~0.24em (B-any-11 item 3a).
 - **Tracking (items 3/5)**: a detached punctuation element (a tiny
   punctuation-coloured item on the same line) sometimes marks inter-
   character spacing the source font carried (run07 p01 `标题 · 点`, flatbg
@@ -236,6 +254,29 @@ source pixels over OCR estimates in one dimension:
   source ink right edge by `>= 8%`, the deficit is spread across its
   characters as `character_spacing_pt` (the assembler clamps it into
   `[-4000, 4000]`).
+- **Isolated `·` islands (B-any-11 item 3b)**: `_fit_isolated_dots` runs
+  after the remeasure/unify passes.  A middle dot inherits the line's
+  weight and size, but the resolved face's dot proportions rarely match
+  the source (YaHei regular `·` inks ~0.13em, bold ~0.28em) — a title
+  flipping bold doubles the rendered dot.  When the rendered glyph would
+  deviate from the measured source dot ink by more than ~18%, each `·`
+  splits into its own run: an ink-kind frame centred on the soft-measured
+  source dot box and a `font_size` solved so the glyph ink fills it.
+  Lines whose dots already render within tolerance keep the single-run
+  form; unmatched or connected dots leave the item untouched.
+- **Trailing-punctuation ink extent (`_line_ink_extent`, B-any-10 item 2 /
+  B-any-11 item 2)**: the assembler's fit-shrink measures a line ending in
+  narrow-ink punctuation by its rendered ink right edge — the trailing
+  punctuation's advance air is free space, so `主诉：`-style labels keep
+  their true size instead of shrinking to fit a phantom advance.  The
+  benefit only exists for **left-aligned** lines (`align` `None`/`0`):
+  centred/right-aligned lines lay out by advance width, so the freed air
+  pushes ink into a neighbour's space (png2 p04's centred
+  `的育龄女性，…？` overflowed left into the yellow `血` when its font
+  stayed large).  `_line_ink_extent(font, line, align)` falls back to the
+  plain advance for `align` `1`/`2`; the same argument flows through
+  `_fit_ocr_font_size`, the `_unify_series_styles` width clamp and the
+  `_remeasure_text_size` growth clamp.
 - **Wordless mixed children (item 4)**: `_synthetic_words` builds OCR word
   boxes from connected ink when a colour-split child has no `words`
   (flatbg p05 `16/18型` — the red segment carried no word boxes, so its

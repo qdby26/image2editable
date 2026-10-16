@@ -3338,3 +3338,103 @@ def test_bany10_weight_propagates_to_borderline_series_sibling():
     assert items[0]['bold'] is True
     assert items[1]['bold'] is True, 'borderline sibling must inherit'
     assert items[2]['bold'] is False, 'clearly regular text must not inherit'
+
+
+def test_bany11_card_grid_titles_share_weight(tmp_path):
+    # B-any-11 item 1: run08 p04's four card titles form one 2x2 series but
+    # the top row measured 1.09/1.10 — under both the 1.30 direct threshold
+    # and the 1.15 propagation floor — so only the bottom row emitted bold.
+    # All four source titles are bold: the series must unify, and the grey
+    # captions under the titles must stay regular.
+    from image2editable.layout_first import prepare_layout
+
+    source, items = _bany06_fixture('run04', 4)
+    slide, _ = prepare_layout(source, tmp_path / 'assets', text_items=items,
+                              background_mode='source', label_reader=lambda *a, **k: ([], None))
+    emitted = {str(it.get('text')): it for it in slide['text_items']}
+    for title in ('医用外科口罩', '一次性手套', '隔离衣', '护目镜或面屏'):
+        assert emitted[title]['bold'] is True, f'{title} stayed regular'
+    for caption in ('阻断飞沫与气溶胶。', '接触血液体液时佩戴。',
+                    '喷溅风险操作时佩戴。', '接触隔离患者或大面积污染时。'):
+        assert emitted[caption]['bold'] is False, f'{caption} wrongly flipped'
+
+
+def test_bany11_split_chunk_remeasures_own_weight(tmp_path):
+    # B-any-11 item 4: png2 p04's '近2个月每次同房后少量鲜红色出血' is one
+    # bold=True cache item.  The colour splitter recovers a dark label and a
+    # red clause, but both children inherit the parent's bold flag — only the
+    # red clause is bold in the source.  Each split child must re-derive its
+    # weight from its own ink instead of inheriting.
+    from image2editable.layout_first import prepare_layout
+
+    source, items = _bany06_fixture('png2', 4)
+    slide, _ = prepare_layout(source, tmp_path / 'assets', text_items=items,
+                              background_mode='source', label_reader=lambda *a, **k: ([], None))
+    emitted = {str(it.get('text')): it for it in slide['text_items']}
+    assert emitted['近2个月每次']['bold'] is False
+    red = next(it for it in slide['text_items']
+               if str(it.get('text') or '').startswith('同房后少量鲜红色出血'))
+    assert red['bold'] is True
+
+
+def test_bany11_centered_punct_line_uses_advance_fit():
+    # B-any-11 item 2: png2 p04's white segment '的育龄女性，…？' is
+    # centre-aligned.  The trailing-punctuation ink-extent fit keeps the font
+    # large; PowerPoint centres by advance width, so the line overflows
+    # symmetrically and the '的' collides with the preceding yellow '血'.
+    # Centred/right-aligned lines cannot give back trailing-punct air — the
+    # advance must fit the box.
+    from scripts.ppt_assemble import _fit_ocr_font_size, _ocr_measurement_font
+
+    text = '的育龄女性， 你会考虑哪些疾病？'
+    font = _ocr_measurement_font('Microsoft YaHei', False, False)
+    advance = font.getlength(text)
+    width = 1183.7 * (40.0 / 3.0) / 3840.0  # 4.11in box on a 3840px page
+    centred = _fit_ocr_font_size(text, 'Microsoft YaHei', False, False,
+                                 20.5, width, align=1)
+    assert centred * advance / 72000 <= width * 1.001, \
+        f'centred line overflows: {centred:.2f}pt advances past the box'
+    left = _fit_ocr_font_size(text, 'Microsoft YaHei', False, False,
+                              20.5, width, align=0)
+    assert left >= centred, 'left-aligned lines keep the punct-air benefit'
+
+
+def test_bany11_detached_dot_fills_ink_box(tmp_path):
+    # B-any-11 item 3a: run08 p01's detached '·' carries a 23x22 source ink
+    # box but emits font_size 29.2 — YaHei's regular dot ink is only ~15px
+    # there, half the source.  The remeasure rescale is capped by the glyph
+    # *advance* width, which a centred dot never uses — ink-kind items must
+    # clamp against ink extent so the dot fills its box.
+    from image2editable.layout_first import prepare_layout
+
+    source, items = _bany06_fixture('run01', 1)
+    slide, _ = prepare_layout(source, tmp_path / 'assets', text_items=items,
+                              background_mode='source', label_reader=lambda *a, **k: ([], None))
+    dots = [it for it in slide['text_items']
+            if str(it.get('text')) == '·' and it.get('box_kind') == 'ink']
+    assert dots, 'detached · was not recovered'
+    assert dots[0]['font_size'] >= 38, \
+        f"dot emitted at {dots[0]['font_size']}pt — ink stays ~15px vs 23px source"
+
+
+def test_bany11_inline_dot_runs_keep_source_size(tmp_path):
+    # B-any-11 item 3b: run08 p03's '接触患者后·体液后·环境后' flips bold on
+    # remeasure, which grows its '·' separators to ~23px — the source dots
+    # are ~15px.  Dot islands inside a line must emit as their own runs
+    # sized from source ink, immune to the neighbour's weight/size.
+    from image2editable.layout_first import prepare_layout
+
+    source, items = _bany06_fixture('run01', 3)
+    slide, _ = prepare_layout(source, tmp_path / 'assets', text_items=items,
+                              background_mode='source', label_reader=lambda *a, **k: ([], None))
+    item = next(it for it in slide['text_items']
+                if str(it.get('text')) == '接触患者后·体液后·环境后')
+    runs = item.get('runs') or []
+    assert ''.join(r['text'] for r in runs) == item['text']
+    dot_runs = [r for r in runs if r['text'] == '·']
+    assert len(dot_runs) == 2, f'expected 2 dot runs, got {len(dot_runs)}'
+    for run in dot_runs:
+        assert run.get('box_kind') == 'ink'
+        # ~15px source dot on this page -> em ~54px in the bold face -> ~13.6pt
+        assert 10 <= run['font_size'] <= 17, \
+            f"dot run at {run['font_size']}pt misses the 15px source dot"
