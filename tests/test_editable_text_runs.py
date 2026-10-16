@@ -123,14 +123,28 @@ def test_ink_runs_preserve_font_size_and_rotate_about_visible_center(assembler, 
     scale = .5 if canvas_width else 1
     size *= scale
     assert shape.text_frame.paragraphs[0].runs[0].font.size.pt == pytest.approx(size, abs=.011)
-    assert shape.width.pt >= font.getlength(text) * size / 1000 - .001
+    # The assembler deliberately hugs the ink, not the advance box (an
+    # advance-wide frame spills over neighbouring text boxes): the frame
+    # must cover the rendered ink measured from the pen origin, i.e. the
+    # absolute ink right edge, offset[0] + ink_right.  The advance width
+    # (getlength) exceeds that span for every CJK full-width glyph —
+    # '！' keeps ~340/1000 units — so the old advance-based expectation
+    # could never hold on any machine with a real font.
+    assert shape.width.pt >= ink[2] * size / 1000 - .001
     ascent, descent = font.getmetrics()
     dx = (ink[0] + ink[2]) * size / 2000 - shape.width.pt / 2
     dy = (ink[1] + ink[3] - ascent - descent) * size / 2000
     visible_x = shape.left.pt + shape.width.pt / 2 + (dx if rotation == 0 else -dy)
     visible_y = shape.top.pt + shape.height.pt / 2 + (dy if rotation == 0 else dx)
-    assert visible_x == pytest.approx((100 + width / 2) * scale, abs=.02)
-    assert visible_y == pytest.approx((100 + height / 2) * scale, abs=.02)
+    # ppt_assemble drops the frame by 0.035em on purpose: PowerPoint's line
+    # box runs ~0.07em taller than PIL's ascent+descent, so centred ink would
+    # land high; the declared geometry carries that pre-compensation.  A 90°
+    # rotation maps the text-space "down" shift onto -x in slide space.
+    lead = size * .035
+    assert visible_x == pytest.approx(
+        (100 + width / 2) * scale - (lead if rotation == 90 else 0), abs=.02)
+    assert visible_y == pytest.approx(
+        (100 + height / 2) * scale + (lead if rotation == 0 else 0), abs=.02)
 
 
 def test_invalid_box_kind_fails_before_creating_shapes(assembler):

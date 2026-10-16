@@ -1001,3 +1001,28 @@ def test_bgen14_vXX_p04_bingli_label_is_weight_loss(ver, tmp_path):
     report = vpng2_report(ver, 4, tmp_path)
     assert _hits(report, 'weight_loss', 2000, 350, 2400, 520, 'fixable'), \
         [d['bbox'] for d in report['defects']]
+
+
+# ---------------------------------------------------------------------------
+# B-gen-15 fixtures: v44 renders all four icon underlay shadows, yet the
+# Path-C scan still flags 01/02 as partial losses (fixable).  The flagged
+# 'lost' pixels are almost entirely the shadow's inert halo — pixels that
+# already sit at the surround colour on the SOURCE side (they pass the
+# 4..30 residual band but lie <4.5 off the flat ring median), so they
+# trivially satisfy the render-side 'reads as surround' test without any
+# fill having been lost: v44-01 logs 42% 'lost' while only 0.6% of the
+# footprint is a real fill->surround transition (source offset >= the
+# same render bar).  A genuine collapse always carries transitions —
+# v40-01's clipped half is 17%, v40-02's cut edge 10%, the absent 03/04
+# plates 62-80%, v39-01's fixable 3.2-3.5% — so a component whose
+# transition share stays under 2% of its footprint is halo noise, not a
+# fill loss.  kept/patch/severity stay untouched.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize('mode', ('png2', 'flatbg'))
+def test_bgen15_v44_p03_present_shadows_are_not_fill_lost(mode, tmp_path):
+    report = (_ver_report('v44', 3, tmp_path) if mode == 'png2'
+              else _flat_report('v44', 3, tmp_path))
+    assert not _hits(report, 'fill_lost', 200, 1000, 1800, 1400), \
+        [d['bbox'] for d in report['defects']]

@@ -90,7 +90,8 @@ def read_objects(pptx, size, slide_index=0):
     return objects
 
 
-def detect_defects(source, pptx, rendered, *, output_dir, slide_index=0):
+def detect_defects(source, pptx, rendered, *, output_dir, slide_index=0,
+                   fast=False):
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     src = np.asarray(Image.open(source).convert('RGB'))
@@ -1209,228 +1210,324 @@ def detect_defects(source, pptx, rendered, *, output_dir, slide_index=0):
                       .astype(np.int16)), axis=2),
         np.max(np.abs(sm16-cv2.morphologyEx(small, cv2.MORPH_OPEN, surf2)
                       .astype(np.int16)), axis=2))
-    coarse = cv2.morphologyEx(((ld2 >= 3) & (ld2 <= 45)).astype(np.uint8),
-                              cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-    _, clabels, cstats, _ = cv2.connectedComponentsWithStats(coarse, 8)
-    pad = kk//2 + 40
-    rois = []
-    acc = np.zeros((sh, sw), np.uint8)
-    for index, (cx, cy, cw, ch, ca) in enumerate(cstats[1:], 1):
-        if ca < width*height*.0005/(ds*ds)*.5:
-            continue
-        ccomp = clabels[cy:cy+ch, cx:cx+cw] == index
-        ccm = np.zeros((sh, sw), np.uint8)
-        ccm[cy:cy+ch, cx:cx+cw][ccomp] = 1
-        cring = cv2.dilate(ccm, np.ones((7, 7), np.uint8)).astype(bool) \
-            & ~ccm.astype(bool)
-        sring = small[cring]
-        sflat = sring[np.max(np.abs(sring.astype(np.int16)
-                                     - np.median(sring, axis=0)), axis=1) <= 12]
-        if len(sflat) >= 50:
-            cmed = np.median(small[cy:cy+ch, cx:cx+cw][ccomp], axis=0)
-            c_edge = np.max(np.abs(cmed-np.median(sflat, axis=0)))
-            if c_edge <= 2 or c_edge >= 40:
-                continue
-            dring = smd[cring]
-            dflat = dring[np.max(np.abs(dring.astype(np.int16)
-                                       - np.median(dring, axis=0)), axis=1) <= 12]
-            if len(dflat) >= 50:
-                cd = smd[cy:cy+ch, cx:cx+cw].astype(np.int16)
-                clost = (np.max(np.abs(cd-np.median(dflat, axis=0)), axis=2)
-                         < max(3, .5*c_edge)) & ccomp
-                if 1-clost.sum()/ccomp.sum() >= .95:
-                    continue
-        rois.append([max(0, cx*ds-pad), max(0, cy*ds-pad),
-                     min(width, (cx+cw)*ds+pad), min(height, (cy+ch)*ds+pad)])
-        acc[cy:cy+ch, cx:cx+cw][ccomp] = 1
-
-    ldiff = np.zeros((height, width), np.int16)
-    valid = np.zeros((height, width), bool)
-    evaled = set()
-
-    def _evalnew(rs):
-        # ldiff = max-channel |src - close|, |src - open|, exact inside each
-        # ROI's valid interior; previously evaluated ROIs are not redone.
-        m = kk//2
-        todo = [r for r in rs if tuple(r) not in evaled]
-
-        def _one(r):
-            rx0, ry0, rx1, ry1 = r
-            sub = src[ry0:ry1, rx0:rx1]
-            s16 = si16[ry0:ry1, rx0:rx1]
-            return np.maximum(
-                np.max(np.abs(s16-cv2.morphologyEx(sub, cv2.MORPH_CLOSE, surf)
-                              .astype(np.int16)), axis=2),
-                np.max(np.abs(s16-cv2.morphologyEx(sub, cv2.MORPH_OPEN, surf)
-                              .astype(np.int16)), axis=2))
-        # stdlib-only intra-call parallelism: cv2 releases the GIL inside
-        # morphologyEx (each call already fans out internally), so a small
-        # worker pool shortens multi-ROI rounds without new dependencies.
-        if len(todo) > 1:
-            with ThreadPoolExecutor(min(4, len(todo))) as pool:
-                subs = list(pool.map(_one, todo))
-        else:
-            subs = [_one(r) for r in todo]
-        for (rx0, ry0, rx1, ry1), subld in zip(todo, subs):
-            xa = rx0 if rx0 == 0 else rx0+m
-            xb = rx1 if rx1 == width else rx1-m
-            ya = ry0 if ry0 == 0 else ry0+m
-            yb = ry1 if ry1 == height else ry1-m
-            if xb > xa and yb > ya:
-                ldiff[ya:yb, xa:xb] = subld[ya-ry0:yb-ry0, xa-rx0:xb-rx0]
-                valid[ya:yb, xa:xb] = True
-            evaled.add((rx0, ry0, rx1, ry1))
-
-    _union = sum((r[2]-r[0])*(r[3]-r[1]) for r in rois)
-    if rois and _union > width*height*.8:
-        # Coverage this dense means components chain across the page —
-        # fragmented ROI passes all funnel back to full-page evaluation
-        # anyway, so skip straight to it.
-        rois = [[0, 0, width, height]]
-    elif rois and _union > width*height*.6:
-        # Dense coarse coverage: a bbox union would reach most of the page,
-        # so evaluate fixed 640px tiles over the needed zone instead.  A
-        # tile is skipped when every component pixel and its measurement
-        # ring inside it is pixel-identical between source and render at
-        # 1/4 scale — a component entirely within skipped tiles then has
-        # kept ~= 1 and could never be reported.  The <=14 changed-pixel
-        # bound is half of what the smallest reportable component needs.
-        ts = 640
-        halo = pad//ds + 2
-        need = cv2.dilate(acc, np.ones((2*halo+1, 2*halo+1), np.uint8))
-        meas = cv2.dilate(acc, np.ones((19, 19), np.uint8)).astype(bool)
-        diff = np.max(np.abs(sm16-smd.astype(np.int16)), axis=2) > 4
-        m = kk//2
-        rois = []
-        for ty in range(0, height, ts):
-            for tx in range(0, width, ts):
-                l0, l1 = ty//ds, min(sh, (ty+ts)//ds)
-                c0, c1 = tx//ds, min(sw, (tx+ts)//ds)
-                if not need[l0:l1, c0:c1].any():
-                    continue
-                if np.count_nonzero(diff[l0:l1, c0:c1]
-                                    & meas[l0:l1, c0:c1]) <= 14:
-                    continue
-                rois.append([max(0, tx-m), max(0, ty-m),
-                             min(width, tx+ts+m), min(height, ty+ts+m)])
-        if sum((r[2]-r[0])*(r[3]-r[1]) for r in rois) > width*height:
-            rois = [[0, 0, width, height]]
-
-    llabels = np.zeros((height, width), np.int32)
-    lstats = np.zeros((0, 5), np.int64)
-    if rois:
-        spent = 0
-        for attempt in range(5):
-            # Past ~1.2 pages of accumulated ROI pixels, one contiguous
-            # full-page pass is cheaper than more fragmented probes.
-            pending = sum((r[2]-r[0])*(r[3]-r[1])
-                          for r in rois if tuple(r) not in evaled)
-            if spent + pending > width*height*1.2:
-                rois = [[0, 0, width, height]]
-            _evalnew(rois)
-            spent += pending
-            subtle = cv2.morphologyEx(((ldiff >= 4) & (ldiff <= 30))
-                                      .astype(np.uint8), cv2.MORPH_OPEN,
-                                      np.ones((9, 9), np.uint8))
-            _, llabels, lstats, _ = cv2.connectedComponentsWithStats(
-                subtle, 8)
-            if rois == [[0, 0, width, height]]:
-                break
-            near = valid & ~cv2.erode(valid.astype(np.uint8),
-                                      np.ones((15, 15), np.uint8)).astype(bool)
-            near[:9] = near[-9:] = near[:, :9] = near[:, -9:] = False
-            grown = False
-            for index, (x, y, w, h, a) in enumerate(lstats[1:], 1):
-                if a < width*height*.00025:
-                    continue
-                if x <= 2 or y <= 2 or x+w >= width-2 or y+h >= height-2:
-                    continue
-                if w > width*.35 or h > height*.35:
-                    # a component only grows as more of the page is
-                    # evaluated — one already over the compactness cap can
-                    # never become reportable, so its truncation is moot.
-                    continue
-                comp = llabels[y:y+h, x:x+w] == index
-                cnear = comp & near[y:y+h, x:x+w]
-                if not np.count_nonzero(cnear):
-                    continue
-                # probe a corridor around the frontier pixels only — the
-                # component may continue past the evaluated zone there; the
-                # rest of its extent is already fully resolved.
-                grow = pad*(2**attempt) + kk//2 + 10
-                cols = np.where(cnear.any(axis=0))[0]
-                rows = np.where(cnear.any(axis=1))[0]
-                rois.append([
-                    max(0, x+cols[0]-grow), max(0, y+rows[0]-grow),
-                    min(width, x+cols[-1]+grow+1),
-                    min(height, y+rows[-1]+grow+1)])
-                grown = True
-            if not grown:
-                break
-        else:
-            _evalnew([[0, 0, width, height]])
-            subtle = cv2.morphologyEx(((ldiff >= 4) & (ldiff <= 30))
-                                      .astype(np.uint8), cv2.MORPH_OPEN,
-                                      np.ones((9, 9), np.uint8))
-            _, llabels, lstats, _ = cv2.connectedComponentsWithStats(
-                subtle, 8)
     plates = []
-    for index, (x, y, w, h, area) in enumerate(lstats[1:], 1):
-        if area < width*height*.0005:
-            continue
-        if w > width*.35 or h > height*.35:
-            continue
-        if x <= 2 or y <= 2 or x+w >= width-2 or y+h >= height-2:
-            continue
-        comp = llabels[y:y+h, x:x+w] == index
-        if np.count_nonzero(comp & text_mask[y:y+h, x:x+w]) > comp.sum()*.5:
-            continue
-        core = cv2.erode(comp.astype(np.uint8), np.ones((7, 7), np.uint8)) > 0
-        if core.sum() < 200:
-            continue
-        cpx = src[y:y+h, x:x+w][core]
-        med = np.median(cpx, axis=0)
-        if np.mean(np.max(np.abs(cpx.astype(np.int16)-med), axis=1) <= 6) < .55:
-            continue
-        compmask = np.zeros((height, width), np.uint8)
-        compmask[y:y+h, x:x+w][comp] = 1
-        ringmask = cv2.dilate(compmask, np.ones((17, 17), np.uint8)
-                              ).astype(bool) & ~compmask.astype(bool)
-        sring = src[ringmask]
-        sflat = sring[np.max(np.abs(sring.astype(np.int16)
-                                     - np.median(sring, axis=0)), axis=1) <= 12]
-        if len(sflat) < 200:
-            continue
-        s_edge = np.max(np.abs(med-np.median(sflat, axis=0)))
-        if s_edge < 7 or s_edge > 30:
-            continue
-        inner = src[y:y+h, x:x+w][~comp]
-        if len(inner):
-            imed = np.median(inner, axis=0)
-            if (np.max(np.abs(imed-med)) <= max(4, .3*s_edge)
-                    and np.mean(np.max(np.abs(inner.astype(np.int16)-imed),
-                                     axis=1) <= 8) >= .6):
+    if fast:
+        # Approximate Path C (B-gen-15 fast-mode evaluation): the same gate
+        # chain runs on the 1/4-scale local-diff field instead of the
+        # full-resolution ROI machinery.  Colour-space thresholds are
+        # resolution-independent and kept verbatim; pixel-count floors scale
+        # by ds (perimeter rings) or ds*ds (areas); reported boxes are
+        # upscaled by ds.  Default stays fast=False — this mode exists to
+        # measure what an approximate scan would recall, not to ship.
+        tm = cv2.resize(text_mask.astype(np.uint8), (sw, sh),
+                        interpolation=cv2.INTER_AREA) > .25
+        subtle = cv2.morphologyEx(((ld2 >= 4) & (ld2 <= 30))
+                                  .astype(np.uint8), cv2.MORPH_OPEN,
+                                  np.ones((3, 3), np.uint8))
+        _, llabels, lstats, _ = cv2.connectedComponentsWithStats(subtle, 8)
+        for index, (x, y, w, h, area) in enumerate(lstats[1:], 1):
+            if area*ds*ds < width*height*.0005:
                 continue
-        dring = dst[ringmask]
-        dflat = dring[np.max(np.abs(dring.astype(np.int16)
-                                     - np.median(dring, axis=0)), axis=1) <= 12]
-        if len(dflat) < 200:
-            continue
-        dpx = dst[y:y+h, x:x+w].astype(np.int16)
-        lost = (np.max(np.abs(dpx-np.median(dflat, axis=0)), axis=2)
-                < max(3, .5*s_edge)) & comp
-        kept = 1-lost.sum()/comp.sum()
-        lostmask = np.zeros((height, width), np.uint8)
-        lostmask[y:y+h, x:x+w][lost] = 1
-        n_lost, _, lstat2, _ = cv2.connectedComponentsWithStats(lostmask, 8)
-        patch = (lstat2[1:, 4].max() if n_lost > 1 else 0)/max(1, comp.sum())
-        if kept >= .55 and not (kept < .85 and patch >= .25):
-            continue
-        plates.append({'box': [int(x), int(y), int(w), int(h)],
-                       'area': int(area), 'med': med,
-                       'ring': np.median(sflat, axis=0), 'kept': float(kept),
-                       'patch': float(patch),
-                       'sev': 'fixable' if kept >= .55 else 'hard'})
+            if w > sw*.35 or h > sh*.35:
+                continue
+            if x <= 0 or y <= 0 or x+w >= sw or y+h >= sh:
+                continue
+            comp = llabels[y:y+h, x:x+w] == index
+            if np.count_nonzero(comp & tm[y:y+h, x:x+w]) > comp.sum()*.5:
+                continue
+            core = cv2.erode(comp.astype(np.uint8),
+                             np.ones((3, 3), np.uint8)) > 0
+            if core.sum()*ds*ds < 200:
+                continue
+            cpx = small[y:y+h, x:x+w][core]
+            med = np.median(cpx, axis=0)
+            if np.mean(np.max(np.abs(cpx.astype(np.int16)-med), axis=1)
+                       <= 6) < .55:
+                continue
+            compmask = np.zeros((sh, sw), np.uint8)
+            compmask[y:y+h, x:x+w][comp] = 1
+            ringmask = cv2.dilate(compmask, np.ones((5, 5), np.uint8)
+                                  ).astype(bool) & ~compmask.astype(bool)
+            sring = small[ringmask]
+            sflat = sring[np.max(np.abs(sring.astype(np.int16)
+                                      - np.median(sring, axis=0)),
+                                axis=1) <= 12]
+            if len(sflat)*ds < 200:
+                continue
+            s_edge = np.max(np.abs(med-np.median(sflat, axis=0)))
+            if s_edge < 7 or s_edge > 30:
+                continue
+            inner = small[y:y+h, x:x+w][~comp]
+            if len(inner):
+                imed = np.median(inner, axis=0)
+                if (np.max(np.abs(imed-med)) <= max(4, .3*s_edge)
+                        and np.mean(np.max(np.abs(
+                            inner.astype(np.int16)-imed), axis=1) <= 8)
+                        >= .6):
+                    continue
+            dring = smd[ringmask]
+            dflat = dring[np.max(np.abs(dring.astype(np.int16)
+                                      - np.median(dring, axis=0)),
+                                axis=1) <= 12]
+            if len(dflat)*ds < 200:
+                continue
+            lim = max(3, .5*s_edge)
+            lost = (np.max(np.abs(smd.astype(np.int16)[y:y+h, x:x+w]
+                                  - np.median(dflat, axis=0)),
+                           axis=2) < lim) & comp
+            if np.count_nonzero(lost & (np.max(np.abs(
+                    sm16[y:y+h, x:x+w]-np.median(sflat, axis=0)), axis=2)
+                    >= lim)) < comp.sum()*.02:
+                continue
+            kept = 1-lost.sum()/comp.sum()
+            lostmask = np.zeros((sh, sw), np.uint8)
+            lostmask[y:y+h, x:x+w][lost] = 1
+            n_lost, _, lstat2, _ = cv2.connectedComponentsWithStats(
+                lostmask, 8)
+            patch = (lstat2[1:, 4].max() if n_lost > 1
+                     else 0)/max(1, comp.sum())
+            if kept >= .55 and not (kept < .85 and patch >= .25):
+                continue
+            plates.append({'box': [int(x*ds), int(y*ds),
+                                   int(w*ds), int(h*ds)],
+                           'area': int(area*ds*ds), 'med': med,
+                           'ring': np.median(sflat, axis=0),
+                           'kept': float(kept), 'patch': float(patch),
+                           'sev': 'fixable' if kept >= .55 else 'hard'})
+    else:
+        coarse = cv2.morphologyEx(((ld2 >= 3) & (ld2 <= 45)).astype(np.uint8),
+                                  cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        _, clabels, cstats, _ = cv2.connectedComponentsWithStats(coarse, 8)
+        pad = kk//2 + 40
+        rois = []
+        acc = np.zeros((sh, sw), np.uint8)
+        for index, (cx, cy, cw, ch, ca) in enumerate(cstats[1:], 1):
+            if ca < width*height*.0005/(ds*ds)*.5:
+                continue
+            ccomp = clabels[cy:cy+ch, cx:cx+cw] == index
+            ccm = np.zeros((sh, sw), np.uint8)
+            ccm[cy:cy+ch, cx:cx+cw][ccomp] = 1
+            cring = cv2.dilate(ccm, np.ones((7, 7), np.uint8)).astype(bool) \
+                & ~ccm.astype(bool)
+            sring = small[cring]
+            sflat = sring[np.max(np.abs(sring.astype(np.int16)
+                                         - np.median(sring, axis=0)), axis=1) <= 12]
+            if len(sflat) >= 50:
+                cmed = np.median(small[cy:cy+ch, cx:cx+cw][ccomp], axis=0)
+                c_edge = np.max(np.abs(cmed-np.median(sflat, axis=0)))
+                if c_edge <= 2 or c_edge >= 40:
+                    continue
+                dring = smd[cring]
+                dflat = dring[np.max(np.abs(dring.astype(np.int16)
+                                           - np.median(dring, axis=0)), axis=1) <= 12]
+                if len(dflat) >= 50:
+                    cd = smd[cy:cy+ch, cx:cx+cw].astype(np.int16)
+                    clost = (np.max(np.abs(cd-np.median(dflat, axis=0)), axis=2)
+                             < max(3, .5*c_edge)) & ccomp
+                    if 1-clost.sum()/ccomp.sum() >= .95:
+                        continue
+            rois.append([max(0, cx*ds-pad), max(0, cy*ds-pad),
+                         min(width, (cx+cw)*ds+pad), min(height, (cy+ch)*ds+pad)])
+            acc[cy:cy+ch, cx:cx+cw][ccomp] = 1
+
+        ldiff = np.zeros((height, width), np.int16)
+        valid = np.zeros((height, width), bool)
+        evaled = set()
+
+        def _evalnew(rs):
+            # ldiff = max-channel |src - close|, |src - open|, exact inside each
+            # ROI's valid interior; previously evaluated ROIs are not redone.
+            m = kk//2
+            todo = [r for r in rs if tuple(r) not in evaled]
+
+            def _one(r):
+                rx0, ry0, rx1, ry1 = r
+                sub = src[ry0:ry1, rx0:rx1]
+                s16 = si16[ry0:ry1, rx0:rx1]
+                return np.maximum(
+                    np.max(np.abs(s16-cv2.morphologyEx(sub, cv2.MORPH_CLOSE, surf)
+                                  .astype(np.int16)), axis=2),
+                    np.max(np.abs(s16-cv2.morphologyEx(sub, cv2.MORPH_OPEN, surf)
+                                  .astype(np.int16)), axis=2))
+            # stdlib-only intra-call parallelism: cv2 releases the GIL inside
+            # morphologyEx (each call already fans out internally), so a small
+            # worker pool shortens multi-ROI rounds without new dependencies.
+            if len(todo) > 1:
+                with ThreadPoolExecutor(min(4, len(todo))) as pool:
+                    subs = list(pool.map(_one, todo))
+            else:
+                subs = [_one(r) for r in todo]
+            for (rx0, ry0, rx1, ry1), subld in zip(todo, subs):
+                xa = rx0 if rx0 == 0 else rx0+m
+                xb = rx1 if rx1 == width else rx1-m
+                ya = ry0 if ry0 == 0 else ry0+m
+                yb = ry1 if ry1 == height else ry1-m
+                if xb > xa and yb > ya:
+                    ldiff[ya:yb, xa:xb] = subld[ya-ry0:yb-ry0, xa-rx0:xb-rx0]
+                    valid[ya:yb, xa:xb] = True
+                evaled.add((rx0, ry0, rx1, ry1))
+
+        _union = sum((r[2]-r[0])*(r[3]-r[1]) for r in rois)
+        if rois and _union > width*height*.8:
+            # Coverage this dense means components chain across the page —
+            # fragmented ROI passes all funnel back to full-page evaluation
+            # anyway, so skip straight to it.
+            rois = [[0, 0, width, height]]
+        elif rois and _union > width*height*.6:
+            # Dense coarse coverage: a bbox union would reach most of the page,
+            # so evaluate fixed 640px tiles over the needed zone instead.  A
+            # tile is skipped when every component pixel and its measurement
+            # ring inside it is pixel-identical between source and render at
+            # 1/4 scale — a component entirely within skipped tiles then has
+            # kept ~= 1 and could never be reported.  The <=14 changed-pixel
+            # bound is half of what the smallest reportable component needs.
+            ts = 640
+            halo = pad//ds + 2
+            need = cv2.dilate(acc, np.ones((2*halo+1, 2*halo+1), np.uint8))
+            meas = cv2.dilate(acc, np.ones((19, 19), np.uint8)).astype(bool)
+            diff = np.max(np.abs(sm16-smd.astype(np.int16)), axis=2) > 4
+            m = kk//2
+            rois = []
+            for ty in range(0, height, ts):
+                for tx in range(0, width, ts):
+                    l0, l1 = ty//ds, min(sh, (ty+ts)//ds)
+                    c0, c1 = tx//ds, min(sw, (tx+ts)//ds)
+                    if not need[l0:l1, c0:c1].any():
+                        continue
+                    if np.count_nonzero(diff[l0:l1, c0:c1]
+                                        & meas[l0:l1, c0:c1]) <= 14:
+                        continue
+                    rois.append([max(0, tx-m), max(0, ty-m),
+                                 min(width, tx+ts+m), min(height, ty+ts+m)])
+            if sum((r[2]-r[0])*(r[3]-r[1]) for r in rois) > width*height:
+                rois = [[0, 0, width, height]]
+
+        llabels = np.zeros((height, width), np.int32)
+        lstats = np.zeros((0, 5), np.int64)
+        if rois:
+            spent = 0
+            for attempt in range(5):
+                # Past ~1.2 pages of accumulated ROI pixels, one contiguous
+                # full-page pass is cheaper than more fragmented probes.
+                pending = sum((r[2]-r[0])*(r[3]-r[1])
+                              for r in rois if tuple(r) not in evaled)
+                if spent + pending > width*height*1.2:
+                    rois = [[0, 0, width, height]]
+                _evalnew(rois)
+                spent += pending
+                subtle = cv2.morphologyEx(((ldiff >= 4) & (ldiff <= 30))
+                                          .astype(np.uint8), cv2.MORPH_OPEN,
+                                          np.ones((9, 9), np.uint8))
+                _, llabels, lstats, _ = cv2.connectedComponentsWithStats(
+                    subtle, 8)
+                if rois == [[0, 0, width, height]]:
+                    break
+                near = valid & ~cv2.erode(valid.astype(np.uint8),
+                                          np.ones((15, 15), np.uint8)).astype(bool)
+                near[:9] = near[-9:] = near[:, :9] = near[:, -9:] = False
+                grown = False
+                for index, (x, y, w, h, a) in enumerate(lstats[1:], 1):
+                    if a < width*height*.00025:
+                        continue
+                    if x <= 2 or y <= 2 or x+w >= width-2 or y+h >= height-2:
+                        continue
+                    if w > width*.35 or h > height*.35:
+                        # a component only grows as more of the page is
+                        # evaluated — one already over the compactness cap can
+                        # never become reportable, so its truncation is moot.
+                        continue
+                    comp = llabels[y:y+h, x:x+w] == index
+                    cnear = comp & near[y:y+h, x:x+w]
+                    if not np.count_nonzero(cnear):
+                        continue
+                    # probe a corridor around the frontier pixels only — the
+                    # component may continue past the evaluated zone there; the
+                    # rest of its extent is already fully resolved.
+                    grow = pad*(2**attempt) + kk//2 + 10
+                    cols = np.where(cnear.any(axis=0))[0]
+                    rows = np.where(cnear.any(axis=1))[0]
+                    rois.append([
+                        max(0, x+cols[0]-grow), max(0, y+rows[0]-grow),
+                        min(width, x+cols[-1]+grow+1),
+                        min(height, y+rows[-1]+grow+1)])
+                    grown = True
+                if not grown:
+                    break
+            else:
+                _evalnew([[0, 0, width, height]])
+                subtle = cv2.morphologyEx(((ldiff >= 4) & (ldiff <= 30))
+                                          .astype(np.uint8), cv2.MORPH_OPEN,
+                                          np.ones((9, 9), np.uint8))
+                _, llabels, lstats, _ = cv2.connectedComponentsWithStats(
+                    subtle, 8)
+        plates = []
+        for index, (x, y, w, h, area) in enumerate(lstats[1:], 1):
+            if area < width*height*.0005:
+                continue
+            if w > width*.35 or h > height*.35:
+                continue
+            if x <= 2 or y <= 2 or x+w >= width-2 or y+h >= height-2:
+                continue
+            comp = llabels[y:y+h, x:x+w] == index
+            if np.count_nonzero(comp & text_mask[y:y+h, x:x+w]) > comp.sum()*.5:
+                continue
+            core = cv2.erode(comp.astype(np.uint8), np.ones((7, 7), np.uint8)) > 0
+            if core.sum() < 200:
+                continue
+            cpx = src[y:y+h, x:x+w][core]
+            med = np.median(cpx, axis=0)
+            if np.mean(np.max(np.abs(cpx.astype(np.int16)-med), axis=1) <= 6) < .55:
+                continue
+            compmask = np.zeros((height, width), np.uint8)
+            compmask[y:y+h, x:x+w][comp] = 1
+            ringmask = cv2.dilate(compmask, np.ones((17, 17), np.uint8)
+                                  ).astype(bool) & ~compmask.astype(bool)
+            sring = src[ringmask]
+            sflat = sring[np.max(np.abs(sring.astype(np.int16)
+                                         - np.median(sring, axis=0)), axis=1) <= 12]
+            if len(sflat) < 200:
+                continue
+            s_edge = np.max(np.abs(med-np.median(sflat, axis=0)))
+            if s_edge < 7 or s_edge > 30:
+                continue
+            inner = src[y:y+h, x:x+w][~comp]
+            if len(inner):
+                imed = np.median(inner, axis=0)
+                if (np.max(np.abs(imed-med)) <= max(4, .3*s_edge)
+                        and np.mean(np.max(np.abs(inner.astype(np.int16)-imed),
+                                         axis=1) <= 8) >= .6):
+                    continue
+            dring = dst[ringmask]
+            dflat = dring[np.max(np.abs(dring.astype(np.int16)
+                                         - np.median(dring, axis=0)), axis=1) <= 12]
+            if len(dflat) < 200:
+                continue
+            lim = max(3, .5*s_edge)
+            lost = (np.max(np.abs(di16[y:y+h, x:x+w]-np.median(dflat, axis=0)),
+                           axis=2) < lim) & comp
+            # A pixel only counts as lost when it actually carried the fill on
+            # the source side: a soft block's halo tail passes the residual
+            # band yet already sits at the surround colour, so it trivially
+            # meets the render test while nothing was lost.  Blocks whose
+            # real fill->surround transitions stay under 2% of the footprint
+            # are halo noise, not a collapse — v44's rendered shadows logged
+            # <=0.8% while genuine cuts run >=10% and absent plates >60%.
+            if np.count_nonzero(lost & (np.max(np.abs(
+                    si16[y:y+h, x:x+w]-np.median(sflat, axis=0)), axis=2)
+                    >= lim)) < comp.sum()*.02:
+                continue
+            kept = 1-lost.sum()/comp.sum()
+            lostmask = np.zeros((height, width), np.uint8)
+            lostmask[y:y+h, x:x+w][lost] = 1
+            n_lost, _, lstat2, _ = cv2.connectedComponentsWithStats(lostmask, 8)
+            patch = (lstat2[1:, 4].max() if n_lost > 1 else 0)/max(1, comp.sum())
+            if kept >= .55 and not (kept < .85 and patch >= .25):
+                continue
+            plates.append({'box': [int(x), int(y), int(w), int(h)],
+                           'area': int(area), 'med': med,
+                           'ring': np.median(sflat, axis=0), 'kept': float(kept),
+                           'patch': float(patch),
+                           'sev': 'fixable' if kept >= .55 else 'hard'})
     mergedplates = []
     for plate in sorted(plates, key=lambda f: f['box'][0]):
         if mergedplates:
