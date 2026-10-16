@@ -963,3 +963,41 @@ def test_run06_p05_top_wash_is_not_fill_lost(tmp_path):
     report = _run_report('run06', 5, tmp_path)
     assert not _hits(report, 'fill_lost', 1100, 0, 3840, 250), \
         [d['bbox'] for d in report['defects']]
+
+
+# ---------------------------------------------------------------------------
+# B-gen-14 fixtures: run08 p04's two upper card titles are bold in the source
+# but render at regular weight and stay silent under the p90 stroke tiers —
+# the distance-transform p90 saturates at 3.0 on both sides because CJK bold
+# thickens the main strokes while the bulk of horizontal ink stays thin. The
+# heavy-tail mass (ink fraction beyond max(4, render p95)) exposes the loss:
+# source 6-8% vs render ~1%. The lower titles render bold and must stay
+# silent; phantom 'O' bubbles are excluded upstream (phantom_ids).
+# ---------------------------------------------------------------------------
+
+
+def test_bgen14_run08_p04_upper_titles_are_weight_loss(tmp_path):
+    report = _run_report('run08', 4, tmp_path)
+    for x, y in ((2569, 974), (739, 979)):   # card titles 一次性手套 / 医用外科口罩
+        assert _hits(report, 'weight_loss', x, y, x + 800, y + 200, 'fixable'), \
+            (x, y, [d['bbox'] for d in report['defects']])
+
+
+def test_bgen14_run08_p04_bold_render_titles_stay_silent(tmp_path):
+    # The lower card titles render bold in run08 — neither the p90 tiers nor
+    # the heavy-tail path may flag them (source tail ~8% but render tail
+    # 26-35%).
+    report = _run_report('run08', 4, tmp_path)
+    for x0, x1 in ((600, 1400), (2400, 3200)):
+        assert not _hits(report, 'weight_loss', x0, 1650, x1, 1900), \
+            [d['bbox'] for d in report['defects']]
+
+
+@pytest.mark.parametrize('ver', ('v35', 'v36'))
+def test_bgen14_vXX_p04_bingli_label_is_weight_loss(ver, tmp_path):
+    # The '病例：' caption is bold in the source but renders thinner — p90
+    # 4.39 vs 4.0 stays under both stroke tiers while the tail mass
+    # (29% vs 11%) shows the loss. Historical fixtures the tiers missed.
+    report = vpng2_report(ver, 4, tmp_path)
+    assert _hits(report, 'weight_loss', 2000, 350, 2400, 520, 'fixable'), \
+        [d['bbox'] for d in report['defects']]

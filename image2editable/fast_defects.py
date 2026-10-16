@@ -855,9 +855,12 @@ def detect_defects(source, pptx, rendered, *, output_dir, slide_index=0):
     # (distance transform over the ink mask) plus ink density inside the
     # text frame; weight_loss = fixable when source exceeds render by
     # 30% stroke + 15% density, or ~18% stroke + 20% density (B-gen-11
-    # second tier for the s_p90/d_p90 ~1.2 bold-loss band). Phantom-flagged
-    # boxes are
-    # excluded: a graphic OCR'd into a glyph is not a weight issue.
+    # second tier for the s_p90/d_p90 ~1.2 bold-loss band). A third tier
+    # (B-gen-14) covers p90 saturation: when both sides quantize to the
+    # same p90, the ink fraction beyond max(4px, render p95) must still
+    # show >=4% mass at >=2.5x the render's tail plus 15% density.
+    # Phantom-flagged boxes are excluded: a graphic OCR'd into a glyph is
+    # not a weight issue.
     for obj in texts:
         if obj['id'] in phantom_ids:
             continue
@@ -882,6 +885,20 @@ def detect_defects(source, pptx, rendered, *, output_dir, slide_index=0):
             # with stronger density evidence (>=1.2x) to keep precision.
             add('weight_loss', [x, y, r-x, b-y], int(np.count_nonzero(s_ink)), [obj],
                 'fixable', 'bold source text rendered at regular weight')
+        elif s_p90 >= d_p90:
+            # heavy-tail tier (B-gen-14): the p90 itself can saturate at 3.0
+            # on both sides — CJK bold thickens the dominant strokes while the
+            # mass of thin horizontals keeps every bulk percentile identical.
+            # Compare the tail instead: ink fraction beyond max(4px, the
+            # render's own p95). A bold source keeps >=4% there (measured
+            # 6-9%) while a regular render holds ~1%.
+            thr = max(4.0, float(np.percentile(d_dt, 95)))
+            s_tail = np.count_nonzero(s_dt >= thr) / np.count_nonzero(s_ink)
+            d_tail = np.count_nonzero(d_dt >= thr) / np.count_nonzero(d_ink)
+            if s_tail >= .04 and s_tail >= 2.5*max(.005, d_tail) \
+               and s_ink.mean() >= 1.15*d_ink.mean():
+                add('weight_loss', [x, y, r-x, b-y], int(np.count_nonzero(s_ink)), [obj],
+                    'fixable', 'bold source text rendered at regular weight (heavy-stroke tail)')
     # fill_shape (B-gen-10): a native fill must reproduce the source
     # colour block's silhouette, not just its tint. Pixels in the padded
     # box are classified nearer-fill vs nearer-local-background on both
