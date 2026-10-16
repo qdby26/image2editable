@@ -3107,12 +3107,318 @@ def _fit_isolated_dots(rgb, items, page=(0, 0)):
                 ok = False
                 break
             sx0, sx1 = left_edge + int(columns[0]), left_edge + int(columns[-1]) + 1
-            emitted.append({'text': seg_text,
-                            'box': [max(0.0, sx0 / w), 0.0,
-                                    min(1.0, sx1 / w) - max(0.0, sx0 / w), 1.0]})
+            rows = np.nonzero(span.any(axis=1))[0]
+            sy0, sy1 = int(rows[0]), int(rows[-1]) + 1
+            # ink-kind so the segment centres its rendered ink on the source
+            # span — a layout box lets the leading whitespace advance shove
+            # the glyphs off it (run09 p01's ' 手卫生' sat +47px right).
+            seg_run = {
+                'text': seg_text,
+                'box': [float(sx0) / w, float(sy0) / h,
+                        float(sx1 - sx0) / w, float(sy1 - sy0) / h],
+                'box_kind': 'ink',
+            }
+            inked = [i for i, ch in enumerate(seg_text) if not ch.isspace()]
+            if len(inked) >= 2:
+                seg_mask, _ = face.getmask2(seg_text)
+                seg_bounds = seg_mask.getbbox()
+                if seg_bounds is not None:
+                    rend_w = (seg_bounds[2] - seg_bounds[0]) * font_px / 1000
+                    nspan = inked[-1] - inked[0]
+                    delta = (sx1 - sx0) - rend_w
+                    if nspan and abs(delta) > 6:
+                        spc = delta / nspan
+                        if abs(spc) <= 60:
+                            seg_run['character_spacing_pt'] = float(round(spc, 2))
+            emitted.append(seg_run)
         if not ok or len(emitted) < 2:
             continue
+        # per-segment spacing replaces the coarser line-level tracking value
+        item['character_spacing_pt'] = 0
         item['runs'] = emitted
+
+
+def _align_dot_line_flankers(rgb, items, page=(0, 0)):
+    """Ink-position the plain text items flanking a detached '·' island.
+
+    A detached '·' recovers as its own item and splits its line visually;
+    the neighbours still lay out by advance inside their OCR boxes, so the
+    ink edges drift off the source spans (run09 p01's '隔离防护' rendered
+    -20px left / -53px right).  A flanker converts into a tight
+    ink-positioned item spanning its own measured source ink — the same
+    contract the dot runs use — with per-glyph spacing solved so the
+    rendered ink width meets the span.
+    """
+    from scripts.font_match import resolve_font
+
+    height, width = rgb.shape[:2]
+    page_w, page_h = page
+    content_in = min(40.0 / 3.0, (page_w / page_h) * 7.5) if page_w and page_h else 40.0 / 3.0
+    px_per_pt = page_w / (content_in * 72.0) if page_w else 0
+    if px_per_pt <= 0:
+        return
+    dots = [it for it in items
+            if str(it.get('text') or '').strip() == '·' and not it.get('runs')]
+    if not dots:
+        return
+    converted = set()
+    for dot in dots:
+        dx, dy, dw, dh = [float(v) for v in dot['box']]
+        for item in items:
+            if item is dot or id(item) in converted:
+                continue
+            text = str(item.get('text') or '')
+            if (not text.strip() or '·' in text or '\n' in text
+                    or item.get('runs') or item.get('rotation')
+                    or item.get('rotation_degrees')):
+                continue
+            color = _parse_color(item)
+            if color is None:
+                continue
+            x, y, w, h = [int(round(v)) for v in item['box']]
+            if x < 0 or y < 0 or x + w > width or y + h > height or w < 8 or h < 8:
+                continue
+            # same line: the flanker's band must cover most of the dot's
+            overlap = min(dy + dh, y + h) - max(dy, y)
+            if overlap < .6 * dh:
+                continue
+            # immediate neighbour: strictly left or right of the dot, gap
+            # under ~1.5 line heights
+            if x + w <= dx:
+                gap = dx - (x + w)
+            elif x >= dx + dw:
+                gap = x - (dx + dw)
+            else:
+                continue
+            if gap > 1.5 * h:
+                continue
+            crop = rgb[y:y + h, x:x + w]
+            ink = np.max(np.abs(crop.astype(np.int16) - np.asarray(color)), axis=2) <= 60
+            if np.count_nonzero(ink) < 200:
+                continue
+            xs = np.nonzero(ink.any(axis=0))[0]
+            ys = np.nonzero(ink.any(axis=1))[0]
+            sx0, sx1 = int(xs[0]), int(xs[-1]) + 1
+            sy0, sy1 = int(ys[0]), int(ys[-1]) + 1
+            if sx1 - sx0 < .5 * w or sy1 - sy0 < .5 * h:
+                continue
+            face = resolve_font(item.get('font') or 'Microsoft YaHei',
+                                bool(item.get('bold')), bool(item.get('italic')), size=1000)
+            if face is None:
+                continue
+            font_px = (item.get('font_size') or 0) * px_per_pt
+            if font_px <= 0:
+                continue
+            inked = [i for i, ch in enumerate(text) if not ch.isspace()]
+            item['emitted_ink_box'] = [float(x + sx0), float(y + sy0),
+                                       float(sx1 - sx0), float(sy1 - sy0)]
+            item['box_kind'] = 'ink'
+            spacing = 0
+            if len(inked) >= 2:
+                mask, _ = face.getmask2(text)
+                bounds = mask.getbbox()
+                if bounds is not None:
+                    rend_w = (bounds[2] - bounds[0]) * font_px / 1000
+                    nspan = inked[-1] - inked[0]
+                    delta = (sx1 - sx0) - rend_w
+                    if nspan and abs(delta) > 6:
+                        spacing = delta / nspan
+                        if abs(spacing) > 60:
+                            spacing = 0
+            if spacing:
+                item['character_spacing_pt'] = float(round(spacing, 2))
+            else:
+                item.pop('character_spacing_pt', None)
+            converted.add(id(item))
+
+
+def _fit_gap_segments(rgb, items, page=(0, 0)):
+    """Split a single-line item at wide interior whitespace onto its ink spans.
+
+    Interior spaces separate segments that the source positioned itself;
+    the resolved face's advance + space width rarely matches (png2 p01's
+    '《妇产科学》 本科教学课件' gap rendered 77px vs source 49).  When the
+    count of wide zero-ink column bands inside the item's ink extent equals
+    the number of interior whitespace runs, each band is a separator: the
+    line splits at the spaces and every segment becomes an ink-positioned
+    run on its own measured span — the same contract '·' islands use.
+    """
+    from scripts.font_match import resolve_font
+
+    height, width = rgb.shape[:2]
+    page_w, page_h = page
+    content_in = min(40.0 / 3.0, (page_w / page_h) * 7.5) if page_w and page_h else 40.0 / 3.0
+    px_per_pt = page_w / (content_in * 72.0) if page_w else 0
+    if px_per_pt <= 0:
+        return
+    for item in items:
+        text = str(item.get('text') or '')
+        if (item.get('runs') or item.get('box_kind') == 'ink'
+                or item.get('emitted_ink_box') or '\n' in text or item.get('rotation')
+                or item.get('rotation_degrees')):
+            continue
+        gaps = [i for i, ch in enumerate(text) if ch.isspace()
+                and 0 < i < len(text) - 1]
+        if not gaps or text != text.strip():
+            continue
+        # whitespace runs: group consecutive space chars; each run is one gap
+        runs_ws = []
+        for i in gaps:
+            if runs_ws and i == runs_ws[-1][-1] + 1:
+                runs_ws[-1].append(i)
+            else:
+                runs_ws.append([i])
+        color = _parse_color(item)
+        if color is None:
+            continue
+        x, y, w, h = [int(round(v)) for v in item['box']]
+        if x < 0 or y < 0 or x + w > width or y + h > height or w < 8 or h < 8:
+            continue
+        crop = rgb[y:y + h, x:x + w]
+        ink = np.max(np.abs(crop.astype(np.int16) - np.asarray(color)), axis=2) <= 60
+        if np.count_nonzero(ink) < 200:
+            continue
+        cols = ink.any(axis=0)
+        xs = np.nonzero(cols)[0]
+        glyph_height = int(np.nonzero(ink.any(axis=1))[0][-1]
+                           - np.nonzero(ink.any(axis=1))[0][0] + 1)
+        wide = max(12, int(.18 * glyph_height))
+        bands = []
+        start = None
+        for c in range(int(xs[0]), int(xs[-1]) + 1):
+            if not cols[c]:
+                start = c if start is None else start
+            else:
+                if start is not None and c - start >= wide:
+                    bands.append((start, c))
+                start = None
+        if len(bands) != len(runs_ws):
+            continue
+        face = resolve_font(item.get('font') or 'Microsoft YaHei',
+                            bool(item.get('bold')), bool(item.get('italic')), size=1000)
+        font_px = (item.get('font_size') or 0) * px_per_pt
+        if face is None or font_px <= 0:
+            continue
+        # segment text: split so each whitespace run leads its segment
+        pieces, cursor = [], 0
+        for ws in runs_ws:
+            pieces.append(text[cursor:ws[0]])
+            cursor = ws[0]
+        pieces.append(text[cursor:])
+        if len(pieces) != len(bands) + 1 or any(not p for p in pieces[:-1]):
+            continue
+        edges = [0]
+        for a, b in bands:
+            edges += [int(a), int(b)]
+        edges.append(w)
+        emitted, ok = [], True
+        edge_iter = iter(edges)
+        for seg_text in pieces:
+            left_edge = next(edge_iter)
+            right_edge = next(edge_iter)
+            span = ink[:, left_edge:right_edge]
+            columns = np.nonzero(span.any(axis=0))[0]
+            if len(columns) < 2:
+                ok = False
+                break
+            sx0, sx1 = left_edge + int(columns[0]), left_edge + int(columns[-1]) + 1
+            rows = np.nonzero(span.any(axis=1))[0]
+            sy0, sy1 = int(rows[0]), int(rows[-1]) + 1
+            seg_run = {
+                'text': seg_text,
+                'box': [float(sx0) / w, float(sy0) / h,
+                        float(sx1 - sx0) / w, float(sy1 - sy0) / h],
+                'box_kind': 'ink',
+            }
+            inked = [i for i, ch in enumerate(seg_text) if not ch.isspace()]
+            if len(inked) >= 2:
+                seg_mask, _ = face.getmask2(seg_text)
+                seg_bounds = seg_mask.getbbox()
+                if seg_bounds is not None:
+                    rend_w = (seg_bounds[2] - seg_bounds[0]) * font_px / 1000
+                    nspan = inked[-1] - inked[0]
+                    delta = (sx1 - sx0) - rend_w
+                    if nspan and abs(delta) > 6:
+                        spc = delta / nspan
+                        if abs(spc) <= 60:
+                            seg_run['character_spacing_pt'] = float(round(spc, 2))
+            emitted.append(seg_run)
+        if not ok or len(emitted) < 2:
+            continue
+        item['character_spacing_pt'] = 0
+        item['runs'] = emitted
+
+
+def _centre_floating_ink_items(rgb, items, page=(0, 0)):
+    """Anchor items whose ink floats symmetric inside their box.
+
+    OCR boxes carry padding; when the source ink leaves matching margins
+    on both sides the element is centre-aligned by design (the '本课重点'
+    badge text has ~9px margins each side) — but it emits left-aligned, so
+    the rendered ink starts at the box edge and drifts off the source.
+    Such an item converts to ink-kind over its measured span, with
+    per-glyph spacing solved when the rendered width misses it.
+    """
+    from scripts.font_match import resolve_font
+
+    height, width = rgb.shape[:2]
+    page_w, page_h = page
+    content_in = min(40.0 / 3.0, (page_w / page_h) * 7.5) if page_w and page_h else 40.0 / 3.0
+    px_per_pt = page_w / (content_in * 72.0) if page_w else 0
+    if px_per_pt <= 0:
+        return
+    for item in items:
+        text = str(item.get('text') or '')
+        if (item.get('runs') or item.get('box_kind') == 'ink'
+                or item.get('emitted_ink_box') or '\n' in text or item.get('rotation')
+                or item.get('rotation_degrees') or item.get('align') not in (None, 0)):
+            continue
+        color = _parse_color(item)
+        if color is None:
+            continue
+        x, y, w, h = [int(round(v)) for v in item['box']]
+        if x < 0 or y < 0 or x + w > width or y + h > height or w < 8 or h < 8:
+            continue
+        crop = rgb[y:y + h, x:x + w]
+        ink = np.max(np.abs(crop.astype(np.int16) - np.asarray(color)), axis=2) <= 60
+        if np.count_nonzero(ink) < 200:
+            continue
+        xs = np.nonzero(ink.any(axis=0))[0]
+        ys = np.nonzero(ink.any(axis=1))[0]
+        sx0, sx1 = int(xs[0]), int(xs[-1]) + 1
+        sy0, sy1 = int(ys[0]), int(ys[-1]) + 1
+        if sx1 - sx0 < .5 * w or sy1 - sy0 < .5 * h:
+            continue
+        margin_l, margin_r = sx0, w - sx1
+        if margin_l < 4 or margin_r < 4:
+            continue
+        if abs(margin_l - margin_r) > max(6, .35 * min(margin_l, margin_r)):
+            continue
+        face = resolve_font(item.get('font') or 'Microsoft YaHei',
+                            bool(item.get('bold')), bool(item.get('italic')), size=1000)
+        font_px = (item.get('font_size') or 0) * px_per_pt
+        if face is None or font_px <= 0:
+            continue
+        item['emitted_ink_box'] = [float(x + sx0), float(y + sy0),
+                                   float(sx1 - sx0), float(sy1 - sy0)]
+        item['box_kind'] = 'ink'
+        inked = [i for i, ch in enumerate(text) if not ch.isspace()]
+        spacing = 0
+        if len(inked) >= 2:
+            mask, _ = face.getmask2(text)
+            bounds = mask.getbbox()
+            if bounds is not None:
+                rend_w = (bounds[2] - bounds[0]) * font_px / 1000
+                nspan = inked[-1] - inked[0]
+                delta = (sx1 - sx0) - rend_w
+                if nspan and abs(delta) > 6:
+                    spacing = delta / nspan
+                    if abs(spacing) > 60:
+                        spacing = 0
+        if spacing:
+            item['character_spacing_pt'] = float(round(spacing, 2))
+        else:
+            item.pop('character_spacing_pt', None)
 
 
 def prepare_layout(source, asset_dir, *, text_items, card_mode='native', background=None, label_reader=None,
@@ -3284,6 +3590,9 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
     _unify_series_styles(items, regions, page=(w, h))
     _remeasure_text_tracking(rgb, items, page=(w, h))
     _fit_isolated_dots(rgb, items, page=(w, h))
+    _align_dot_line_flankers(rgb, items, page=(w, h))
+    _fit_gap_segments(rgb, items, page=(w, h))
+    _centre_floating_ink_items(rgb, items, page=(w, h))
     for item in items:
         if 'measured_ink_box' in item:
             item['box'] = item.pop('measured_ink_box')
@@ -3615,7 +3924,8 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
             if max(fill) - min(fill) > 45:
                 continue  # light label on a saturated card is the card's own text
         pad = max(12, round(th*.8))
-        x0, y0, x1, y1 = max(0, x-pad), max(0, y-pad), min(w, x+tw+pad), min(h, y+th+pad)
+        x0, y0 = max(0, int(round(x-pad))), max(0, int(round(y-pad)))
+        x1, y1 = min(w, int(round(x+tw+pad))), min(h, int(round(y+th+pad)))
         labels = [l for l in np.unique(ink_lab[y0:y1, x0:x1]) if l]
         alpha = np.zeros((h, w), np.uint8)
         for label in labels:
@@ -4170,6 +4480,9 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
              'source_sha256': _digest(source),
              'background_kind': 'external' if background else 'source_fill' if preserve_backdrop and reconstructed is not None else 'source_cleaned' if preserve_backdrop else 'flat',
              'warnings': ['object grouping is local; complex touching decorations require review'] if residual_objects else []}
+    for item in items:
+        if 'emitted_ink_box' in item:
+            item['box'] = item.pop('emitted_ink_box')
     slide = {'img_width': w, 'img_height': h, 'text_items': items, 'components': [],
              'visual_elements': elements, 'object_groups': groups, 'original_image_path': str(source)}
     if preserve_backdrop and reconstructed is None:

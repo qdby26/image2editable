@@ -27,6 +27,7 @@ def validate_text_runs(item: dict) -> None:
     allowed = required | {
         "font", "font_size", "color", "bold", "rotation",
         "outline_color", "outline_width", "box_kind", "gradient",
+        "character_spacing_pt",
     }
     if not isinstance(runs, list) or not runs:
         raise ValueError("text runs must be a nonempty list")
@@ -44,12 +45,13 @@ def validate_text_runs(item: dict) -> None:
             or box[0] + box[2] > 1.000001 or box[1] + box[3] > 1.000001
         ):
             raise ValueError("text runs content or box is invalid")
-        for key in ("font_size", "rotation", "outline_width"):
+        for key in ("font_size", "rotation", "outline_width", "character_spacing_pt"):
             if key in run and (
                 type(run[key]) not in {int, float} or not math.isfinite(run[key])
                 or (key == "font_size" and not 0 < run[key] <= 4000)
                 or (key == "outline_width" and not 0 <= run[key] <= 1584)
                 or (key == "rotation" and not -360 <= run[key] <= 360)
+                or (key == "character_spacing_pt" and not -4000.0 <= run[key] <= 201168.0)
             ):
                 raise ValueError("text runs numeric style is invalid")
         for key in ("color", "outline_color"):

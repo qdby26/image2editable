@@ -985,6 +985,13 @@ def _add_textbox(
             tf.word_wrap = True
             font_size = 1
     font.size = Pt(font_size)
+    character_spacing = item.get("character_spacing_pt", 0.0)
+    if (
+        type(character_spacing) not in {int, float}
+        or not math.isfinite(character_spacing)
+        or not -4000.0 <= character_spacing <= 201168.0
+    ):
+        raise ValueError("text character spacing is invalid")
     if item.get("box_kind") == "ink":
         measured_font = _ocr_measurement_font(
             item.get("font", "Microsoft YaHei"), item.get("bold", False), item.get("italic", False),
@@ -1005,19 +1012,35 @@ def _add_textbox(
         # an advance-wide frame spills over neighbouring text boxes.
         ink_w = max(1e-4, (ink_right - ink_left) * scale)
         ink_h = max(1e-4, (ink_bottom - ink_top) * scale)
+        # The declared frame must cover the rendered ink: glyphs draw from
+        # the frame's left edge, so a positive pen offset spills ink past
+        # box.width (junction audits then see neighbour ink between boxes).
+        # Widen to the rendered span; the left edge stays — moving it
+        # moves the pen.
+        ink_w = max(ink_w, (offset[0] + ink_right) * scale)
         line_h = (ascent + descent) * scale
         box.left = Inches(left + width / 2 - (ink_left + ink_right + 2 * offset[0]) * scale / 2)
+        # PowerPoint's line box runs ~0.07em taller than PIL's ascent+descent:
+        # the extra leading drops below the glyphs, so centred ink lands
+        # ~0.035em above the target centre. Measured -4px @fs25.7,
+        # -3.5px @fs29, -6px @fs41.7 — shift the frame down to compensate.
         box.top = Inches(top + height / 2 - (ink_top + ink_bottom + 2 * offset[1]) * scale / 2
-                         + (line_h - ink_h) / 2)
+                         + (line_h - ink_h) / 2 + font_size * 0.035 / 72)
         box.width = Inches(ink_w)
         box.height = Inches(ink_h)
-    character_spacing = item.get("character_spacing_pt", 0.0)
-    if (
-        type(character_spacing) not in {int, float}
-        or not math.isfinite(character_spacing)
-        or not -4000.0 <= character_spacing <= 201168.0
-    ):
-        raise ValueError("text character spacing is invalid")
+        # Character spacing applies after the frame is placed: each glyph past
+        # the first shifts right, so the rendered ink drifts off the target
+        # span by half the total spread.  Pull the frame back by that amount
+        # (and widen it by the trailing spread) so spaced ink stays centred.
+        gaps = len(run.text) - 1
+        if character_spacing and gaps > 0:
+            first_inked = next(
+                (i for i, ch in enumerate(run.text) if not ch.isspace()), 0)
+            inch_per_px = transform.content_width / img_w
+            box.left -= Inches(character_spacing * (first_inked + gaps)
+                               / 2 * inch_per_px)
+            box.width += Inches(character_spacing * (gaps - first_inked)
+                                * inch_per_px)
     if character_spacing:
         spacing = character_spacing * transform.content_width * 72 / img_w
         run._r.get_or_add_rPr().set("spc", str(round(spacing * 100)))
