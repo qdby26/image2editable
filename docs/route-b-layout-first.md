@@ -210,6 +210,38 @@ All pixel geometry below is in the 3840×2160 source frame unless noted.
   `test_refine_trims_misread_tail_overlapping_next_prefix`,
   `test_split_color_label_refits_its_own_weight`.
 
+### Source-ink remeasurement (`_remeasure_text_weight` / `_size` / `_tracking`)
+
+Three passes run on `text_items` before `_unify_series_styles`; each trusts
+source pixels over OCR estimates in one dimension:
+
+- **Weight (B-any-10 item 1)**: the OCR bold flag is unstable on large CJK
+  titles (`bold=False` on genuinely bold heads — `上报登记`, `接触患者前`).
+  For each non-bold item the p90 distance-transform stroke width of the
+  declared-colour ink, normalised by glyph height, is compared to the same
+  text rendered in the resolved face's regular weight; `>= 1.30x` flips
+  `bold=True`. Only False→True (never cleared); glyph heights `<50px` are
+  skipped because stroke p90 quantises and inflates the ratio on regular
+  small text.
+- **Size (item 2)**: OCR font sizes occasionally collapse on single
+  outliers (page-number `4` at 9.7pt beside `3`/`5` at ~14pt). The source
+  ink height inside the box is compared to the text's rendered ink height
+  at the reported size; a `>= 1.35x` deficit rescales `font_size` to match
+  (growth capped at 2x, width re-clamped by ink extent, single-line items
+  only).
+- **Tracking (items 3/5)**: a detached punctuation element (a tiny
+  punctuation-coloured item on the same line) sometimes marks inter-
+  character spacing the source font carried (run07 p01 `标题 · 点`, flatbg
+  p05 `【...】,`). When the left neighbour's rendered width underflows the
+  source ink right edge by `>= 8%`, the deficit is spread across its
+  characters as `character_spacing_pt` (the assembler clamps it into
+  `[-4000, 4000]`).
+- **Wordless mixed children (item 4)**: `_synthetic_words` builds OCR word
+  boxes from connected ink when a colour-split child has no `words`
+  (flatbg p05 `16/18型` — the red segment carried no word boxes, so its
+  box/font could not be fitted and the red run rendered misaligned).
+- **Tests**: `test_bany10_*` in `tests/test_layout_first.py`.
+
 ### Unit suppression (`_suppress_mixed_unit_text`, `_free_glyph_units`)
 
 - **Problem**: a compact text unit that is partially unread (the "%" beside
@@ -282,6 +314,21 @@ All pixel geometry below is in the 3840×2160 source frame unless noted.
   `test_bany09_run04_p04_baked_tail_period_is_gone`,
   `test_tail_punctuation_context_merges_without_repeating_glyph`.
 
+### Owned-silhouette native promotion (B-any-10 item 6)
+
+- **Problem**: a solid-colour badge/capsule sitting behind live text (png2
+  p03 `本课重点`) used to stay a `object_*` raster. Its alpha is the
+  silhouette minus text-shaped holes plus anti-aliased halo, so the PNG
+  rendered with rough edges and a visible outline.
+- **Rule**: inside the residual pass, an *owned* silhouette that is
+  `>= .04%` of its host, whose non-text pixels are `>= 50%` of its mass,
+  and whose fillable pixels agree within `±14` (uniform `>= .88`) is fit
+  with `fit_fill_shape` and emitted as a native `fill_*` under the text
+  elements instead of as a PNG. Z-order: the fill sits just above the
+  containing native shape (`host_z + .01`) and drops below any overlapping
+  element whose overlap area is not `>= 50%` fill-coloured.
+- **Tests**: `test_bany10_badge_promoted_to_native_shape`.
+
 ### Residual merge compositing (`_emit_residual` `_overlay`)
 
 - **Problem**: small residual records are merged into shared PNGs. The old
@@ -296,6 +343,27 @@ All pixel geometry below is in the 3840×2160 source frame unless noted.
   a fragment should exist at all.
 - **Tests**: `test_bany09_residual_merge_keeps_partial_alpha_colour`,
   `test_bany09_run04_p02_no_fabricated_dark_in_card_gap`.
+
+### Source-backdrop cleaning seam check (B-any-10 item 8)
+
+- **Problem**: on `background_mode='source'` pages with no dominant flat
+  backdrop, `_clean_source_backdrop` writes `background-source-cleaned.png`
+  — text/object zones erased so a real PPTX background shows the page's own
+  artwork behind the re-typeset text. The large-zone branch filled any zone
+  whose `21px` ring spread was `<= 12` with the ring median — but a slow
+  gradient has a quiet ring too, so a flat rectangle landed under png2
+  p01's subtitle (visible patch behind `《妇产科学》 本科教学课件`).
+- **Rule**: before accepting the flat fill (or a fitted surface field),
+  verify the seam: compare the fill colour against the source pixels in a
+  `7px` ring just outside the zone. Median edge deviation `> 5` means the
+  surroundings carry real structure — fall back to `cv2.inpaint`
+  (`INPAINT_TELEA`), which interpolates the boundary and continues the
+  gradient.
+- **Boundaries**: inpainting fills from the contour's border inward;
+  `》`-internal spacing inside the subtitle text itself is a font-metric
+  difference (YaHei's `》`+space advance vs the source face), not part of
+  this fix.
+- **Tests**: `test_bany10_cleaned_backdrop_keeps_local_gradient`.
 
 ## Card and frame geometry
 

@@ -3070,3 +3070,271 @@ def test_bany09c_p03_icon_shadows_render_as_occluded_ellipses(kind, tmp_path):
             assert covered[row].sum() >= n * .8, \
                 f'{kind} icon{index}: row {sy0 + row} paints ' \
                 f'{covered[row].sum()}/{n} shadow px (clip edge?)'
+
+
+@pytest.mark.parametrize('kind,page,bold_texts,regular_texts', [
+    # B-any-10 item 1: bold titles/card titles the OCR cache marked regular.
+    # The source glyphs measure ~1.33-1.6x the resolved regular face's stroke;
+    # controls are same-page body text that must stay regular.
+    ('run01', 3,
+     {'手卫生： 两前三后', '清洁或无菌操作前', '接触患者前'},
+     {'在进行清洁或无菌操作之前，', '应先进行手卫生，降低感染风险。'}),
+    ('run04', 5,
+     {'职业暴露处置流程', '评估用药', '上报登记', '黄金处置时间：', '暴露后 2 小时内'},
+     {'挤血冲洗消毒包扎', '30分钟内报院感科'}),
+    ('flatbg', 5, {'病因：'}, {'只有高危型HPV 持续感染，才会逐步诱发宫颈上皮'}),
+])
+def test_bany10_lost_bold_weight_is_recovered(kind, page, bold_texts, regular_texts, tmp_path):
+    from image2editable.layout_first import prepare_layout
+
+    source, items = _bany06_fixture(kind, page)
+    slide, _ = prepare_layout(source, tmp_path / 'assets', text_items=items,
+                              background_mode='source', label_reader=lambda *a, **k: ([], None))
+    emitted = {item['text'].strip(): item for item in slide['text_items']
+               if item['text'].strip()}
+    for text in bold_texts:
+        match = next((it for t, it in emitted.items() if t[:4] == text[:4]), None)
+        assert match is not None, f'{kind} p{page}: {text!r} not emitted'
+        assert match['bold'], f'{kind} p{page}: {text!r} emitted regular, source is bold'
+    for text in regular_texts:
+        match = next((it for t, it in emitted.items() if t[:4] == text[:4]), None)
+        assert match is not None and not match['bold'], \
+            f'{kind} p{page}: regular {text!r} wrongly flipped to bold'
+
+
+def test_bany10_trailing_punct_label_keeps_nominal_size(tmp_path):
+    # B-any-10 item 2: '主诉：'/'病例：'/'就诊经过：' labels shrank 19.2->15.3pt.
+    # The source colon is narrow-ink; YaHei's full-width colon advance fooled
+    # the width clamp.  Width checks must measure the ink extent of a
+    # punctuation-ending line, not its advance.
+    from image2editable.layout_first import prepare_layout
+
+    source, items = _bany06_fixture('png2', 4)
+    slide, _ = prepare_layout(source, tmp_path / 'assets', text_items=items,
+                              background_mode='source', label_reader=lambda *a, **k: ([], None))
+    emitted = {item['text'].strip(): item for item in slide['text_items']
+               if item['text'].strip()}
+    for label in ('主诉：', '病例：', '就诊经过：'):
+        match = next((it for t, it in emitted.items() if t == label), None)
+        assert match is not None, f'{label} not emitted'
+        assert match['font_size'] >= 18.5, \
+            f'{label} shrank to {match["font_size"]:.2f}pt (nominal ~19.2)'
+
+
+def test_bany10_fit_ocr_font_size_measures_ink_for_trailing_punct():
+    from scripts.ppt_assemble import _fit_ocr_font_size
+
+    # '主诉：' at 19.2pt: YaHei advance is 3.0em (230px > 202px box) but the
+    # ink extent is ~2.35em — the trailing colon's advance is whitespace.
+    width_in = 202 * 13.333 / 3840
+    size = _fit_ocr_font_size('主诉：', 'Microsoft YaHei', True, False, 19.2, width_in)
+    assert size >= 18.5, f'shrank to {size}'
+    # non-punctuation lines keep the advance-based check.
+    narrow = _fit_ocr_font_size('隔离防护', 'Microsoft YaHei', True, False, 29.0,
+                                300 * 13.333 / 3840)
+    assert narrow < 29.0, 'advance overflow must still shrink'
+
+
+def test_bany10_page_number_ocr_size_outlier_rescaled():
+    # B-any-10 item 2: run07 p04's page-number '4' was cached at 9.7pt while
+    # sibling digits got ~14pt — the emitted glyph rendered at 0.62x the
+    # source ink height.  Single-line text whose predicted ink height
+    # undershoots the source by >=1.35x must be rescaled from the pixels.
+    from PIL import ImageDraw
+    from image2editable.layout_first import _remeasure_text_size
+    from scripts.font_match import resolve_font
+
+    face = resolve_font('Arial', False, size=160)
+    unit = resolve_font('Arial', False, size=1000)
+    assert face is not None and unit is not None
+    probe = Image.new('L', (260, 260))
+    ImageDraw.Draw(probe).text((20, 20), '4', font=face, fill=255)
+    ys, xs = np.nonzero(np.asarray(probe) > 60)
+    ink = np.asarray(probe)[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+    ink_h, ink_w = ink.shape
+    page = (800, 600)
+    rgb = np.full((page[1], page[0], 3), 248, np.uint8)
+    box = [400, 300, ink_w + 8, ink_h + 8]
+    rgb[box[1] + 4:box[1] + 4 + ink_h,
+        box[0] + 4:box[0] + 4 + ink_w][ink > 60] = (75, 103, 134)
+    mb = unit.getmask('4').getbbox()
+    px_per_pt = 800 / (min(40.0 / 3.0, 800 / 600 * 7.5) * 72)
+    true_pt = ink_h * 1000 / ((mb[3] - mb[1]) * px_per_pt)
+
+    shrunk = {'text': '4', 'box': list(box), 'font_size': true_pt / 1.65,
+              'font': 'Arial', 'color': '#4b6786', 'bold': False}
+    correct = {'text': '4', 'box': list(box), 'font_size': true_pt,
+               'font': 'Arial', 'color': '#4b6786', 'bold': False}
+    _remeasure_text_size(rgb, [shrunk, correct], page=page)
+    assert shrunk['font_size'] >= true_pt * 0.85, shrunk['font_size']
+    assert abs(correct['font_size'] - true_pt) < true_pt * .05, correct['font_size']
+
+
+def test_bany10_detached_punct_closes_tracking_gap():
+    # B-any-10 items 3/5: OCR emits a line's punctuation as its own element
+    # ('·' on run07 p01, '，' on flatbg p05).  The mark keeps its source spot
+    # while the left text renders narrower than the source ink, doubling the
+    # gap.  The engine must widen the left item's character spacing until its
+    # ink right edge matches the source.
+    from PIL import ImageDraw
+    from image2editable.layout_first import _remeasure_text_tracking
+    from scripts.font_match import resolve_font
+
+    face = resolve_font('Microsoft YaHei', False, size=80)
+    assert face is not None
+    page = (1920, 1080)
+    px_per_pt = 1920 / (min(40.0 / 3.0, 1920 / 1080 * 7.5) * 72)
+
+    def drawn_items(track):
+        rgb = np.full((page[1], page[0], 3), 248, np.uint8)
+        canvas = Image.fromarray(rgb)
+        draw = ImageDraw.Draw(canvas)
+        x, y = 100, 120
+        for ch in '标准预防 · 手卫生':
+            draw.text((x, y), ch, font=face, fill=(91, 126, 156))
+            x += int(round(face.getlength(ch))) + track
+        rgb = np.asarray(canvas)
+        crop = rgb[y:y + 160, 100:x]
+        ink = np.max(np.abs(crop.astype(np.int16)
+                            - np.array([91, 126, 156])), axis=2) <= 60
+        xs = np.nonzero(ink.any(axis=0))[0]
+        ink_right = 100 + int(xs[-1])
+        items = [
+            {'text': '标准预防 · 手卫生', 'box': [100, 120, x - 92, 160],
+             'font_size': 80 / px_per_pt, 'font': 'Microsoft YaHei',
+             'color': '#5b7e9c', 'align': 0, 'bold': False},
+            {'text': '·', 'box': [ink_right + 70, 160, 23, 22],
+             'font_size': 80 / px_per_pt, 'font': 'Microsoft YaHei',
+             'color': '#5b7e9c', 'bold': False},
+        ]
+        return rgb, items
+
+    rgb, items = drawn_items(16)
+    _remeasure_text_tracking(rgb, items, page=page)
+    assert items[0].get('character_spacing_pt', 0) > 3.0, \
+        items[0].get('character_spacing_pt')
+    rgb, items = drawn_items(0)
+    _remeasure_text_tracking(rgb, items, page=page)
+    assert not items[0].get('character_spacing_pt'), \
+        items[0].get('character_spacing_pt')
+
+
+def test_bany10_wordless_mixed_colour_line_splits():
+    # B-any-10 item 4: png2 p05 'HPV 16/18型是"头号高危分子' — the source
+    # renders 16/18型 in red but the OCR cache carries no word boxes, so the
+    # mixed-colour splitter skipped it and the whole line emitted black.
+    # Word-less items must get approximate per-character boxes so the split
+    # still happens.
+    import cv2
+    from image2editable.layout_first import refine_layout_text
+
+    source, items = _bany06_fixture('png2', 5)
+    rgb = cv2.cvtColor(cv2.imread(str(source)), cv2.COLOR_BGR2RGB)
+    refined, _ = refine_layout_text(rgb, items)
+    red = next((it for it in refined
+                if '16/18型' in str(it.get('text') or '')), None)
+    assert red is not None, '16/18型 not emitted as its own item'
+    rgb_col = [int(red['color'][i:i + 2], 16) for i in (1, 3, 5)]
+    assert rgb_col[0] > 150 and rgb_col[1] < 100, \
+        f'16/18型 emitted with colour {red["color"]}, expected red'
+    assert red['text'].strip() == '16/18型', red['text']
+    rest = next((it for it in refined
+                 if str(it.get('text') or '').startswith('是')), None)
+    assert rest is not None and rest['color'] != red['color'], \
+        'black remainder of the line was not kept'
+
+
+def test_bany10_badge_promoted_to_native_shape(tmp_path):
+    # B-any-10 item 6: png2 p03's 本课重点 capsule emitted as a verbatim PNG
+    # with text-shaped holes — the native white text left a blue halo and a
+    # slit at the capsule's right edge.  A solid-colour residual silhouette
+    # inside a card must promote to a native shape under the text instead.
+    from image2editable.layout_first import prepare_layout
+
+    source, items = _bany06_fixture('png2', 3)
+    slide, _ = prepare_layout(source, tmp_path / 'assets', text_items=items,
+                              background_mode='source', label_reader=lambda *a, **k: ([], None))
+    capsule = (2442, 532, 2779, 639)
+    fills = [e for e in slide['visual_elements']
+             if e.get('route') == 'native_shape' and e.get('role') == 'fill'
+             and abs(e['bbox'][0] - capsule[0]) < 15
+             and abs(e['bbox'][1] - capsule[1]) < 15]
+    assert fills, 'capsule was not promoted to a native fill'
+    colour = fills[0]['shape']['fill_rgb']
+    assert colour[0] > 200 and colour[1] > 100 and colour[2] < 100, colour
+    # no residual raster may still paint the capsule interior
+    for e in slide['visual_elements']:
+        comp = e.get('component')
+        if not comp:
+            continue
+        inter = (max(0, min(comp['x'] + comp['w'], capsule[2]) - max(comp['x'], capsule[0]))
+                 * max(0, min(comp['y'] + comp['h'], capsule[3]) - max(comp['y'], capsule[1])))
+        assert inter < .2 * (capsule[2] - capsule[0]) * (capsule[3] - capsule[1]), \
+            f"{e['object_id']} still covers the capsule"
+
+
+def test_bany10_cleaned_backdrop_keeps_local_gradient():
+    # B-any-10 item 8: png2 p01's subtitle sits on a blue gradient; the
+    # cleaner filled the whole zone with a flat colour, leaving a visible
+    # rectangular patch behind the text.  When the flat fit disagrees with
+    # the zone's boundary ring the cleaner must inpaint instead.
+    from image2editable.layout_first import _clean_source_backdrop
+
+    yy, xx = np.indices((600, 1200))
+    rgb = np.stack((20 + yy * .30, 90 + xx * .06 + yy * .15,
+                    205 + yy * .06), axis=2).astype(np.uint8)
+    affected = np.zeros(rgb.shape[:2], np.uint8)
+    affected[240:330, 300:900] = 255
+    # white glyphs inside the affected zone, like the subtitle ink
+    affected = affected.astype(bool)
+    glyph = np.zeros_like(affected)
+    glyph[255:315, 320:880] = True
+    glyph[270:290, 340:860] = False
+    rgb = rgb.copy()
+    rgb[glyph] = (245, 248, 252)
+    cleaned = _clean_source_backdrop(rgb, affected.astype(np.uint8))
+    zone = cleaned[240:330, 300:900].astype(int)
+    edge_top = cleaned[236:240, 300:900].astype(int).mean(0)
+    edge_bottom = cleaned[330:334, 300:900].astype(int).mean(0)
+    # the fill must continue the gradient: each column of its top edge ≈ the
+    # pixels just above, its bottom edge ≈ the pixels just below — not one
+    # flat median colour.
+    assert np.abs(zone[0] - edge_top).max() <= 4, \
+        (zone[0] - edge_top).max()
+    assert np.abs(zone[-1] - edge_bottom).max() <= 4, \
+        (zone[-1] - edge_bottom).max()
+
+
+def test_bany10_weight_propagates_to_borderline_series_sibling():
+    # run07 p03's three card titles measured 1.37/1.33/1.24 — the hard
+    # threshold flipped two and left the third regular, splitting the series.
+    # A borderline item (>=1.15) inherits bold from a same-row sibling that
+    # flipped on its own >=1.30 evidence.
+    from image2editable.layout_first import _remeasure_text_weight
+
+    rgb = np.full((400, 1200, 3), 240, np.uint8)
+
+    def fake_glyphs(x0, bar):
+        # vertical bars: distance-transform p90 == bar/2, glyph height 60 —
+        # exact control over the measured stroke ratio.
+        for gx in range(x0, x0 + 240, 14):
+            rgb[100:160, gx:gx + bar] = (10, 15, 47)
+
+    items = [
+        # ~3.5px half-width bars -> ratio well above 1.30 -> direct flip
+        {'text': '甲乙丙丁', 'box': [100, 90, 260, 80], 'color': '#0a0f2f',
+         'font_size': 22, 'bold': False},
+        # ~2.5px -> ratio ~1.26 -> only bold via sibling propagation
+        {'text': '戊己庚辛', 'box': [480, 90, 260, 80], 'color': '#0a0f2f',
+         'font_size': 22, 'bold': False},
+        # ~1.5px -> ratio ~0.8 -> must stay regular even beside bold
+        {'text': '壬癸子丑', 'box': [860, 90, 260, 80], 'color': '#0a0f2f',
+         'font_size': 22, 'bold': False},
+    ]
+    fake_glyphs(110, 7)
+    fake_glyphs(490, 5)
+    fake_glyphs(870, 3)
+    _remeasure_text_weight(rgb, items)
+    assert items[0]['bold'] is True
+    assert items[1]['bold'] is True, 'borderline sibling must inherit'
+    assert items[2]['bold'] is False, 'clearly regular text must not inherit'
