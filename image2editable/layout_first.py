@@ -57,6 +57,50 @@ def _word_bounds(item):
                             word['box'][2]*w, word['box'][3]*h]) for word in item['words']]
 
 
+def _synthetic_words(rgb, item):
+    """Approximate per-character word boxes for a word-less OCR line.
+
+    The mixed-colour splitter needs per-word boxes to localise colour
+    islands, but caches produced before word export carry ``words: null``
+    (png2 p05 'HPV 16/18型是"头号高危分子'), so a coloured segment inside
+    such a line could never be split out.  Each character's advance in the
+    resolved face is mapped linearly onto the measured ink span of the item
+    box — rough, but enough to place a multi-glyph colour island.
+    """
+    from scripts.font_match import resolve_font
+
+    text = str(item.get('text') or '')
+    if not text.strip() or '\n' in text or len(text) < 3:
+        return []
+    x, y, w, h = [int(round(v)) for v in item['box']]
+    if x < 0 or y < 0 or x + w > rgb.shape[1] or y + h > rgb.shape[0] or w < 8 or h < 8:
+        return []
+    crop = rgb[y:y + h, x:x + w]
+    border = np.concatenate((crop[0], crop[-1], crop[:, 0], crop[:, -1]))
+    background = np.median(border, axis=0)
+    ink = np.max(np.abs(crop.astype(np.int16) - background), axis=2) > 30
+    xs = np.nonzero(ink.any(axis=0))[0]
+    if len(xs) < 4:
+        return []
+    face = resolve_font(item.get('font') or 'Microsoft YaHei',
+                        bool(item.get('bold')), bool(item.get('italic')), size=1000)
+    if face is None:
+        return []
+    advances = [max(1.0, face.getlength(ch)) for ch in text]
+    total = sum(advances)
+    if total <= 0:
+        return []
+    ink_left, ink_right = int(xs[0]), int(xs[-1]) + 1
+    words = []
+    advance_left = 0.0
+    for ch, advance in zip(text, advances):
+        left_edge = ink_left + advance_left / total * (ink_right - ink_left)
+        advance_left += advance
+        right_edge = ink_left + advance_left / total * (ink_right - ink_left)
+        words.append((ch, [x + left_edge, y, right_edge - left_edge, h]))
+    return words
+
+
 def _reject_visual_text(rgb, items):
     from PIL import ImageDraw
     from scripts.font_match import resolve_font, _prepare_target, _ink_similarity
@@ -207,6 +251,10 @@ def refine_layout_text(rgb, text_items):
         if not item['text']:
             continue
         words = _word_bounds(item)
+        synthetic = False
+        if not words and not (item.get('rotation') or item.get('rotation_degrees') or item.get('runs')):
+            words = _synthetic_words(rgb, item)
+            synthetic = bool(words)
         if not words or item.get('rotation') or item.get('rotation_degrees') or item.get('runs'):
             result.append(item)
             continue
@@ -234,6 +282,21 @@ def refine_layout_text(rgb, text_items):
             if previous is None or (np.max(np.abs(color-previous)) > 35 and cosine < .99):
                 chunks.append([])
             chunks[-1].append(entry)
+        if synthetic:
+            # per-character boxes are approximate: a lone "word" whose sampled
+            # colour differs from the line is usually a decoration sampled
+            # through the char box (an underline, a rule), not a real colour
+            # island.  Real islands span several characters — merge singletons
+            # back into their neighbour.
+            merged = [chunks[0]]
+            for chunk in chunks[1:]:
+                if len(chunk) == 1:
+                    merged[-1].extend(chunk)
+                else:
+                    merged.append(chunk)
+            while len(merged) > 1 and len(merged[0]) == 1:
+                merged[1][:0] = merged.pop(0)
+            chunks = merged
         if len(chunks) == 1:
             result.append(item)
             continue
@@ -1971,7 +2034,27 @@ def _clean_source_backdrop(rgb, affected):
                 chosen = pale if len(pale) >= len(samples)*.5 else samples
                 spread = np.median(np.abs(chosen.astype(int) - np.median(chosen, axis=0)), axis=0).max()
                 if spread <= 12:
-                    cleaned[y:y+h, x:x+w][local_full != 0] = np.median(chosen, axis=0).astype(np.uint8)
+                    flat = np.median(chosen, axis=0).astype(np.uint8)
+                    # the ring being quiet is not enough: a slow gradient has
+                    # a uniform median too, and a flat fill over it leaves a
+                    # visible rectangle.  Verify the seam; if the colour at
+                    # the patch edge disagrees, inpaint the gradient instead.
+                    near = ((cv2.dilate(affected, np.ones((7, 7), np.uint8)) != 0)
+                            & (affected == 0))
+                    seam = np.max(np.abs(rgb[near].astype(int) - flat.astype(int)),
+                                  axis=1) if np.count_nonzero(near) else np.array([0])
+                    if np.median(seam) <= 5:
+                        cleaned[y:y+h, x:x+w][local_full != 0] = flat
+                    else:
+                        margin = max(12, min(150, round(min(w, h) * .5)))
+                        l2, t2 = max(0, x - margin), max(0, y - margin)
+                        r2, b2 = (min(rgb.shape[1], x + w + margin),
+                                  min(rgb.shape[0], y + h + margin))
+                        fill = cv2.inpaint(rgb[t2:b2, l2:r2],
+                                           affected[t2:b2, l2:r2], 7,
+                                           cv2.INPAINT_TELEA)
+                        cleaned[t2:b2, l2:r2][affected[t2:b2, l2:r2] != 0] = \
+                            fill[affected[t2:b2, l2:r2] != 0]
                     continue
         pad = max(12, min(150, round(min(w, h)*.5)))
         left, top = max(0, x-pad), max(0, y-pad)
@@ -1988,6 +2071,16 @@ def _clean_source_backdrop(rgb, affected):
                 fill = cv2.inpaint(crop, cleaning, 7, cv2.INPAINT_TELEA)
             else:
                 fill = surface[0]
+                # the fitted field flattens real structure (a slow gradient
+                # under a wide text zone): where it disagrees with the ring
+                # just outside the patch, fall back to inpainting, which
+                # interpolates the boundary instead of levelling it.
+                ring = ((cv2.dilate(local, np.ones((7, 7), np.uint8)) != 0)
+                        & (local == 0))
+                if np.count_nonzero(ring) >= 64 and np.median(np.max(
+                        np.abs(fill.astype(int) - crop.astype(int)),
+                        axis=2)[ring]) > 5:
+                    fill = cv2.inpaint(crop, local, 7, cv2.INPAINT_TELEA)
         else:
             fill = cv2.inpaint(crop, local, 7, cv2.INPAINT_TELEA)
         cleaned[top:bottom, left:right][cleaning != 0] = fill[cleaning != 0]
@@ -2463,6 +2556,245 @@ def _audit_invariants(elements, items, page_size, rgb=None):
     return {'i1': i1, 'i2': i2, 'i3': i3}
 
 
+def _remeasure_text_weight(rgb, items):
+    """Re-derive the bold flag from source stroke width.
+
+    The OCR-side bold estimate is a density comparison that loses weight on
+    large CJK titles, so the cache marks genuinely bold titles regular and the
+    native text renders thin (weight_loss). The source pixels are still here:
+    measure the 90th-percentile stroke width of the declared-colour ink,
+    normalised by glyph height, and compare it against the same text rendered
+    in the resolved face's regular weight. Sources at >=1.30x the regular
+    stroke are bold — regular body text measures 0.95-1.25x, the lost-bold
+    band starts at ~1.33x. Glyphs under ~50px are excluded: stroke p90
+    quantises at small sizes and inflates the ratio past the threshold on
+    genuinely regular caption text. Only False->True is allowed: an OCR
+    bold=True flag never gets cleared here.
+    """
+    from PIL import ImageDraw
+    from scripts.font_match import resolve_font
+
+    height, width = rgb.shape[:2]
+    measured = []
+    for item in items:
+        if item.get('bold') or item.get('runs'):
+            continue
+        text = str(item.get('text') or '').strip()
+        if not text:
+            continue
+        x, y, w, h = [int(round(v)) for v in item['box']]
+        if x < 0 or y < 0 or x + w > width or y + h > height or w < 8 or h < 8:
+            continue
+        color = _parse_color(item)
+        if color is None:
+            continue
+        crop = rgb[y:y + h, x:x + w]
+        ink = (np.max(np.abs(crop.astype(np.int16) - np.asarray(color)),
+                      axis=2) <= 60).astype(np.uint8)
+        if np.count_nonzero(ink) < 200:
+            continue
+        ys = np.nonzero(ink.any(axis=1))[0]
+        glyph_height = int(ys[-1] - ys[0] + 1)
+        if glyph_height < 50:
+            continue
+        dt = cv2.distanceTransform(ink, cv2.DIST_L2, 5)[ink.astype(bool)]
+        source_norm = float(np.percentile(dt, 90)) / glyph_height
+        face = resolve_font(item.get('font') or 'Microsoft YaHei', False, size=1000)
+        if face is None:
+            continue
+        left, top, right, bottom = face.getbbox(text)
+        if right <= left or bottom <= top:
+            continue
+        glyph = Image.new('L', (right - left + 16, bottom - top + 16))
+        ImageDraw.Draw(glyph).text((8 - left, 8 - top), text, font=face, fill=255)
+        reference = (np.asarray(glyph) > 127).astype(np.uint8)
+        ref_dt = cv2.distanceTransform(reference, cv2.DIST_L2, 5)[reference.astype(bool)]
+        ref_norm = float(np.percentile(ref_dt, 90)) / (bottom - top)
+        if ref_norm <= 0:
+            continue
+        ratio = source_norm / ref_norm
+        measured.append((item, x, y, w, h, glyph_height, color, ratio))
+        if ratio >= 1.30:
+            item['bold'] = True
+    # A sibling series sits in one stroke-width band; a hard threshold splits
+    # it (run07 p03's titles measured 1.37/1.33/1.24 — two flipped, one not).
+    # An item just under the threshold still carries real stroke evidence:
+    # when a same-row sibling of matching size and colour flipped on its own
+    # >=1.30 measurement, propagate — the source drew them in one weight.
+    for item, x, y, w, h, gh, color, ratio in measured:
+        if item.get('bold') or ratio < 1.15:
+            continue
+        for other, ox, oy, ow, oh, ogh, ocolor, oratio in measured:
+            if other is item or not other.get('bold') or oratio < 1.30:
+                continue
+            overlap = min(y + h, oy + oh) - max(y, oy)
+            if overlap < .5 * min(h, oh):
+                continue
+            if not .8 <= gh / ogh <= 1.25:
+                continue
+            if np.max(np.abs(np.asarray(color, dtype=int)
+                             - np.asarray(ocolor, dtype=int))) > 45:
+                continue
+            item['bold'] = True
+            break
+
+
+def _remeasure_text_size(rgb, items, page=(0, 0)):
+    """Rescale OCR font-size outliers from measured source ink height.
+
+    OCR occasionally reports a size far below the sibling series (run07 p04
+    page-number '4' was cached at 9.7pt while '3'/'5' got ~14pt), and the
+    emitted glyph then renders at ~0.65x the source ink height.  The source
+    pixels still give the true scale: measure the ink height inside the item
+    box, predict the same text's ink height in the resolved face at the
+    reported size, and when the source is >=1.35x taller rescale font_size so
+    they match.  The rescaled width is re-clamped against the box using the
+    line ink extent, growth is capped at 2x, and only single-line items are
+    touched — multi-line, near-correct, and run-based items are left alone.
+    """
+    try:
+        from scripts.ppt_assemble import _ocr_measurement_font, _line_ink_extent
+    except ImportError:
+        return
+    height, width = rgb.shape[:2]
+    page_w, page_h = page
+    content_in = min(40.0 / 3.0, (page_w / page_h) * 7.5) if page_w and page_h else 40.0 / 3.0
+    px_per_pt = page_w / (content_in * 72.0) if page_w else 0
+    if px_per_pt <= 0:
+        return
+    for item in items:
+        text = str(item.get('text') or '').strip()
+        if not text or '\n' in text or item.get('runs'):
+            continue
+        size = item.get('font_size')
+        if not size:
+            continue
+        x, y, w, h = [int(round(v)) for v in item['box']]
+        if x < 0 or y < 0 or x + w > width or y + h > height or w < 8 or h < 8:
+            continue
+        color = _parse_color(item)
+        if color is None:
+            continue
+        crop = rgb[y:y + h, x:x + w]
+        ink = np.max(np.abs(crop.astype(np.int16) - np.asarray(color)), axis=2) <= 60
+        if np.count_nonzero(ink) < 40:
+            continue
+        ys = np.nonzero(ink.any(axis=1))[0]
+        source_h = int(ys[-1] - ys[0] + 1)
+        font = _ocr_measurement_font(item.get('font') or 'Microsoft YaHei',
+                                     bool(item.get('bold')), bool(item.get('italic')))
+        if font is None:
+            continue
+        mask_box = font.getmask(text).getbbox()
+        if not mask_box or mask_box[3] <= mask_box[1]:
+            continue
+        predicted_h = size * px_per_pt * (mask_box[3] - mask_box[1]) / 1000.0
+        if predicted_h <= 0 or source_h < predicted_h * 1.35:
+            continue
+        grown = min(size * source_h / predicted_h, size * 2.0)
+        extent = _line_ink_extent(font, text)
+        if extent > 0:
+            grown = min(grown, w * content_in / page_w * 72000.0 / extent)
+        if grown > size * 1.15:
+            item['font_size'] = round(grown, 3)
+
+
+_DETACHED_PUNCT = set('·，。；：！？、,.;:!?')
+
+
+def _remeasure_text_tracking(rgb, items, page=(0, 0)):
+    """Close gaps between underflowing text and detached line punctuation.
+
+    OCR sometimes emits a line's trailing/interior punctuation as its own
+    tiny item (the '·' on run07 p01, the '，' on flatbg p05).  The detached
+    mark keeps its source position while the text left of it renders
+    narrower than the source ink — a font metric difference — so the
+    visible gap roughly doubles.  For each detached-punctuation item, find
+    the nearest same-line text item to its left, measure that item's ink
+    right edge in the source, predict the emitted text's ink right edge,
+    and spread the deficit across its characters as ``character_spacing_pt``
+    — the field name lies: the assembler converts it from *source pixels*
+    (``value * slide_pt / page_px``), so the per-character deficit is
+    emitted in pixels.  Only the underflowing neighbour of a detached mark
+    is touched; every other line keeps zero spacing.  Growth is capped at
+    0.45em per character and centred/run-based items are skipped.
+    """
+    try:
+        from scripts.ppt_assemble import _ocr_measurement_font
+    except ImportError:
+        return
+    height, width = rgb.shape[:2]
+    page_w, page_h = page
+    content_in = min(40.0 / 3.0, (page_w / page_h) * 7.5) if page_w and page_h else 40.0 / 3.0
+    px_per_pt = page_w / (content_in * 72.0) if page_w else 0
+    if px_per_pt <= 0:
+        return
+
+    def lone_punct(item):
+        text = str(item.get('text') or '').strip()
+        return 0 < len(text) <= 2 and all(c in _DETACHED_PUNCT for c in text)
+
+    indexed = [it for it in items
+               if it.get('box') is not None and str(it.get('text') or '').strip()]
+    for mark in indexed:
+        if not lone_punct(mark):
+            continue
+        mx, my, mw, mh = mark['box']
+        best = None
+        for cand in indexed:
+            if cand is mark or lone_punct(cand):
+                continue
+            cx, cy, cw, ch = cand['box']
+            if cx + cw > mx + mw * .3:
+                continue
+            overlap = min(my + mh, cy + ch) - max(my, cy)
+            if overlap < .4 * min(mh, ch):
+                continue
+            gap = mx - (cx + cw)
+            if gap < 4 * mh and (best is None or gap < best[0]):
+                best = (gap, cand)
+        if best is None:
+            continue
+        item = best[1]
+        text = str(item.get('text') or '').strip()
+        if not text or '\n' in text or len(text) < 3 or item.get('runs'):
+            continue
+        if item.get('align') not in (None, 0) or item.get('character_spacing_pt'):
+            continue
+        size = item.get('font_size')
+        if not size:
+            continue
+        x, y, w, h = [int(round(v)) for v in item['box']]
+        if x < 0 or y < 0 or x + w > width or y + h > height or w < 8 or h < 8:
+            continue
+        color = _parse_color(item)
+        if color is None:
+            continue
+        crop = rgb[y:y + h, x:x + w]
+        ink = np.max(np.abs(crop.astype(np.int16) - np.asarray(color)), axis=2) <= 60
+        if np.count_nonzero(ink) < 40:
+            continue
+        xs = np.nonzero(ink.any(axis=0))[0]
+        source_right = x + int(xs[-1])
+        font = _ocr_measurement_font(item.get('font') or 'Microsoft YaHei',
+                                     bool(item.get('bold')), bool(item.get('italic')))
+        if font is None:
+            continue
+        mask_box = font.getmask(text).getbbox()
+        if not mask_box or mask_box[2] <= mask_box[0]:
+            continue
+        ink_right_units = mask_box[2] - min(0, mask_box[0])
+        predicted_right = x + ink_right_units * size * px_per_pt / 1000.0
+        deficit = source_right - predicted_right
+        if deficit < 8:
+            continue
+        # despite the _pt name the assembler converts this field from source
+        # pixels (spacing = value * slide_pt / page_px); emit the per-char
+        # deficit in source pixels — one unit delivers ~1px of tracking.
+        spacing_px = min(deficit / len(text), size * .45 * px_per_pt)
+        item['character_spacing_pt'] = round(spacing_px, 2)
+
+
 def _unify_series_styles(items, regions, page=(0, 0)):
     """Median-unify typography inside a sibling-card slot series.
 
@@ -2542,9 +2874,9 @@ def _unify_series_styles(items, regions, page=(0, 0)):
     for idx in hosts:
         groups.setdefault(find(idx), []).append(idx)
     try:
-        from scripts.ppt_assemble import _ocr_measurement_font
+        from scripts.ppt_assemble import _ocr_measurement_font, _line_ink_extent
     except Exception:
-        _ocr_measurement_font = None
+        _ocr_measurement_font = _line_ink_extent = None
     page_w, page_h = page
     content_in = min(40.0 / 3.0, (page_w / page_h) * 7.5) if page_w and page_h else 40.0 / 3.0
     for member in groups.values():
@@ -2567,7 +2899,7 @@ def _unify_series_styles(items, regions, page=(0, 0)):
             it = items[i]
             font = _ocr_measurement_font(it.get('font', 'Microsoft YaHei'),
                                          bold, it.get('italic', False))
-            measured = max((font.getlength(line)
+            measured = max((_line_ink_extent(font, line)
                             for line in str(it.get('text') or '').split('\n')),
                            default=0) if font is not None else 0
             if measured > 0:
@@ -2742,7 +3074,10 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
         for item in stamp_items)]
     text_audit['unit_suppressed'] = len(suppressed_items)
     text_audit['suppressed_items'] = suppressed_items
+    _remeasure_text_weight(rgb, items)
+    _remeasure_text_size(rgb, items, page=(w, h))
     _unify_series_styles(items, regions, page=(w, h))
+    _remeasure_text_tracking(rgb, items, page=(w, h))
     for item in items:
         if 'measured_ink_box' in item:
             item['box'] = item.pop('measured_ink_box')
@@ -3427,6 +3762,72 @@ def prepare_layout(source, asset_dir, *, text_items, card_mode='native', backgro
                 if os.environ.get('LF_DEBUG_RESIDUAL'):
                     print(f'[residual-drop text] {pass_tag} bbox=({x},{y},{rw},{rh})')
                 continue
+            # A solid-colour silhouette owned by a card (a badge/capsule) is a
+            # fill wearing text-shaped holes, not raster art: promote it to a
+            # native shape under the text so no halo or edge slit remains.
+            if owned and rw * rh >= h * w * .0004:
+                block = opaque != 0
+                fillable = block & (local_text == 0)
+                if np.count_nonzero(fillable) >= .5 * np.count_nonzero(block):
+                    tones = rgb[y:bottom, x:right][fillable]
+                    fill_col = np.median(tones, axis=0)
+                    uniform = np.mean(np.max(
+                        np.abs(tones - fill_col), axis=1) <= 14)
+                    fit = fit_fill_shape(block, rgb, (x, y), fill_col,
+                                         occluder=occluder) if uniform >= .88 else None
+                    if fit is not None:
+                        box = [x, y, x + rw, y + rh]
+                        host_z = 0.0
+                        occluders = []
+                        for e in elements:
+                            if e.get('component'):
+                                c = e['component']
+                                eb = [c['x'], c['y'], c['x'] + c['w'], c['y'] + c['h']]
+                            else:
+                                eb = e.get('bbox')
+                            if not eb:
+                                continue
+                            inter = (max(0, min(box[2], eb[2]) - max(box[0], eb[0]))
+                                     * max(0, min(box[3], eb[3]) - max(box[1], eb[1])))
+                            if (e['route'] == 'native_shape' and e.get('bbox') is not None
+                                    and inter >= .9 * rw * rh):
+                                host_z = max(host_z, e.get('z_index', 0))
+                            elif inter > 0:
+                                occluders.append(e)
+                        z = host_z + .01
+                        for e in occluders:
+                            ez = e.get('z_index', 0)
+                            if ez < host_z:
+                                continue
+                            if e.get('component'):
+                                c = e['component']
+                                eb = [c['x'], c['y'], c['x'] + c['w'], c['y'] + c['h']]
+                            else:
+                                eb = e['bbox']
+                            ix0, iy0 = max(box[0], int(eb[0])), max(box[1], int(eb[1]))
+                            ix1, iy1 = min(box[2], int(eb[2])), min(box[3], int(eb[3]))
+                            ours = np.mean(np.max(np.abs(
+                                rgb[iy0:iy1, ix0:ix1].astype(np.int16) - fill_col),
+                                axis=2) <= 14)
+                            if ours < .5:
+                                z = min(z, ez - .01)
+                        shape = {'shape_type': fit['shape_type'],
+                                 'fill_rgb': fill_col.astype(int).tolist(),
+                                 'stroke_rgb': None, 'rotation': 0}
+                        if fit['shape_type'] == 'rounded_rectangle':
+                            corner = _corner_radius(block.astype(np.uint8))
+                            if corner < min(rw, rh) * .03:
+                                shape['shape_type'] = 'rectangle'
+                            else:
+                                shape['corner_ratio'] = min(.5, corner / min(rw, rh))
+                        elif fit['shape_type'] == 'pentagon':
+                            shape['tip_ratio'] = fit['tip_ratio']
+                            if fit['tip_direction'] == 'left':
+                                shape['rotation'] = 180
+                        elements.append({'object_id': f'fill_{len(elements):04d}',
+                                         'route': 'native_shape', 'role': 'fill',
+                                         'z_index': z, 'bbox': box, 'shape': shape})
+                        continue
             local_owned = consumed[y:bottom, x:right] != 0
             complete = np.mean(local_owned[opaque != 0]) < .5
             patch_rgb = rgb[y:bottom, x:right].copy()

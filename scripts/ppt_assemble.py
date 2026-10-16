@@ -855,13 +855,32 @@ def _ocr_measurement_font(font_name: str, bold: bool, italic: bool):
     return resolve_font(font_name, bold, italic)
 
 
+_TRAILING_FREE_PUNCT = set('，。；：！？、,.;:!?）)】》」』\'"“”‘’')
+
+
+def _line_ink_extent(font, line):
+    bounds = font.getbbox(line)
+    ink_right = bounds[2] - min(0, bounds[0])
+    # A line ending on narrow-ink punctuation is constrained by its real ink
+    # extent, not the final glyph's full advance — the trailing whitespace
+    # inside the advance overflows into free space harmlessly.  getbbox()
+    # reports metric boxes (full-width CJK punctuation fills its em), so the
+    # rendered mask is measured instead.
+    if line.rstrip() and line.rstrip()[-1] in _TRAILING_FREE_PUNCT:
+        mask_bounds = font.getmask(line.rstrip()).getbbox()
+        if mask_bounds:
+            return mask_bounds[2] - min(0, mask_bounds[0])
+        return ink_right
+    return max(font.getlength(line), ink_right)
+
+
 def _fit_ocr_font_size(text, font_name, bold, italic, font_size, width):
     font = _ocr_measurement_font(font_name, bold, italic)
     if font is None or not text:
         return font_size
     # Measure advances and italic overhangs; keep the detected frame unchanged.
     measured = max(
-        max(font.getlength(line), font.getbbox(line)[2] - min(0, font.getbbox(line)[0]))
+        _line_ink_extent(font, line)
         for line in text.split("\n")
     )
     return min(font_size, width * 72 * 1000 / measured) if measured > 0 else font_size
