@@ -1,9 +1,27 @@
+import inspect
+import re
 from pathlib import Path
 
 from PIL import ImageFont
 import pytest
 from fontTools.ttLib import TTFont
 from fontTools.varLib.instancer import instantiateVariableFont
+
+
+def pytest_collection_modifyitems(items):
+    # B-gen-13: tests whose detect_defects call audits a real rendered page
+    # (WORK=/TRIAL= fixture paths, or the *_report helpers that wrap them)
+    # are the suite's wall-clock cost. Mark them `slow` so a quick pass can
+    # deselect them with `-m "not slow"`; the default run still covers all.
+    for item in items:
+        if item.path.name != 'test_fast_defects.py':
+            continue
+        try:
+            body = inspect.getsource(item.function)
+        except (OSError, TypeError):
+            continue
+        if re.search(r'WORK/|TRIAL/|source_for|_report\(|/conv/', body):
+            item.add_marker(pytest.mark.slow)
 
 
 @pytest.fixture(scope="session")

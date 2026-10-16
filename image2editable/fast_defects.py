@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import io
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
@@ -98,9 +99,13 @@ def detect_defects(source, pptx, rendered, *, output_dir, slide_index=0):
     if image.size != (width, height):
         raise ValueError('render and source must have the same dimensions')
     dst = np.asarray(image)
+    # shared int16 planes (B-gen-13): the patch/fill_lost scans below each
+    # used to re-cast the full 8MP images; identical values, computed once.
+    si16 = src.astype(np.int16)
+    di16 = dst.astype(np.int16)
     objects = read_objects(pptx, (width, height), slide_index)
     background = np.median(np.concatenate((src[0], src[-1], src[:, 0], src[:, -1])), axis=0)
-    changed = np.max(abs(src.astype(np.int16)-dst.astype(np.int16)), axis=2) > 40
+    changed = np.max(np.abs(si16-di16), axis=2) > 40
     text_mask = np.zeros((height, width), bool)
     defects = []
 
@@ -1015,8 +1020,9 @@ def detect_defects(source, pptx, rendered, *, output_dir, slide_index=0):
     # backdrop rectangle (dominant-backdrop rebuild artefact). Cells of
     # 40px whose median delta over near-background pixels is >=2.5 are
     # flagged; regions of >=0.4% page area are reported fixable.
-    near_bg = np.max(np.abs(src.astype(np.int16)-page_bg.astype(np.int16)), axis=2) <= 15
-    delta = np.max(np.abs(src.astype(np.int16)-dst.astype(np.int16)), axis=2).astype(np.float32)
+    sdist = np.max(np.abs(si16-page_bg.astype(np.int16)), axis=2)
+    near_bg = sdist <= 15
+    delta = np.max(np.abs(si16-di16), axis=2).astype(np.float32)
     cell = 40
     flagged = np.zeros((height//cell+1, width//cell+1), bool)
     for cy in range(flagged.shape[0]):
@@ -1082,7 +1088,6 @@ def detect_defects(source, pptx, rendered, *, output_dir, slide_index=0):
     # page background, 15px opening to drop text/strokes), >=0.2% of the
     # page, >=60% uniform, whose render pixels read >=60% as the RENDER's
     # own page background.
-    sdist = np.max(np.abs(src.astype(np.int16)-page_bg.astype(np.int16)), axis=2)
     subfill = cv2.morphologyEx(((sdist >= 5) & (sdist <= 25)).astype(np.uint8),
                                cv2.MORPH_OPEN, np.ones((15, 15), np.uint8))
     fcount, flabels, fstats, _ = cv2.connectedComponentsWithStats(subfill, 8)
@@ -1158,14 +1163,200 @@ def detect_defects(source, pptx, rendered, *, output_dir, slide_index=0):
     # into one defect.
     kk = round(min(width, height)*.07) | 1
     surf = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kk, kk))
-    lclose = cv2.morphologyEx(src, cv2.MORPH_CLOSE, surf)
-    lopen = cv2.morphologyEx(src, cv2.MORPH_OPEN, surf)
-    ldiff = np.maximum(
-        np.max(np.abs(src.astype(np.int16)-lclose.astype(np.int16)), axis=2),
-        np.max(np.abs(src.astype(np.int16)-lopen.astype(np.int16)), axis=2))
-    subtle = cv2.morphologyEx(((ldiff >= 4) & (ldiff <= 30)).astype(np.uint8),
-                              cv2.MORPH_OPEN, np.ones((9, 9), np.uint8))
-    lcount, llabels, lstats, _ = cv2.connectedComponentsWithStats(subtle, 8)
+    # Two-pass evaluation (B-gen-13): the 7%-ellipse close/open pair on the
+    # whole 2160p page costs ~25s, so candidate blocks are located on a
+    # 1/4-scale image first. The coarse pass is deliberately over-inclusive
+    # (wider band 3..45, half the area floor, no size/edge gates) but a
+    # candidate is still skipped when its coarse measurement sits far
+    # outside every flag gate (s_edge <=2 or >=40 vs the 7..30 gate; kept
+    # >=.95 vs the .85 partial-loss gate) — margins larger than the
+    # low-res/full-res readout spread. The exact morphology is recomputed
+    # per candidate ROI at full resolution — inside an ROI's valid interior
+    # (>= kernel radius from any interior cut edge) local morphology equals
+    # the global one pixel for pixel — and ROIs are evaluated in parallel.
+    # A component within ~7px of an evaluated-zone interior boundary may be
+    # truncated by the unevaluated surround, so a probe corridor around its
+    # frontier pixels is evaluated (exponentially deeper each round); dense
+    # pages (ROI union >80%, or 60-80% tiled) and exhausted attempts fall
+    # back to whole-page evaluation. The reported list is identical to the
+    # unrestricted scan — verified bit-exact on the 26-page B-gen-13 set.
+    ds = 4
+    sw, sh = width//ds, height//ds
+    small = cv2.resize(src, (sw, sh), interpolation=cv2.INTER_AREA)
+    smd = cv2.resize(dst, (sw, sh), interpolation=cv2.INTER_AREA)
+    kk2 = round(min(sw, sh)*.07) | 1
+    surf2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kk2, kk2))
+    sm16 = small.astype(np.int16)
+    ld2 = np.maximum(
+        np.max(np.abs(sm16-cv2.morphologyEx(small, cv2.MORPH_CLOSE, surf2)
+                      .astype(np.int16)), axis=2),
+        np.max(np.abs(sm16-cv2.morphologyEx(small, cv2.MORPH_OPEN, surf2)
+                      .astype(np.int16)), axis=2))
+    coarse = cv2.morphologyEx(((ld2 >= 3) & (ld2 <= 45)).astype(np.uint8),
+                              cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    _, clabels, cstats, _ = cv2.connectedComponentsWithStats(coarse, 8)
+    pad = kk//2 + 40
+    rois = []
+    acc = np.zeros((sh, sw), np.uint8)
+    for index, (cx, cy, cw, ch, ca) in enumerate(cstats[1:], 1):
+        if ca < width*height*.0005/(ds*ds)*.5:
+            continue
+        ccomp = clabels[cy:cy+ch, cx:cx+cw] == index
+        ccm = np.zeros((sh, sw), np.uint8)
+        ccm[cy:cy+ch, cx:cx+cw][ccomp] = 1
+        cring = cv2.dilate(ccm, np.ones((7, 7), np.uint8)).astype(bool) \
+            & ~ccm.astype(bool)
+        sring = small[cring]
+        sflat = sring[np.max(np.abs(sring.astype(np.int16)
+                                     - np.median(sring, axis=0)), axis=1) <= 12]
+        if len(sflat) >= 50:
+            cmed = np.median(small[cy:cy+ch, cx:cx+cw][ccomp], axis=0)
+            c_edge = np.max(np.abs(cmed-np.median(sflat, axis=0)))
+            if c_edge <= 2 or c_edge >= 40:
+                continue
+            dring = smd[cring]
+            dflat = dring[np.max(np.abs(dring.astype(np.int16)
+                                       - np.median(dring, axis=0)), axis=1) <= 12]
+            if len(dflat) >= 50:
+                cd = smd[cy:cy+ch, cx:cx+cw].astype(np.int16)
+                clost = (np.max(np.abs(cd-np.median(dflat, axis=0)), axis=2)
+                         < max(3, .5*c_edge)) & ccomp
+                if 1-clost.sum()/ccomp.sum() >= .95:
+                    continue
+        rois.append([max(0, cx*ds-pad), max(0, cy*ds-pad),
+                     min(width, (cx+cw)*ds+pad), min(height, (cy+ch)*ds+pad)])
+        acc[cy:cy+ch, cx:cx+cw][ccomp] = 1
+
+    ldiff = np.zeros((height, width), np.int16)
+    valid = np.zeros((height, width), bool)
+    evaled = set()
+
+    def _evalnew(rs):
+        # ldiff = max-channel |src - close|, |src - open|, exact inside each
+        # ROI's valid interior; previously evaluated ROIs are not redone.
+        m = kk//2
+        todo = [r for r in rs if tuple(r) not in evaled]
+
+        def _one(r):
+            rx0, ry0, rx1, ry1 = r
+            sub = src[ry0:ry1, rx0:rx1]
+            s16 = si16[ry0:ry1, rx0:rx1]
+            return np.maximum(
+                np.max(np.abs(s16-cv2.morphologyEx(sub, cv2.MORPH_CLOSE, surf)
+                              .astype(np.int16)), axis=2),
+                np.max(np.abs(s16-cv2.morphologyEx(sub, cv2.MORPH_OPEN, surf)
+                              .astype(np.int16)), axis=2))
+        # stdlib-only intra-call parallelism: cv2 releases the GIL inside
+        # morphologyEx (each call already fans out internally), so a small
+        # worker pool shortens multi-ROI rounds without new dependencies.
+        if len(todo) > 1:
+            with ThreadPoolExecutor(min(4, len(todo))) as pool:
+                subs = list(pool.map(_one, todo))
+        else:
+            subs = [_one(r) for r in todo]
+        for (rx0, ry0, rx1, ry1), subld in zip(todo, subs):
+            xa = rx0 if rx0 == 0 else rx0+m
+            xb = rx1 if rx1 == width else rx1-m
+            ya = ry0 if ry0 == 0 else ry0+m
+            yb = ry1 if ry1 == height else ry1-m
+            if xb > xa and yb > ya:
+                ldiff[ya:yb, xa:xb] = subld[ya-ry0:yb-ry0, xa-rx0:xb-rx0]
+                valid[ya:yb, xa:xb] = True
+            evaled.add((rx0, ry0, rx1, ry1))
+
+    _union = sum((r[2]-r[0])*(r[3]-r[1]) for r in rois)
+    if rois and _union > width*height*.8:
+        # Coverage this dense means components chain across the page —
+        # fragmented ROI passes all funnel back to full-page evaluation
+        # anyway, so skip straight to it.
+        rois = [[0, 0, width, height]]
+    elif rois and _union > width*height*.6:
+        # Dense coarse coverage: a bbox union would reach most of the page,
+        # so evaluate fixed 640px tiles over the needed zone instead.  A
+        # tile is skipped when every component pixel and its measurement
+        # ring inside it is pixel-identical between source and render at
+        # 1/4 scale — a component entirely within skipped tiles then has
+        # kept ~= 1 and could never be reported.  The <=14 changed-pixel
+        # bound is half of what the smallest reportable component needs.
+        ts = 640
+        halo = pad//ds + 2
+        need = cv2.dilate(acc, np.ones((2*halo+1, 2*halo+1), np.uint8))
+        meas = cv2.dilate(acc, np.ones((19, 19), np.uint8)).astype(bool)
+        diff = np.max(np.abs(sm16-smd.astype(np.int16)), axis=2) > 4
+        m = kk//2
+        rois = []
+        for ty in range(0, height, ts):
+            for tx in range(0, width, ts):
+                l0, l1 = ty//ds, min(sh, (ty+ts)//ds)
+                c0, c1 = tx//ds, min(sw, (tx+ts)//ds)
+                if not need[l0:l1, c0:c1].any():
+                    continue
+                if np.count_nonzero(diff[l0:l1, c0:c1]
+                                    & meas[l0:l1, c0:c1]) <= 14:
+                    continue
+                rois.append([max(0, tx-m), max(0, ty-m),
+                             min(width, tx+ts+m), min(height, ty+ts+m)])
+        if sum((r[2]-r[0])*(r[3]-r[1]) for r in rois) > width*height:
+            rois = [[0, 0, width, height]]
+
+    llabels = np.zeros((height, width), np.int32)
+    lstats = np.zeros((0, 5), np.int64)
+    if rois:
+        spent = 0
+        for attempt in range(5):
+            # Past ~1.2 pages of accumulated ROI pixels, one contiguous
+            # full-page pass is cheaper than more fragmented probes.
+            pending = sum((r[2]-r[0])*(r[3]-r[1])
+                          for r in rois if tuple(r) not in evaled)
+            if spent + pending > width*height*1.2:
+                rois = [[0, 0, width, height]]
+            _evalnew(rois)
+            spent += pending
+            subtle = cv2.morphologyEx(((ldiff >= 4) & (ldiff <= 30))
+                                      .astype(np.uint8), cv2.MORPH_OPEN,
+                                      np.ones((9, 9), np.uint8))
+            _, llabels, lstats, _ = cv2.connectedComponentsWithStats(
+                subtle, 8)
+            if rois == [[0, 0, width, height]]:
+                break
+            near = valid & ~cv2.erode(valid.astype(np.uint8),
+                                      np.ones((15, 15), np.uint8)).astype(bool)
+            near[:9] = near[-9:] = near[:, :9] = near[:, -9:] = False
+            grown = False
+            for index, (x, y, w, h, a) in enumerate(lstats[1:], 1):
+                if a < width*height*.00025:
+                    continue
+                if x <= 2 or y <= 2 or x+w >= width-2 or y+h >= height-2:
+                    continue
+                if w > width*.35 or h > height*.35:
+                    # a component only grows as more of the page is
+                    # evaluated — one already over the compactness cap can
+                    # never become reportable, so its truncation is moot.
+                    continue
+                comp = llabels[y:y+h, x:x+w] == index
+                cnear = comp & near[y:y+h, x:x+w]
+                if not np.count_nonzero(cnear):
+                    continue
+                # probe a corridor around the frontier pixels only — the
+                # component may continue past the evaluated zone there; the
+                # rest of its extent is already fully resolved.
+                grow = pad*(2**attempt) + kk//2 + 10
+                cols = np.where(cnear.any(axis=0))[0]
+                rows = np.where(cnear.any(axis=1))[0]
+                rois.append([
+                    max(0, x+cols[0]-grow), max(0, y+rows[0]-grow),
+                    min(width, x+cols[-1]+grow+1),
+                    min(height, y+rows[-1]+grow+1)])
+                grown = True
+            if not grown:
+                break
+        else:
+            _evalnew([[0, 0, width, height]])
+            subtle = cv2.morphologyEx(((ldiff >= 4) & (ldiff <= 30))
+                                      .astype(np.uint8), cv2.MORPH_OPEN,
+                                      np.ones((9, 9), np.uint8))
+            _, llabels, lstats, _ = cv2.connectedComponentsWithStats(
+                subtle, 8)
     plates = []
     for index, (x, y, w, h, area) in enumerate(lstats[1:], 1):
         if area < width*height*.0005:

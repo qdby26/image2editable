@@ -51,4 +51,5 @@ image2editable = ["runtime_model_catalog.json"]
 [tool.pytest.ini_options]
 markers = [
     "powerpoint: requires Windows and an installed Microsoft PowerPoint",
+    "slow: full-page detector audit on a real rendered page (deselect with -m 'not slow')",
 ]

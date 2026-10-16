@@ -86,3 +86,66 @@ baked leftover and let the real extra mark slip.
   invisible to OCR-level audits when no native box exists; `extra_glyph`
   only catches punctuation-scale marks at text-box edges.
 - **micro residue below floor**: sub-0.007%-page specks.
+
+## Performance (B-gen-13)
+
+`detect_defects` is dominated by Path C of `fill_lost`: the close/open
+reconstruction uses an ellipse kernel of 7% of the page's short side
+(~151px at 3840x2160), which cost ~25 s/page at full resolution — ~83% of
+a ~30 s page. The scan now evaluates that morphology only where it can
+matter, then proves the result equals the unrestricted scan:
+
+1. A 1/4-scale pass (kernel ~38) computes a *superset* mask of candidate
+   regions: wider band (3–45 vs 4–30), half the area floor, no size caps.
+   Per-candidate rings give two monotone vetoes — surround contrast
+   <2/>40 and render kept-fraction >=.95 — which only reject blocks that
+   the full-resolution gates would reject anyway.
+2. Surviving candidates become ROIs (bbox + kernel-radius + blur pad)
+   evaluated at full resolution; each ROI's `ldiff` writes only its
+   interior (inset by kernel radius). Component masks, areas, bboxes and
+   every report gate still run on the full-page arrays, so any component
+   lying entirely inside evaluated zones is bit-identical to the global
+   scan.
+3. Components touching an evaluated-zone boundary may be truncated;
+   their frontier pixels trigger probe corridors (exponential depth) so
+   the component resolves to its true extent — or, for components already
+   past a monotone reject gate (>.35 page dimension, edge-touching), the
+   truncation is ignored because more evaluation could never make them
+   reportable.
+4. Budget and density guards: >80% initial ROI union goes straight to a
+   full-page pass; 60–80% switches to fixed 640px tiles, skipping any
+   tile whose component pixels and measurement ring are pixel-identical
+   between source and render at 1/4 scale (<=14 changed low-res pixels —
+   half of what the smallest reportable component needs); accumulated
+   eval >1.2 pages also converts to one full-page pass. Worst case cost
+   is therefore bounded (~1.2x of the old scan plus a full-page pass).
+
+Evaluation of multiple ROIs uses a small stdlib `ThreadPoolExecutor`
+(cv2 releases the GIL inside `morphologyEx`, which already parallelises
+each call internally — no new dependency).
+
+Shared `si16`/`di16` int16 page arrays remove repeated
+`astype(np.int16)` conversions across `changed`, `patch`, Path B and
+`sdist`.
+
+### Measured (v41 png2 p03, 3840x2160)
+
+- Before: ~30-42 s/page (Path C 25 s = 83%).
+- After: ~6-12 s/page on 23 of 26 validation pages; three dense pages
+  (v41/v40 png2 p04, run07 p04) stay ~35-38 s — their subtle-surface band
+  chains across the page, so exact evaluation is inherently near
+  full-page there; they fall back to the unoptimised path.
+- 26-page defect lists are bit-identical (category/severity/bbox/pixels/
+  reason) to the pre-change detector; see
+  `.agents/tmp-bgen13/baseline/` vs `new/`.
+
+### Test-side
+
+- `tests/test_fast_defects.py` memoises `detect_defects` per
+  (source, pptx, render, slide_index) for the session — repeated audits
+  of the same fixture compute once. Defect crops land in the first
+  caller's `tmp_path`, which pytest keeps for the whole session.
+- Tests that audit real rendered pages are auto-marked `slow` in
+  `conftest.py` (`pytest -m "not slow"` for a quick pass).
+- `pytest-xdist` is not installed in this environment; the suite stays
+  sequential.

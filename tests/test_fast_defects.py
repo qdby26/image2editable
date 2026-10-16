@@ -2,7 +2,24 @@ from pathlib import Path
 
 import pytest
 
-from image2editable.fast_defects import detect_defects
+from image2editable.fast_defects import detect_defects as _detect_raw
+
+
+# Session-scoped memoisation (B-gen-13): the suite re-audits the same
+# (source, pptx, render, slide_index) pages across dozens of assertions and
+# the report depends only on those inputs, so it is computed once. Defect
+# crops land in the first caller's output_dir — the path stays valid for
+# the whole pytest session, so the `crop` existence assertion still holds.
+_detect_cache = {}
+
+
+def detect_defects(source, pptx, rendered, output_dir=None, slide_index=0):
+    key = (str(source), str(pptx), str(rendered), int(slide_index))
+    if key not in _detect_cache:
+        _detect_cache[key] = _detect_raw(source, pptx, rendered,
+                                         output_dir=output_dir,
+                                         slide_index=slide_index)
+    return _detect_cache[key]
 
 
 WORK = Path('E:/PPT/projects/2026-10-01-chunyu092704-cervical-cancer/working')
